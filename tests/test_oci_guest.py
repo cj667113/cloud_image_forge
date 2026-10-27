@@ -94,6 +94,15 @@ class PlanTests(unittest.TestCase):
         profile["capabilities"]["Storage.BootVolumeType"] = {"default_value": "ISCSI", "values": ["ISCSI"]}
         self.assertTrue(any("firmware discovery" in item for item in plan_guest(inspected(), profile)["blockers"]))
 
+    def test_ibft_driver_is_required_for_firmware_boot_but_not_data_volumes(self):
+        image, profile = inspected(), config()
+        image["oci_evidence"]["kernels"][VERSION]["modules"].remove("iscsi_ibft")
+        image["oci_evidence"]["iscsi_boot_configured"] = True
+        profile["capabilities"]["Storage.RemoteDataVolumeType"] = {"default_value": "ISCSI", "values": ["ISCSI"]}
+        self.assertNotIn("iscsi_ibft", plan_guest(image, profile)["required_modules"])
+        profile["capabilities"]["Storage.BootVolumeType"] = {"default_value": "ISCSI", "values": ["ISCSI"]}
+        self.assertTrue(any("iscsi_ibft" in item for item in plan_guest(image, profile)["blockers"]))
+
     def test_consistent_naming_requires_actual_oci_rules(self):
         profile = config()
         profile["capabilities"]["Storage.ConsistentVolumeNaming"]["default_value"] = True
@@ -217,6 +226,54 @@ class EvidenceTests(unittest.TestCase):
 
 
 class PreparationTests(unittest.TestCase):
+    def test_oci_rebuild_preserves_physical_driver_and_returns_hash_bound_receipt(self):
+        image = inspected()
+        image["oci_evidence"]["kernels"][VERSION]["modules"].remove("ixgbe")
+        before = deepcopy(image)
+        image["platform"] = {"kernels": {VERSION: {
+            "modules": ["ixgbe"], "builtin": [], "initrd": "/boot/initramfs-" + VERSION + ".img",
+            "initrd_sha256": "a" * 64,
+        }}}
+        after = deepcopy(image)
+        after["platform"]["kernels"][VERSION]["initrd_sha256"] = "b" * 64
+        profile = config(configure_network=False, configure_cloud_init=False, configure_serial_console=False)
+        g = Mock()
+        g.is_symlink.return_value = False
+        g.is_file.return_value = False
+
+        @contextmanager
+        def guest(*args, **kwargs):
+            yield g
+
+        with patch("forge.engine._guest", guest), patch("forge.engine._mount"), \
+                patch("forge.engine._roots", return_value="/dev/sda1"), patch("forge.engine._run") as run, \
+                patch("forge.engine.ImageEngine.inspect", return_value=after):
+            result = prepare_guest(Path("/tmp/working.qcow2"), image, profile, False, lambda _: None,
+                                   extra_required_modules=["ixgbe"])
+        self.assertIn("ixgbe", result["required_modules"])
+        self.assertIn("Required driver ixgbe absent", " ".join(run.call_args.args[0]))
+        receipt = result["verified_initrds"][VERSION]
+        self.assertIn("ixgbe", receipt["modules"])
+        self.assertEqual(receipt["sha256"], "b" * 64)
+        self.assertEqual(image["oci_evidence"], before["oci_evidence"])
+
+    def test_additional_driver_must_be_installed_before_mutation(self):
+        image = inspected()
+        image["oci_evidence"]["kernels"][VERSION]["modules"].remove("ixgbe")
+        with patch("forge.engine._guest") as guest, patch("forge.engine._run") as run:
+            with self.assertRaisesRegex(EngineError, "lacks required migration drivers"):
+                prepare_guest(Path("/tmp/working.qcow2"), image, config(), False, lambda _: None,
+                              extra_required_modules=["ixgbe"])
+            guest.assert_not_called()
+            run.assert_not_called()
+
+    def test_iscsi_initramfs_requires_userspace_and_dracut_module_proof(self):
+        script = _initramfs_script(inspected(), {"initramfs_backend": "dracut", "required_modules": ["iscsi_tcp"], "iscsi_boot": True})
+        self.assertIn("/iscsistart", script)
+        self.assertIn("lsinitrd -m", script)
+        with self.assertRaisesRegex(ValueError, "requires dracut"):
+            _initramfs_script(inspected(), {"initramfs_backend": "initramfs-tools", "required_modules": ["iscsi_tcp"], "iscsi_boot": True})
+
     def test_initramfs_creation_and_driver_verification_are_mandatory(self):
         image = inspected()
         image["oci_evidence"]["kernels"][VERSION]["initrd"] = None
@@ -253,6 +310,30 @@ class PreparationTests(unittest.TestCase):
             self.assertEqual(plan["blockers"], [])
             guest.assert_not_called()
             run.assert_not_called()
+
+
+def test_oci_projects_iscsi_only_after_valid_platform_plan_without_mutating_source():
+    from forge.oci import compatibility_plan
+    image = inspected()
+    original = deepcopy(image)
+    profile = OciConfig(capabilities={
+        "Compute.LaunchMode": {"default_value": "CUSTOM", "values": ["CUSTOM"]},
+        "Storage.BootVolumeType": {"default_value": "ISCSI", "values": ["ISCSI"]},
+        "Storage.ConsistentVolumeNaming": {"default_value": False},
+    })
+    options = {"enabled": True, "boot_attachment": "iscsi"}
+    for ready in (False, True):
+        with patch("forge.platform.plan_platform", return_value={
+            "ready": ready, "actions": ["Prepare firmware-discovered iSCSI"],
+            "blockers": [] if ready else ["Missing physical NIC driver"], "warnings": [],
+        }):
+            plan = compatibility_plan(image, profile, platform_migration=options)
+            actual = compatibility_plan(image, profile, platform_migration=options, project_platform=False)
+        discovery_blocked = any("firmware discovery" in item for item in plan["blockers"])
+        assert discovery_blocked is not ready
+        assert plan["platform_migration"]["ready"] is ready
+        assert any("firmware discovery" in item for item in actual["blockers"])
+    assert image == original
 
 
 if __name__ == "__main__":

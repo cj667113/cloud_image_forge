@@ -52,6 +52,14 @@ Debian/Ubuntu use guest `grub-install` with an explicit x86_64 EFI target, the m
 
 The output guest retains backups under `/var/lib/cloud-image-forge/uefi-backups/`. Final inspection must find the fallback loader and both firmware arrangements after subsequent OCI preparation, sparsification, and export alignment. These checks do not execute the boot chain: package updates can also affect BIOS GRUB modules, and both desired firmware modes need a VM boot test. A migration failure discards the unpublished working build while preserving the imported source.
 
+## Filesystem rebuild and machine profiles
+
+`storage_rebuild` selects a separate new-disk reconstruction path. Read-only inspection records filesystem capacity, GPT identities and simple LVM topology. The planner accounts for all partitions and filesystems, preserves the ESP, and rejects unsupported boot arrangements, data volumes and identity pins. Archive manifests verify restored file contents and metadata, and the engine repeats disk/filesystem identity checks after customization, sparsification and provider alignment. Failure removes only unpublished output. Previewed and actual sizes are included in the artifact manifest. See [supported storage workflows](storage-and-platform.md).
+
+`platform_migration` prepares VM or experimental bare-metal hardware profiles. A source image cannot reveal the destination physical NIC, so hardware networking requires an explicit driver. Plans use installed per-kernel evidence and supported guest tooling. Preparation adapts UUID mounts, boot transport, initramfs, networking and serial settings in the working copy. Standard GRUB environment variables are resolved as data; unrecognized dynamic substitutions are rejected. Driver verification receipts are bound to the exact kernel, initramfs path and content hash. These receipts do not prove a hardware boot.
+
+Order is storage resize/rebuild, ordinary edits, optional BIOS-to-UEFI migration, machine preparation, OCI preparation, sparsification, reinspection and output alignment. OCI previews can use explicitly planned machine changes only after that machine plan is valid. Actual OCI preparation runs against the modified disk and retains required physical drivers. Final storage and platform verification must pass before publishing the artifact. Provider support remains separate: OCI currently documents BYOI to bare metal as unsupported.
+
 ## Storage and process model
 
 The application stores image metadata, job status/logs, and artifact records alongside image files under `FORGE_DATA_DIR`. A single worker serializes expensive operations. The API process can still serve polling, configuration, and downloads while that worker runs.

@@ -274,6 +274,13 @@ def _validate_recipe(recipe: dict, inspection: dict) -> None:
     size = recipe.get("disk_size_gib")
     if size is not None and (not math.isfinite(size) or not 0 < size <= int(os.getenv("FORGE_MAX_VIRTUAL_GIB", "2048"))):
         raise EngineError("Requested virtual disk size is outside the allowed range.")
+    if (recipe.get("storage_rebuild") or {}).get("enabled"):
+        from .storage import plan_rebuild
+        if recipe.get("partition_changes") or recipe.get("expand_partition") or recipe.get("expand_lv"):
+            raise EngineError("Filesystem rebuild cannot be combined with direct partition or LV expansion actions.")
+        storage_plan = plan_rebuild(inspection, recipe["storage_rebuild"], size)
+        if not storage_plan["ready"]:
+            raise EngineError("Storage rebuild blocked: " + " ".join(storage_plan["blockers"]))
     for item in recipe.get("files", []):
         if not _allowed_file(item["path"]):
             raise EngineError(f"Editing {item['path']} is not allowed.")
@@ -288,7 +295,7 @@ def _validate_recipe(recipe: dict, inspection: dict) -> None:
         if not math.isfinite(size_mib) or size_mib < 16:
             raise EngineError("Partition sizes must be at least 16 MiB.")
         if int(size_mib * MIB) < known[dev]["size"] and known[dev].get("filesystem") not in {"ext2", "ext3", "ext4"}:
-            raise EngineError("Shrinking requires a direct ext2/3/4 partition. XFS and LVM shrink need a filesystem rebuild and are not supported.")
+            raise EngineError("Direct shrinking requires an ext2/3/4 partition. For XFS and LVM, enable filesystem rebuild and review its supported-layout checks.")
         seen.add(dev)
     expand = recipe.get("expand_partition")
     if expand and (expand not in known or expand in seen or not re.fullmatch(r"/dev/sda[1-9][0-9]*", expand)):
@@ -318,7 +325,7 @@ class ImageEngine:
                 "input_formats": ["qcow2", "raw", "vhd"],
                 "output_formats": ["qcow2", "raw", "vhd", "gcp"],
                 "kvm": os.access("/dev/kvm", os.R_OK | os.W_OK),
-                "resize": "Partition growth, LVM growth, direct ext2/3/4 partition shrink. XFS/LVM shrink requires a separate rebuild."}
+                "resize": "Partition and LVM growth, offline ext2/3/4 shrink, and a validated filesystem rebuild for supported GPT/UEFI XFS and LVM layouts."}
 
     def inspect(self, path: Path) -> dict:
         path = Path(path)
@@ -377,14 +384,25 @@ class ImageEngine:
                 migration_guest = inspect_prerequisites(g, root, partitions, migration_layout)
             except RuntimeError as exc:
                 migration_guest = {"errors": [f"Cannot inspect optional UEFI migration prerequisites: {exc}"]}
+            from .storage import inspect_storage
+            from .platform import inspect_platform
+            storage = inspect_storage(g, root, partitions, migration_layout)
+            platform = inspect_platform(g, root, partitions, kernels, oci_evidence=oci_evidence)
         return {"format": fmt, "virtual_size": info["virtual-size"],
                 "actual_size": path.stat().st_size, "allocated_size": info.get("actual-size"),
                 "os": os_info, "partitions": partitions, "files": files,
                 "services": sorted(services), "kernels": kernels, "oci_evidence": oci_evidence, "boot": boot,
                 "uefi_migration": {"version": 1, "layout": migration_layout, "guest": migration_guest},
+                "storage": storage, "platform": platform,
                 "warnings": ["Bootability and cloud-agent compatibility require a test launch after export."]}
 
     def _resize(self, work: Path, destination: Path, inspection: dict, recipe: dict, log) -> Path:
+        if (recipe.get("storage_rebuild") or {}).get("enabled"):
+            from .storage import rebuild
+            rebuilt = rebuild(work, destination / f"rebuilt-{uuid4().hex}.qcow2", inspection, recipe, log)
+            if rebuilt != work:
+                work.unlink()
+            return rebuilt
         old_size = inspection["virtual_size"]
         new_size = int(recipe["disk_size_gib"] * GIB) if recipe.get("disk_size_gib") else old_size
         changes = recipe.get("partition_changes", [])
@@ -474,11 +492,21 @@ class ImageEngine:
         migration_plan = plan_migration(inspection, migration_options, recipe.get("allow_network", False))
         if migration_plan["requested"] and not migration_plan["ready_to_migrate"]:
             raise EngineError("UEFI migration blocked: " + " ".join(migration_plan["blockers"]))
+        from .platform import plan_platform, prepare_platform, verify_platform
+        platform_options = recipe.get("platform_migration")
+        platform_plan = plan_platform(inspection, platform_options, recipe.get("allow_network", False),
+                                      recipe.get("oci"), target_provider=recipe.get("target", "generic"),
+                                      boot_migration=migration_options)
+        if platform_plan["requested"] and not platform_plan["ready"]:
+            raise EngineError("Machine migration blocked: " + " ".join(platform_plan["blockers"]))
+        from .storage import plan_rebuild
+        storage_plan = plan_rebuild(inspection, recipe.get("storage_rebuild"), recipe.get("disk_size_gib"))
         oci_config = None
         if recipe.get("oci") is not None:
             from .oci import OciConfig, compatibility_plan
             oci_config = OciConfig.model_validate(recipe["oci"])
-            preflight = compatibility_plan(inspection, oci_config, recipe.get("allow_network", False), migration_options)
+            preflight = compatibility_plan(inspection, oci_config, recipe.get("allow_network", False), migration_options,
+                                           platform_migration=platform_options)
             if preflight["blockers"]:
                 raise EngineError("OCI preparation blocked: " + " ".join(preflight["blockers"]))
         if not self.capabilities()["available"]:
@@ -495,6 +523,8 @@ class ImageEngine:
         final_format = recipe.get("output_format", "qcow2")
         target = recipe.get("target", "generic")
         warnings = ["Output format validated; cloud import and boot testing have not been performed."]
+        if storage_plan["requested"]:
+            warnings.extend(storage_plan["warnings"])
         if target == "oci":
             warnings.append("Import as QCOW2 and verify firmware, launch mode, agents, and destination boot-volume sizing. OCI metadata is not bundled.")
         if recipe.get("kernel_args") is not None:
@@ -508,13 +538,23 @@ class ImageEngine:
             migration = migrate(work, customized, migration_options, recipe.get("allow_network", False), log)
             migration_plan = migration["plan"]
             warnings.extend(migration["warnings"])
+        platform_receipt = None
+        if platform_plan["requested"]:
+            customized = self.inspect(work)
+            platform_receipt = prepare_platform(work, customized, platform_options, recipe.get("allow_network", False), log,
+                                                oci_config=recipe.get("oci"), target_provider=target)
+            warnings.extend(platform_receipt["warnings"])
         if oci_config is not None:
             from .oci_guest import prepare_guest
             # Manual package/configuration edits may invalidate the original evidence.
             customized = self.inspect(work)
             preparation = prepare_guest(work, customized, oci_config.model_dump(),
-                                        recipe.get("allow_network", False), log)
+                                        recipe.get("allow_network", False), log,
+                                        extra_required_modules=platform_plan.get("required_modules", []) if platform_plan["requested"] else (),
+                                        platform_migration=platform_options)
             warnings.extend(preparation["warnings"])
+            if platform_plan["requested"] and preparation.get("verified_initrds"):
+                platform_receipt = preparation
         if recipe.get("sparsify", True):
             log("Discarding unused guest filesystem blocks")
             _run(["virt-sparsify", "--in-place", "--format", "qcow2", str(work)], log)
@@ -555,6 +595,19 @@ class ImageEngine:
             if missing:
                 raise EngineError("Final OCI image lacks verified installed firmware support for "
                                   + ", ".join(missing) + "; export was stopped.")
+        storage_result = None
+        if storage_plan["requested"]:
+            from .storage import verify_rebuild
+            storage_result = verify_rebuild(result_inspection, storage_plan, expected_disk_size=virtual_size)
+            if not storage_result["ready"]:
+                raise EngineError("Final storage rebuild verification failed: " + " ".join(storage_result["blockers"]))
+            storage_result["plan"] = storage_plan
+        platform_result = None
+        if platform_plan["requested"]:
+            platform_result = verify_platform(result_inspection, platform_options, oci_config=recipe.get("oci"),
+                                              target_provider=target, receipt=platform_receipt)
+            if not platform_result["ready"]:
+                raise EngineError("Final machine migration verification failed: " + " ".join(platform_result["blockers"]))
         filenames = {"qcow2": "image.qcow2", "raw": "image.raw", "vhd": "image.vhd", "gcp": "image.tar.gz"}
         output = destination_dir / filenames[final_format]
         conversion = destination_dir / "disk.raw" if final_format == "gcp" else output
@@ -589,4 +642,6 @@ class ImageEngine:
         work.unlink()
         return {"artifact_path": str(output), "filename": output.name, "format": final_format,
                 "virtual_size": virtual_size, "sha256": digest.hexdigest(), "warnings": warnings,
-                "boot": result_inspection.get("boot")}
+                "boot": result_inspection.get("boot"),
+                "storage_rebuild": storage_result,
+                "platform_migration": platform_result}

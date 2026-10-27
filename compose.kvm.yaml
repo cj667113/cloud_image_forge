@@ -1,0 +1,8 @@
+services:
+  forge:
+    devices:
+      - /dev/kvm:/dev/kvm
+    group_add:
+      - "${FORGE_KVM_GID:?Set FORGE_KVM_GID to the group ID of /dev/kvm}"
+    environment:
+      LIBGUESTFS_BACKEND_SETTINGS: force_kvm

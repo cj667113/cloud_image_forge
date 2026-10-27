@@ -4,16 +4,16 @@
 // returning to an earlier step never resets the customization draft.
 const wizardState = {sessions:{},busy:false,navigating:false};
 const wizardStepCatalog = [
-  {id:'source',label:'Source',description:'Import a local image, use an object storage URL, or choose an existing source.'},
-  {id:'overview',label:'Inspect',description:'Review the operating system, disk layout, and detected boot support.'},
-  {id:'storage',label:'Storage',description:'Choose disk and partition changes, or keep the current layout.'},
-  {id:'startup',label:'Startup',description:'Configure services and scheduled jobs, or keep the existing settings.'},
-  {id:'mounts',label:'Mounts',description:'Review persistent filesystem mounts and make any required changes.'},
-  {id:'boot',label:'Boot & kernel',description:'Set boot options, kernels, modules, and optional BIOS-to-UEFI migration.'},
-  {id:'export',label:'Destination',description:'Choose the cloud provider and output format.'},
-  {id:'oci',label:'OCI compatibility',description:'Optionally prepare the guest and choose Oracle Cloud image capabilities.'},
-  {id:'review',label:'Review',description:'Review your chosen changes before starting the build.'},
-  {id:'result',label:'Build & export',description:'Follow the build, then download the image or upload it to object storage.'}
+  {id:'source',label:'Source',description:'Choose a local, S3 or existing image.'},
+  {id:'overview',label:'Inspect',description:'Review the source and detected boot mode.'},
+  {id:'storage',label:'Storage',description:'Preview and resize disk space.'},
+  {id:'startup',label:'Startup',description:'Services and scheduled jobs.'},
+  {id:'mounts',label:'Mounts',description:'Persistent filesystem mounts.'},
+  {id:'boot',label:'Boot & kernel',description:'Firmware, kernels and drivers.'},
+  {id:'export',label:'Destination',description:'Output format and target hardware.'},
+  {id:'oci',label:'OCI compatibility',description:'Guest readiness and image capabilities.'},
+  {id:'review',label:'Review',description:'Confirm the changes before building.'},
+  {id:'result',label:'Build & export',description:'Follow progress, then download or upload.'}
 ];
 
 function wizardSession(imageId = state.selected) {
@@ -41,7 +41,7 @@ function wizardFooter() {
 }
 function wizardSource() {
   const image = wizardImage();
-  return `<h3>Choose your source image</h3><p class="panel-intro">Start with a local file, an S3-compatible object storage URL, or a source you already imported.</p><div class="wizard-source-card"><span class="large-icon">${icon('upload')}</span><div><h4>Import a new image</h4><p>Upload a local disk or import from S3 / HTTPS. Inspection runs before customization.</p><button type="button" class="button primary" data-action="open-import">${icon('plus')}Import image</button></div></div>${state.images.length ? `<div class="wizard-source-card"><span class="large-icon">${icon('image')}</span><div><label class="field">Use an imported source<select id="image-select">${state.images.map(item => `<option value="${esc(item.id)}"${item.id === state.selected ? ' selected' : ''}>${esc(item.name)} · ${esc(item.status)}</option>`).join('')}</select></label><p>${image?.status === 'ready' ? 'This source is ready. Select Next to review its inspection.' : 'Wait for inspection to finish before customizing this source.'}</p></div></div>` : ''}<div class="notice info">The imported source is preserved. Every build writes a separate image.</div>`;
+  return `<h3>Choose your source image</h3><p class="panel-intro">Your original stays untouched.</p><div class="wizard-source-card"><span class="large-icon">${icon('upload')}</span><div><h4>Import a new image</h4><p>Local file · S3 · HTTPS</p><button type="button" class="button primary" data-action="open-import">${icon('plus')}Import image</button></div></div>${state.images.length ? `<div class="wizard-source-card"><span class="large-icon">${icon('image')}</span><div><label class="field">Use an imported source<select id="image-select">${state.images.map(item => `<option value="${esc(item.id)}"${item.id === state.selected ? ' selected' : ''}>${esc(item.name)} · ${esc(item.status)}</option>`).join('')}</select></label><p>${image?.status === 'ready' ? 'This source is ready. Select Next to review its inspection.' : 'Wait for inspection to finish before customizing this source.'}</p></div></div>` : ''}<div class="notice info">Every build creates a separate image.</div>`;
 }
 function wizardPendingInspection(image) {
   if (!image) return '<p class="muted">Import an image in the Source step to begin inspection.</p>';
@@ -124,6 +124,7 @@ function wizardUpdate() {
   const selector = $('#image-select'); if (selector) selector.disabled = busy;
   if (session.step === 'review') wizardRenderReview();
   if (session.step === 'result') wizardRenderResult();
+  compactStudioHelp($('#recipe-form')||document);
 }
 function wizardSetBusy(value) { wizardState.busy = Boolean(value); wizardUpdate(); }
 function wizardError(message, node) {
@@ -154,12 +155,16 @@ async function wizardValidateStep(id, remote = false) {
   const hidden = panel.hidden; panel.hidden = false;
   try { wizardCheckFields(panel); } finally { panel.hidden = hidden; }
   if (id === 'storage') {
-    const size = $('#disk-size').value;
-    if (size && Number(size) > (state.health?.limits?.max_virtual_gib || 2048)) throw new Error('The requested disk capacity exceeds the server limit.');
+    const size = getDiskSizeGiB();
+    if (size && size > (state.health?.limits?.max_virtual_gib || 2048)) throw new Error('The requested disk capacity exceeds the server limit.');
+    const rebuild = getStorageRebuildConfig();
+    if (rebuild) { if(remote)await previewStorage(rebuild,true); return; }
     if ($$('[data-partition]').some(node => node.value && node.dataset.partition === $('#expand-partition').value)) throw new Error('Choose either an explicit size or automatic expansion for the same partition.');
+    for(const field of $$('[data-partition]')) { const part=image?.inspection?.partitions?.find(item=>item.device===field.dataset.partition);if(field.value&&Number(field.value)*MiB<part?.size&&['xfs','LVM2_member'].includes(part.filesystem))throw new Error('Shrinking XFS or an LVM container requires filesystem rebuild mode.'); }
     const lv = $('#expand-lv').value.trim();
     if (lv && !/^\/dev\/[A-Za-z0-9_+.-]+\/[A-Za-z0-9_+.-]+$/.test(lv)) throw new Error('Enter a logical-volume path such as /dev/volume-group/root.');
   }
+  if (id === 'export') { const platform=getPlatformMigrationConfig(); if(remote&&platform)await previewPlatform(platform,true); }
   if (id === 'startup') {
     for (const row of $$('.rule-row')) {
       const name = $('.service-name',row).value.trim();
@@ -255,6 +260,7 @@ function wizardRenderReview() {
   add('Source','source',[wizardImage()?.name || 'Selected source',`Detected boot: ${bootModeLabel(wizardImage()?.inspection?.boot)}`]);
   add('Storage','storage',[
     recipe.disk_size_gib ? `Disk capacity: ${recipe.disk_size_gib} GiB before migration and export alignment` : 'Keep current disk capacity',
+    ...(recipe.storage_rebuild ? ['Rebuild filesystems on a separate disk',...recipe.storage_rebuild.sizes.map(item=>`${item.device}: ${item.size_mib.toLocaleString()} MiB`)] : []),
     ...recipe.partition_changes.map(part => `${part.device}: resize to ${part.size_mib} MiB`),
     ...(recipe.expand_partition ? [`Expand ${recipe.expand_partition}`] : []),
     ...(recipe.expand_lv ? [`Expand logical volume ${recipe.expand_lv}`] : [])
@@ -274,11 +280,12 @@ function wizardRenderReview() {
   boot.push(recipe.allow_network ? 'Guest networking enabled during customization' : 'Guest networking disabled during customization');
   add('Boot and kernel','boot',boot);
   add('Destination','export',[profiles[recipe.target].label,`Output: ${recipe.output_format.toUpperCase()}`,recipe.sparsify ? 'Reclaim unused space' : 'Keep unused blocks',...(recipe.output_format === 'qcow2' ? [recipe.compress ? 'Compress QCOW2 output' : 'Uncompressed QCOW2 output'] : [])]);
+  if(recipe.platform_migration) { const platform=recipe.platform_migration;add('Platform preparation','export',[`${platform.source==='vm'?'Virtual machine':'Bare metal'} → ${platform.target==='vm'?'Virtual machine':'Bare metal'}`,`Boot: ${platform.boot_attachment}; network: ${platform.network_attachment}`,...(platform.nic_driver?[`NIC driver: ${platform.nic_driver}`]:[]),...(platform.target==='bare_metal'?['Experimental · OCI bare-metal BYOI is unsupported']:[])]); }
   if (recipe.target === 'oci') {
     const firmware = recipe.oci?.capabilities?.['Compute.Firmware'];
     add('OCI compatibility','oci',recipe.oci ? [`Apply ${Object.keys(recipe.oci.capabilities).length} capability settings`,...(firmware ? [`Preferred firmware: ${firmware.default_value}; allowed: ${(firmware.values || [firmware.default_value]).join(', ')}`] : []),recipe.oci.guest.prepare ? 'Prepare the guest for selected capabilities' : 'Validate existing guest preparation'] : ['OCI guest preparation and capability configuration are disabled']);
   }
-  panel.innerHTML = `<h3>Review your image build</h3><p class="panel-intro">Check the selected changes. Build image starts a separate working copy of your source.</p><div class="wizard-review-grid">${cards.join('')}</div>${recipe.files.length ? `<details class="wizard-file-review"><summary>Review ${recipe.files.length} changed configuration file${recipe.files.length === 1 ? '' : 's'}</summary>${recipe.files.map(file => `<h4><code>${esc(file.path)}</code></h4><pre class="wizard-file-content">${esc(file.content)}</pre>`).join('')}</details>` : ''}<div class="notice info">Compatibility and migration checks run again before building. The finished image will be available for download or S3 upload in the next step.</div>`;
+  panel.innerHTML = `<h3>Review your image build</h3><p class="panel-intro">Your source stays unchanged.</p><div class="wizard-review-grid">${cards.join('')}</div>${recipe.files.length ? `<details class="wizard-file-review"><summary>Review ${recipe.files.length} changed configuration file${recipe.files.length === 1 ? '' : 's'}</summary>${recipe.files.map(file => `<h4><code>${esc(file.path)}</code></h4><pre class="wizard-file-content">${esc(file.content)}</pre>`).join('')}</details>` : ''}<div class="notice info">Plans are checked again before building. Download or upload the result in the final step.</div>`;
 }
 function wizardRenderResult() {
   const panel = $('#panel-result'); if (!panel) return;

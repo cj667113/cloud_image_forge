@@ -226,21 +226,54 @@ def capability_schema(config: OciConfig) -> dict:
             for key, setting in config.capabilities.items()}
 
 
-def compatibility_plan(inspection: dict, config: OciConfig, allow_network=False, boot_migration: dict | None = None) -> dict:
+def compatibility_plan(inspection: dict, config: OciConfig, allow_network=False, boot_migration: dict | None = None,
+                       platform_migration: dict | None = None, *, project_platform=True) -> dict:
     from .oci_guest import plan_guest
 
     migration_plan = None
+    platform_plan = None
+    platform_nic_driver = None
+    evidence = inspection
+    if platform_migration and platform_migration.get("enabled"):
+        from copy import deepcopy
+        from .platform import plan_platform
+        platform_plan = plan_platform(inspection, platform_migration, allow_network, config.model_dump(),
+                                      target_provider="oci", boot_migration=boot_migration)
+        if platform_plan["ready"]:
+            # This is explicitly planned evidence. The engine applies migration
+            # first, then repeats OCI preparation against the actual working disk.
+            evidence = deepcopy(inspection)
+            planned_guest = evidence.setdefault("oci_evidence", {})
+            if project_platform and platform_migration.get("boot_attachment") == "iscsi":
+                planned_guest["iscsi_boot_configured"] = True
+            if project_platform and platform_migration.get("configure_network", True):
+                planned_guest["network_ready"] = True
+            if project_platform and platform_migration.get("configure_serial_console", True):
+                planned_guest["serial_console_ready"] = True
+            if platform_migration.get("network_attachment") == "vfio":
+                platform_nic_driver = platform_migration.get("nic_driver")
+            for version, kernel in (planned_guest.get("kernels", {}).items() if project_platform else ()):
+                physical = inspection.get("platform", {}).get("kernels", {}).get(version, {})
+                for key in ("modules", "builtin"):
+                    kernel[key] = sorted(set(kernel.get(key, [])) | set(physical.get(key, [])))
+                kernel["initrd_modules"] = sorted(set(kernel.get("initrd_modules") or []) | set(platform_plan.get("required_modules", [])))
     pending = ()
     if boot_migration and boot_migration.get("enabled"):
         from .uefi import plan_migration
         migration_plan = plan_migration(inspection, boot_migration, allow_network)
         if migration_plan["ready_to_migrate"] and migration_plan.get("layout", {}).get("action") != "already_uefi":
             pending = ("UEFI_64",)
-    plan = plan_guest(inspection, config.model_dump(), allow_network=allow_network, planned_firmware=pending)
+    plan = plan_guest(evidence, config.model_dump(), allow_network=allow_network, planned_firmware=pending,
+                      platform_nic_driver=platform_nic_driver)
     for field in ("changes", "blockers", "warnings"):
         plan.setdefault(field, [])
         if migration_plan:
             plan[field] = list(migration_plan.get(field, [])) + plan[field]
+        if platform_plan:
+            plan[field] = list(platform_plan.get("actions" if field == "changes" else field, [])) + plan[field]
+    if platform_plan:
+        plan["platform_migration"] = platform_plan
+        plan["warnings"].append("Machine migration changes are planned. OCI preparation is checked again after those changes are applied to the working disk.")
     if migration_plan:
         plan["boot_migration"] = migration_plan
         if pending:

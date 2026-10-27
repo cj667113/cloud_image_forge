@@ -7,7 +7,9 @@
   <title>Cloud Image Forge</title>
   <link rel="stylesheet" href="/app.css">
   <link rel="stylesheet" href="/wizard.css">
+  <link rel="stylesheet" href="/redwood.css">
   <script src="/wizard.js" defer></script>
+  <script src="/studio.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
@@ -48,7 +50,7 @@
       <div id="global-error" class="notice error" role="alert" hidden></div>
       <div id="engine-notice" class="notice warning" hidden></div>
       <section id="view-images" class="view">
-        <div class="page-heading"><div><div class="eyebrow">BUILD SOMETHING THAT BOOTS</div><h1>Image studio</h1><p>Follow each step from source image to a ready-to-download export.</p></div><button class="button primary" data-action="open-import"><svg class="icon"><use href="#i-plus"/></svg>Import image</button></div>
+        <div class="page-heading"><div><div class="eyebrow">IMAGE WORKSPACE</div><h1>Image studio</h1><p>Customize. Validate. Export.</p></div><button class="button primary" data-action="open-import"><svg class="icon"><use href="#i-plus"/></svg>Import image</button></div>
         <div id="image-workspace"></div>
       </section>
       <section id="view-artifacts" class="view" hidden><div class="page-heading"><div><div class="eyebrow">READY FOR THE NEXT STEP</div><h1>Your exports</h1><p>Download a finished image or send it to S3-compatible storage.</p></div><button class="button secondary" data-action="refresh"><svg class="icon"><use href="#i-activity"/></svg>Refresh</button></div><div id="artifacts-content"></div></section>

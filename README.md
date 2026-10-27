@@ -15,6 +15,8 @@ docker compose up --build -d
 
 Open **http://localhost:8080**. The default configuration binds only to loopback and uses software emulation, so it does not need `/dev/kvm`, privileged mode, or access to host disks. The first build includes a Linux kernel and image tooling and will take longer than a typical web application image.
 
+For faster filesystem rebuilds on a host with usable KVM, set `FORGE_KVM_GID` in `.env` to the output of `stat -c '%g' /dev/kvm`, then start with `docker compose -f compose.yaml -f compose.kvm.yaml up --build -d`. This supplies only the KVM device and its group; the service still runs without Linux capabilities or privileged mode. A host without working KVM should use the standard Compose file.
+
 The Docker image targets `linux/amd64`. Docker Desktop on macOS or Windows adds a Linux VM, and ARM hosts add another architecture emulation layer. Real image operations on those configurations have not been validated; use a Linux x86_64 worker for image builds. The API and browser UI can be developed on macOS without the image tools, but image operations will report the missing engine dependencies.
 
 The named `forge-data` volume stores imported images, jobs, build outputs, and metadata. `docker compose down` preserves it. Do not use `docker compose down -v` if you need to retain your images. Run **one API process and one replica per data directory**; an exclusive workspace lock rejects a second process using the same directory.
@@ -24,11 +26,11 @@ The named `forge-data` volume stores imported images, jobs, build outputs, and m
 1. Start at **Source**. Import an offline local file, enter an `s3://bucket/path/image.qcow2` or public/presigned HTTPS URL, or select a previously imported image. Custom S3 endpoints and regions are supported; credentials come from the server's AWS SDK configuration.
 2. Continue to **Inspect** when import finishes. Review the operating system, disk capacity, partitions, filesystems, detected boot support, and warnings.
 3. Use **Next** through **Storage**, **Startup**, **Mounts**, and **Boot & kernel**. Set the changes you need or keep the existing settings. **Back** and the available step buttons let you revisit choices without clearing them.
-4. Choose the provider and output format in **Destination**. Oracle Cloud adds an **OCI compatibility** step for optional capability settings and guest preparation.
+4. Choose the provider and output format in **Destination**, with optional VM/bare-metal preparation. Oracle Cloud adds an **OCI compatibility** step for capability settings and guest preparation.
 5. Check the changes and edited configuration files in **Review**. Use each card's **Edit** action to revise them, then select **Build image**.
 6. Stay in **Build & export** to follow progress and logs. Download the completed image and manifest, or upload it to S3 using an optional custom endpoint. OCI configuration is available when included in the build. **Exports** and **Activity** also provide access to completed files and job history.
 
-The wizard shows the current step and keeps your choices while you navigate. Inspection, field validation, and required migration or OCI checks must finish before the relevant step can continue.
+The wizard keeps your choices while you navigate. Its warm neutral, charcoal, and red palette takes cues from Oracle/OCI; Cloud Image Forge is an independent application. Help buttons work on hover, keyboard focus, or tap. Required errors and migration limits remain visible. Inspection, field validation, and required migration or OCI checks must finish before the relevant step can continue.
 
 Images must be shut down before export from the source hypervisor. Supported inputs are standalone **QCOW2, RAW, and fixed/dynamic VHD** disk files. The importer also accepts the reference project's two-member OCI export archive: regular root-level files named exactly `output.QCOW2` and `image_metadata.json`. It retains the metadata with the source and edits the extracted disk; it does not generate a new OCI metadata bundle on export.
 
@@ -58,7 +60,7 @@ Boot the result with **Secure Boot disabled** and test both desired firmware mod
 
 | Area | Available operations |
 | --- | --- |
-| Storage | Grow physical partitions; shrink direct ext2/3/4 partitions offline; expand a selected partition/LVM PV and one logical volume |
+| Storage | Grow partitions and LVM; shrink direct ext2/3/4 partitions; rebuild supported GPT/UEFI XFS/ext filesystems and simple LVM into a smaller disk |
 | Startup | Enable, disable, mask, or unmask systemd units; edit custom `.service` units |
 | Scheduling | Edit `/etc/crontab` and files in `/etc/cron.d/` |
 | Mounts | Edit `/etc/fstab` using the inspected contents as a starting point |
@@ -69,7 +71,15 @@ Boot the result with **Secure Boot disabled** and test both desired firmware mod
 
 Guest package operations require explicitly enabling network access in the recipe. Package repositories and package names belong to the guest distribution. A new kernel must be compatible with the guest's bootloader, filesystem, and destination hypervisor; selecting a provider preset does not install or configure that provider's agent automatically. Default-kernel selection currently requires the guest's `grubby` command. Initramfs rebuilding uses `dracut` or `update-initramfs`; GRUB regeneration uses `update-grub` or `grub2-mkconfig`. Unsupported guest tooling produces an explicit job error.
 
-**XFS cannot shrink in place.** Reducing an XFS filesystem requires a separate rebuild-and-restore workflow that preserves ownership, ACLs, extended attributes, SELinux labels, filesystem UUIDs, and EFI boot content. This application does not automate that reconstruction or shrinking LVM volumes; it rejects those requests instead of truncating live data. Direct ext2/3/4 partition shrinking is supported with an offline filesystem resize before partition reduction. Other resize requests are subject to filesystem and layout validation. See the [libguestfs resize documentation](https://libguestfs.org/virt-resize.1.html) for the underlying tool's behavior.
+**XFS cannot shrink in place.** In **Storage**, enable filesystem rebuild to create smaller filesystems on a new disk, restore the files, and verify their contents and metadata. This supports the Oracle Linux pattern in the supplied example: EFI, XFS `/boot`, and ordinary XFS logical volumes in one LVM volume group. Before/after bars show the disk and filesystem capacities, used space, and reductions. Target disk capacity accepts GiB or decimal GB; filesystem sizes use MiB. Compressed output size is unknown until export.
+
+The rebuild preserves filesystem UUIDs/labels, ownership, ACLs, extended attributes, SELinux labels, GPT identifiers, and EFI bytes. It creates new internal LVM IDs while preserving VG/LV names. It is restricted to supported single-disk GPT/UEFI layouts, Linux kernels 5.15 or newer, direct XFS/ext filesystems and one ordinary LVM PV/VG. BIOS/dual boot, complex LVM, encryption, unaccounted filesystems, quota/project-ID layouts, and detected pinned LVM identities block this workflow. Required space is checked, and failures do not publish an artifact. Direct ext partition shrinking remains available separately. See [storage and migration workflows](docs/storage-and-platform.md) and the [libguestfs resize documentation](https://libguestfs.org/virt-resize.1.html).
+
+### VM and bare-metal preparation
+
+Enable machine migration in **Destination** and choose the direction, boot/network attachments, and the actual destination NIC driver where required. The planner checks every installed non-rescue kernel. Preparation converts local mounts to stable UUID references, adapts boot transport arguments, builds generic initramfs with verified drivers, and optionally replaces machine-bound network profiles with DHCP and enables a serial console. Existing guest configuration is backed up in the output. Missing drivers require a suitable kernel/module package; the application does not infer physical hardware from an offline disk.
+
+The bare-metal profile is experimental UEFI/iSCSI preparation and requires the target firmware to supply valid iBFT/iSCSI boot information. It does not copy hardcoded addresses, IQNs, or initiator identities from the reference scripts. **OCI documents BYOI to bare metal as unsupported.** Preparing the disk does not establish provider support or a successful hardware boot. This application accepts captured disk images; it does not capture a running physical host or provision a bare-metal server. See [OCI BYOI limitations](https://docs.oracle.com/en-us/iaas/Content/Compute/References/bringyourownimage.htm) and [workflow details](docs/storage-and-platform.md).
 
 ### Export presets
 
@@ -119,6 +129,7 @@ For profile-based credentials, mount an appropriate AWS configuration directory 
 | `FORGE_MAX_VIRTUAL_GIB` | `2048` | Maximum expanded virtual disk capacity |
 | `FORGE_ALLOW_PRIVATE_ENDPOINTS` | `false` | Permit trusted private object-storage destinations |
 | `LIBGUESTFS_BACKEND_SETTINGS` | `force_tcg` | Software emulation; use `force_kvm` only with KVM configured |
+| `FORGE_KVM_GID` | unset | Host KVM device group; required by the optional `compose.kvm.yaml` |
 
 Set a long random `API_TOKEN` before publishing the service beyond localhost. For remote use, place it behind an HTTPS reverse proxy with an upload limit and timeout suitable for large disk images. Forward the original `Host` and scheme, and configure Uvicorn's `FORWARDED_ALLOW_IPS` to trust only your proxy's address so HTTPS sessions and same-origin checks work correctly. This is a single-operator tool; the shared token does not provide tenant isolation or per-user permissions. Imported disks contain executable guest software; use trusted source images and a dedicated image-build host.
 
@@ -126,23 +137,10 @@ Jobs are serialized because each appliance and disk conversion consumes substant
 
 ### Optional KVM acceleration
 
-On a Linux x86_64 host with hardware virtualization and an accessible `/dev/kvm`, create `compose.kvm.yaml`:
-
-```yaml
-services:
-  forge:
-    devices:
-      - /dev/kvm:/dev/kvm
-    group_add:
-      - "${KVM_GID}"
-    environment:
-      LIBGUESTFS_BACKEND_SETTINGS: force_kvm
-```
-
-Start with the host device's group ID:
+On a Linux x86_64 host with hardware virtualization and an accessible `/dev/kvm`, use the included `compose.kvm.yaml`. Set `FORGE_KVM_GID` in `.env` to the host device's group ID (`stat -c '%g' /dev/kvm`), then start:
 
 ```sh
-KVM_GID=$(stat -c '%g' /dev/kvm) docker compose -f compose.yaml -f compose.kvm.yaml up -d
+docker compose -f compose.yaml -f compose.kvm.yaml up -d
 ```
 
 There is no need to expose host block devices or use `--privileged`. If the appliance cannot start, inspect `docker compose logs forge` and run `docker compose exec forge libguestfs-test-tool`. [libguestfs troubleshooting](https://libguestfs.org/guestfs-faq.1.html)
@@ -178,10 +176,14 @@ For a fixture whose boot arrangement you already know, set `FORGE_EXPECT_BOOT_MO
 
 Set `FORGE_SMOKE_UEFI_MIGRATION=1` to exercise migration on a BIOS-only fixture with the required EFI tools already installed. This smoke mode keeps guest networking and package installation disabled, so use an eligible Debian/Ubuntu fixture; the RPM migration path requires an explicit package workflow. The script additionally checks the output's EFI fallback loader and retained BIOS detection. It still requires separate UEFI and legacy VM boot tests.
 
-The initial implementation was developed on macOS without Docker or libguestfs. Container build, appliance startup, real image operations, and cloud import/launch must be validated on the intended Linux host before operational use.
+Unit tests use mocked image tooling. Container startup and a real Debian import/edit/export round trip have also been exercised on a Linux x86_64 Docker host. An Oracle Linux 9.8 UEFI/XFS/LVM fixture was rebuilt from a 12 GiB test disk to exactly 10 GB, reducing its root filesystem from 8 GiB to 7.5 GiB. File contents and archived metadata, filesystem identities, source preservation and export byte comparison passed. The rebuilt image reached a serial login prompt under KVM/OVMF with no network device and temporary disk writes; its checksum remained unchanged.
+
+The same Oracle fixture completed VM-to-bare-metal preparation and a reverse conversion to a VirtIO VM profile without guest network access or package installation. Both outputs passed driver, initramfs and generated boot-configuration verification, and the input hashes remained unchanged.
+
+Storage rebuilds and machine preparation still require an appropriate firmware boot and destination launch test for each image and target; these checks do not certify cloud support or physical hardware compatibility.
 
 ## Relationship to the QCOW2 optimization record
 
-The supplied Oracle Linux optimization record informed source preservation, isolated libguestfs access, optional sparsification, zlib QCOW2 output, and guest-visible byte comparison after conversion. Its XFS shrink procedure was a layout-specific filesystem rebuild, not a general `qemu-img resize` operation. Cloud Image Forge deliberately does not turn that procedure into an unvalidated automatic shrink path.
+The supplied Oracle Linux optimization record informed source preservation, isolated libguestfs access, optional sparsification, zlib QCOW2 output, and guest-visible byte comparison after conversion. Its XFS procedure is implemented as an explicitly selected, validated filesystem rebuild for supported layouts. It creates new filesystems and verifies restored contents; it never shrinks XFS by truncating a disk or logical volume.
 
 The record also distinguishes virtual capacity, compressed file length, and allocated host blocks. The UI preserves that distinction: reducing virtual disk size is not the same as reducing transfer bytes, and a smaller exported disk does not guarantee a smaller provisioned cloud boot volume. See [architecture and validation notes](docs/architecture.md) for implementation details.

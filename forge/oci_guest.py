@@ -18,9 +18,11 @@ MODULE_CONFIG = {
     "virtio_scsi": "CONFIG_SCSI_VIRTIO", "virtio_net": "CONFIG_VIRTIO_NET",
     "virtio_console": "CONFIG_VIRTIO_CONSOLE", "sd_mod": "CONFIG_BLK_DEV_SD",
     "e1000": "CONFIG_E1000", "sym53c8xx": "CONFIG_SCSI_SYM53C8XX_2",
-    "ata_piix": "CONFIG_ATA_PIIX", "iscsi_tcp": "CONFIG_ISCSI_TCP",
+    "ata_piix": "CONFIG_ATA_PIIX", "iscsi_tcp": "CONFIG_ISCSI_TCP", "iscsi_ibft": "CONFIG_ISCSI_IBFT",
     "dm_multipath": "CONFIG_DM_MULTIPATH", "ixgbevf": "CONFIG_IXGBEVF",
     "iavf": "CONFIG_IAVF", "mlx5_core": "CONFIG_MLX5_CORE", "ipv6": "CONFIG_IPV6",
+    "ixgbe": "CONFIG_IXGBE", "i40e": "CONFIG_I40E", "mlx4_en": "CONFIG_MLX4_EN",
+    "bnxt_en": "CONFIG_BNXT",
 }
 STORAGE_DRIVERS = {"PARAVIRTUALIZED": {"virtio_pci", "virtio_blk", "virtio_scsi", "sd_mod"},
                    "SCSI": {"sym53c8xx", "sd_mod"}, "IDE": {"ata_piix", "sd_mod"},
@@ -182,7 +184,7 @@ def _uek_supported(version):
     return "uek" in version.lower() and bool(numbers) and tuple(map(int, numbers.groups())) >= (5, 4, 17, 2036)
 
 
-def plan_guest(inspection: dict, config: dict, allow_network=False, planned_firmware=()) -> dict:
+def plan_guest(inspection: dict, config: dict, allow_network=False, planned_firmware=(), platform_nic_driver=None) -> dict:
     evidence = inspection.get("oci_evidence") or {}
     changes, blockers, warnings, packages = [], [], [], set()
     guest = config.get("guest", {})
@@ -213,13 +215,16 @@ def plan_guest(inspection: dict, config: dict, allow_network=False, planned_firm
         elif kind == "E1000":
             required.add("e1000")
         elif kind == "VFIO":
-            common = {"ixgbevf", "iavf", "mlx5_core"}
+            if platform_nic_driver is not None and platform_nic_driver not in {"ixgbe", "ixgbevf", "i40e", "iavf", "mlx4_en", "mlx5_core", "bnxt_en"}:
+                raise ValueError("Unsupported selected hardware NIC driver")
+            common = {platform_nic_driver} if platform_nic_driver else {"ixgbevf", "iavf", "mlx5_core"}
             for kernel in kernels.values():
                 common &= {module for module in common if _supported(kernel, module)}
             if not common:
-                blockers.append("VFIO networking needs an installed physical VF driver (ixgbevf, iavf or mlx5_core) across the selected kernels; the target shape's NIC must match it.")
+                blockers.append("Hardware networking needs the selected physical NIC driver across every kernel." if platform_nic_driver else "VFIO networking needs an installed physical VF driver (ixgbevf, iavf or mlx5_core) across the selected kernels; the target shape's NIC must match it.")
             required.update(common)
-            warnings.append("VFIO exposes a hardware VF: verify the selected shape's NIC against the inspected VF drivers. vfio-pci is a host passthrough driver, not a guest Ethernet driver.")
+            warnings.append(("The explicitly selected hardware NIC driver must match the destination device; no offline check proves the target hardware. " if platform_nic_driver else "VFIO exposes a hardware VF: verify the selected shape's NIC against the inspected VF drivers. ")
+                            + "vfio-pci is a host passthrough driver, not a guest Ethernet driver.")
         else:
             blockers.append(f"Network.AttachmentType={kind}: no validated guest driver adapter is available.")
     iscsi = any("ISCSI" in _values(config, key) for key in STORAGE_KEYS)
@@ -228,6 +233,7 @@ def plan_guest(inspection: dict, config: dict, allow_network=False, planned_firm
     if iscsi_boot and not evidence.get("iscsi_boot_configured"):
         blockers.append("iSCSI boot needs existing firmware discovery (rd.iscsi.firmware=1, rd.iscsi.ibft=1, or legacy ip=ibft) and dracut iSCSI support. Adding iscsi_tcp alone cannot convert this image to OCI native boot.")
     if iscsi_boot:
+        required.add("iscsi_ibft")
         warnings.append("Existing firmware-discovered iSCSI boot configuration will be retained; a successful OCI native-mode boot must still be validated.")
     if multipath:
         required.add("dm_multipath")
@@ -269,7 +275,9 @@ def plan_guest(inspection: dict, config: dict, allow_network=False, planned_firm
     if _flag(config, "Storage.ParaVirtualization.EncryptionInTransit"):
         warnings.append("Paravirtualized encryption-in-transit is an OCI attachment property. Confirm this custom image and target shape are supported by OCI; the exported disk is not encrypted by this setting.")
     warnings.append("Paravirtualized attachment version is applied by OCI. Installed VirtIO drivers are checked; the platform must offer the requested version.")
-    initramfs = "dracut" if tools.get("dracut") and rpm else "initramfs-tools" if tools.get("update-initramfs") else "dracut" if tools.get("dracut") else None
+    initramfs = "dracut" if tools.get("dracut") and (rpm or iscsi_boot) else "initramfs-tools" if tools.get("update-initramfs") else "dracut" if tools.get("dracut") else None
+    if iscsi_boot and initramfs != "dracut":
+        blockers.append("Firmware-discovered iSCSI boot preparation requires the installed dracut initramfs framework.")
     if prepare:
         if not tools.get("systemctl"):
             blockers.append("Automatic OCI guest preparation requires a systemd Linux guest.")
@@ -363,6 +371,8 @@ def _network_files(backend):
 
 
 def _initramfs_script(inspection, plan):
+    if plan["iscsi_boot"] and plan["initramfs_backend"] != "dracut":
+        raise ValueError("iSCSI initramfs verification requires dracut")
     commands = ["set -eu"]
     for version, kernel in inspection["oci_evidence"]["kernels"].items():
         if not re.fullmatch(r"[A-Za-z0-9_.+~-]+", version):
@@ -383,15 +393,19 @@ def _initramfs_script(inspection, plan):
                 continue
             expression = r"/" + module.replace("_", "[-_]") + r"\.ko([. /]|$)"
             commands.append("printf '%s\\n' \"$listing\" | grep -Eq " + shlex.quote(expression) + " || { echo " + shlex.quote(f"Required driver {module} absent from initramfs {version}") + " >&2; exit 1; }")
+        if plan["iscsi_boot"]:
+            from .platform import iscsi_initramfs_checks
+            commands += iscsi_initramfs_checks(path)
     return "\n".join(commands)
 
 
-def prepare_guest(work: Path, inspection: dict, config: dict, allow_network: bool, log) -> dict:
+def prepare_guest(work: Path, inspection: dict, config: dict, allow_network: bool, log,
+                  *, extra_required_modules=(), platform_migration=None) -> dict:
     from .engine import EngineError, ImageEngine, _grub_assignment, _guest, _mount, _roots, _run
     from .oci import OciConfig, compatibility_plan
 
     model = OciConfig.model_validate(config)
-    plan = compatibility_plan(inspection, model, allow_network)
+    plan = compatibility_plan(inspection, model, allow_network, platform_migration=platform_migration)
     if plan["blockers"]:
         raise EngineError("OCI preparation blocked: " + " ".join(plan["blockers"]))
     if not config.get("guest", {}).get("prepare", True):
@@ -401,9 +415,22 @@ def prepare_guest(work: Path, inspection: dict, config: dict, allow_network: boo
     if plan["packages"]:
         _run(["virt-customize", "--format", "qcow2", "-a", str(work), "--network", "--install", ",".join(plan["packages"])], log)
         inspection = ImageEngine().inspect(work)
-        plan = compatibility_plan(inspection, model, allow_network=False)
+        plan = compatibility_plan(inspection, model, allow_network=False, platform_migration=platform_migration)
         if plan["blockers"]:
             raise EngineError("OCI prerequisites still missing after package installation: " + " ".join(plan["blockers"]))
+    if extra_required_modules:
+        from copy import deepcopy
+        if any(not re.fullmatch(r"[A-Za-z0-9_]{1,100}", module) for module in extra_required_modules):
+            raise EngineError("Invalid additional initramfs driver name.")
+        inspection = deepcopy(inspection)
+        plan["required_modules"] = sorted(set(plan["required_modules"]) | set(extra_required_modules))
+        for version, kernel in inspection["oci_evidence"]["kernels"].items():
+            hardware = inspection.get("platform", {}).get("kernels", {}).get(version, {})
+            for key in ("modules", "builtin"):
+                kernel[key] = sorted(set(kernel.get(key, [])) | set(hardware.get(key, [])))
+            missing = set(plan["required_modules"]) - set(kernel["modules"]) - set(kernel["builtin"])
+            if missing:
+                raise EngineError(f"Kernel {version} lacks required migration drivers: {', '.join(sorted(missing))}")
     guest = config.get("guest", {})
     evidence = inspection["oci_evidence"]
     commands = []
@@ -476,14 +503,35 @@ def prepare_guest(work: Path, inspection: dict, config: dict, allow_network: boo
     if set(after_kernels) != set(evidence["kernels"]):
         raise EngineError("Kernel inventory changed during OCI preparation; inspect the build before export.")
     for version, kernel in after_kernels.items():
+        original = evidence["kernels"][version]
+        expected = ((original.get("initrd") or f"/boot/initramfs-{version}.img")
+                    if plan["initramfs_backend"] == "dracut" else f"/boot/initrd.img-{version}")
+        if kernel.get("initrd") != expected:
+            raise EngineError("OCI verification found a different initramfs from the one checked by the guest tools.")
         # The immediately preceding guest-native listing proved these modules are in
         # this freshly rebuilt initrd, even when older libguestfs cannot list it.
         verified = set(plan["required_modules"]) - set(kernel.get("builtin", []))
         kernel["initrd_modules"] = sorted(set(kernel.get("initrd_modules") or []) | verified)
     final_model = model.model_copy(deep=True)
     final_model.guest.prepare = False
-    final = compatibility_plan(after, final_model, allow_network=False)
+    final = compatibility_plan(after, final_model, allow_network=False, platform_migration=platform_migration,
+                               project_platform=False)
     if final["blockers"]:
         raise EngineError("OCI guest verification failed after preparation: " + " ".join(final["blockers"]))
+    if extra_required_modules:
+        hardware = after.get("platform", {}).get("kernels", {})
+        if set(hardware) != set(evidence["kernels"]):
+            raise EngineError("Hardware kernel inventory changed during OCI preparation.")
+        for version, original in evidence["kernels"].items():
+            expected = ((original.get("initrd") or f"/boot/initramfs-{version}.img")
+                        if plan["initramfs_backend"] == "dracut" else f"/boot/initrd.img-{version}")
+            if hardware[version].get("initrd") != expected or not hardware[version].get("initrd_sha256"):
+                raise EngineError("OCI migration receipt must identify the exact initramfs that was verified.")
+        plan["verified_initrds"] = {
+            version: {"path": kernel.get("initrd"), "sha256": kernel.get("initrd_sha256"),
+                      "modules": sorted(set(plan["required_modules"]) - set(kernel.get("builtin", []))),
+                      "iscsi_boot": bool(plan["iscsi_boot"])}
+            for version, kernel in after.get("platform", {}).get("kernels", {}).items()
+        }
     log("OCI guest preparation completed; actual configuration and rebuilt initramfs driver inclusion verified")
     return plan

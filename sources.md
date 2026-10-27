@@ -1,9 +1,14 @@
-https://github.com/cj667113/VirtualMachine_to_OCI-BareMetal
+# Implementation references
 
-https://github.com/cj667113/VirtualMachine_to_OCI-VM
+- [VirtualMachine_to_OCI-BareMetal](https://github.com/cj667113/VirtualMachine_to_OCI-BareMetal): experimental EFI/native preparation examples. Informs physical NIC, storage-driver and initramfs requirements. Its machine-specific boot addresses, initiator identities, BLS deletion and layout assumptions are not copied into this application.
+- [VirtualMachine_to_OCI-VM](https://github.com/cj667113/VirtualMachine_to_OCI-VM): VM preparation examples. Informs VirtIO, generic initramfs, networking and boot-argument adaptation.
+- [OCI BYOI requirements and limitations](https://docs.oracle.com/en-us/iaas/Content/Compute/References/bringyourownimage.htm): provider requirements; explicitly states BYOI to bare-metal instances is unsupported. Experimental disk preparation must not be presented as OCI support.
+- [OCI Linux image import](https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/importingcustomimagelinux.htm) and [custom images](https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/managingcustomimages.htm): import and lifecycle requirements.
+- [dracut iSCSI module setup](https://github.com/dracutdevs/dracut/blob/master/modules.d/95iscsi/module-setup.sh), [command-line hook](https://github.com/dracutdevs/dracut/blob/master/modules.d/95iscsi/parse-iscsiroot.sh) and [firmware handler](https://github.com/dracutdevs/dracut/blob/master/modules.d/95iscsi/iscsiroot.sh): kernel modules, installed userspace, boot hooks and firmware login behavior. Verification follows the handler actually present in each guest archive, including modern `iscsiadm`/`iscsid` implementations.
+- [Linux 6.12 firmware Kconfig](https://github.com/torvalds/linux/blob/v6.12/drivers/firmware/Kconfig): `CONFIG_ISCSI_IBFT` exposes firmware boot information through sysfs; the firmware-discovery profile requires this driver in addition to iSCSI transport support.
+- [libguestfs API](https://libguestfs.org/guestfs.3.html) and [archive implementation](https://github.com/libguestfs/libguestfs/blob/master/daemon/tar.c): isolated filesystem access, GPT/LVM APIs, metadata-preserving archive export/restore and validation.
+- [virt-resize](https://libguestfs.org/virt-resize.1.html): direct resize behavior and filesystem limitations.
+- [Oracle Linux XFS documentation](https://docs.oracle.com/en/operating-systems/oracle-linux/9/xfs/xfs-GrowinganXFSFileSystem.html): XFS growth and the absence of in-place shrink.
+- [Debian bookworm mkfs.xfs](https://manpages.debian.org/bookworm/xfsprogs/mkfs.xfs.8.en.html): filesystem creation features in the pinned image appliance.
 
-https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/managingcustomimages.htm
-
-https://docs.oracle.com/en-us/iaas/Content/Compute/References/bringyourownimage.htm
-
-https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/importingcustomimagelinux.htm
+The user-supplied QCOW2 optimization record additionally informed the new-disk XFS/LVM rebuild, UUID and EFI preservation, zlib QCOW2 output, and the distinction between virtual disk capacity and compressed transfer size. Private source images, host details and login credentials are not repository fixtures.

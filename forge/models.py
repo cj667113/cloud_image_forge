@@ -56,6 +56,48 @@ class BootMigration(StrictModel):
     install_packages: bool = False
 
 
+class FilesystemSize(StrictModel):
+    device: str = Field(max_length=256, pattern=r"^/dev/(sda[1-9][0-9]*|[A-Za-z0-9_+.-]+/[A-Za-z0-9_+.-]+)$")
+    size_mib: int = Field(ge=32, le=2097152)
+
+    @field_validator("device")
+    @classmethod
+    def no_relative_components(cls, value: str) -> str:
+        if any(component in {".", ".."} for component in value.split("/")):
+            raise ValueError("Filesystem sizes must name an inspected device, without relative path components")
+        return value
+
+
+class StorageRebuild(StrictModel):
+    enabled: bool = False
+    sizes: list[FilesystemSize] = Field(default_factory=list, max_length=128)
+
+    @model_validator(mode="after")
+    def unique_filesystems(self):
+        devices = [item.device for item in self.sizes]
+        if len(devices) != len(set(devices)):
+            raise ValueError("Each filesystem can have one target size")
+        return self
+
+
+class PlatformMigration(StrictModel):
+    enabled: bool = False
+    source: Literal["vm", "bare_metal"] = "vm"
+    target: Literal["vm", "bare_metal"] = "bare_metal"
+    boot_attachment: Literal["paravirtualized", "iscsi"] = "iscsi"
+    network_attachment: Literal["paravirtualized", "vfio"] = "vfio"
+    nic_driver: Literal["ixgbe", "ixgbevf", "i40e", "iavf", "mlx4_en", "mlx5_core", "bnxt_en"] | None = None
+    install_packages: bool = False
+    configure_network: bool = True
+    configure_serial_console: bool = True
+
+    @model_validator(mode="after")
+    def migration_direction(self):
+        if self.enabled and self.source == self.target:
+            raise ValueError("Select different source and target machine types")
+        return self
+
+
 class Recipe(StrictModel):
     target: Literal["oci", "aws", "azure", "gcp", "generic"] = "oci"
     output_format: Literal["qcow2", "raw", "vhd", "gcp"] = "qcow2"
@@ -75,6 +117,8 @@ class Recipe(StrictModel):
     compress: bool = True
     allow_network: bool = False
     boot_migration: BootMigration | None = None
+    storage_rebuild: StorageRebuild | None = None
+    platform_migration: PlatformMigration | None = None
     oci: OciConfig | None = None
 
     @field_validator("packages_install", "packages_remove")
@@ -103,6 +147,8 @@ class Recipe(StrictModel):
         devices = [c.device for c in self.partition_changes]
         if len(devices) != len(set(devices)) or self.expand_partition in devices:
             raise ValueError("Each partition can have one resize action")
+        if self.storage_rebuild and self.storage_rebuild.enabled and (self.partition_changes or self.expand_partition or self.expand_lv):
+            raise ValueError("Filesystem rebuild cannot be combined with direct partition or LV expansion actions")
         paths = [f.path for f in self.files]
         if len(paths) != len(set(paths)):
             raise ValueError("Each configuration file can be edited once")
@@ -115,11 +161,25 @@ class OciPlanRequest(StrictModel):
     oci: OciConfig
     allow_network: bool = False
     boot_migration: BootMigration | None = None
+    platform_migration: PlatformMigration | None = None
 
 
 class UefiPlanRequest(StrictModel):
     boot_migration: BootMigration
     allow_network: bool = False
+
+
+class StoragePlanRequest(StrictModel):
+    storage_rebuild: StorageRebuild
+    disk_size_gib: float | None = Field(default=None, gt=0, le=2048)
+
+
+class PlatformPlanRequest(StrictModel):
+    platform_migration: PlatformMigration
+    allow_network: bool = False
+    target: Literal["oci", "aws", "azure", "gcp", "generic"] = "oci"
+    oci: OciConfig | None = None
+    boot_migration: BootMigration | None = None
 
 
 class OciSchemaRequest(StrictModel):

@@ -18,7 +18,8 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .config import Settings
 from .jobs import Jobs
-from .models import ObjectLocation, Recipe, OciPlanRequest, OciSchemaRequest, UefiPlanRequest
+from .models import (ObjectLocation, Recipe, OciPlanRequest, OciSchemaRequest, UefiPlanRequest,
+                     StoragePlanRequest, PlatformPlanRequest)
 from .oci import catalog as oci_catalog, compatibility_plan
 from .store import Store
 from . import transfers
@@ -198,7 +199,8 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
             if image["status"] != "ready" or image.get("inspection_status") in {"queued", "running"}:
                 raise HTTPException(409, "Wait for successful inspection before planning OCI preparation")
             return compatibility_plan(image["inspection"], body.oci, body.allow_network,
-                                      body.boot_migration.model_dump() if body.boot_migration else None)
+                                      body.boot_migration.model_dump() if body.boot_migration else None,
+                                      platform_migration=body.platform_migration.model_dump() if body.platform_migration else None)
 
     @app.post("/api/images/{image_id}/uefi/plan")
     def plan_uefi(image_id: str, body: UefiPlanRequest):
@@ -208,6 +210,28 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
             if image["status"] != "ready" or image.get("inspection_status") in {"queued", "running"}:
                 raise HTTPException(409, "Wait for successful inspection before planning boot migration")
             return plan_migration(image["inspection"], body.boot_migration.model_dump(), body.allow_network)
+
+    @app.post("/api/images/{image_id}/storage/plan")
+    def plan_storage(image_id: str, body: StoragePlanRequest):
+        from .storage import plan_rebuild
+        with app.state.jobs.inspection_lock:
+            image = get_record("image", image_id)
+            if image["status"] != "ready" or image.get("inspection_status") in {"queued", "running"}:
+                raise HTTPException(409, "Wait for successful inspection before planning storage changes")
+            if body.disk_size_gib and body.disk_size_gib > settings.max_virtual_gib:
+                raise HTTPException(422, "Requested virtual size exceeds FORGE_MAX_VIRTUAL_GIB")
+            return plan_rebuild(image["inspection"], body.storage_rebuild.model_dump(), body.disk_size_gib)
+
+    @app.post("/api/images/{image_id}/platform/plan")
+    def plan_machine(image_id: str, body: PlatformPlanRequest):
+        from .platform import plan_platform
+        with app.state.jobs.inspection_lock:
+            image = get_record("image", image_id)
+            if image["status"] != "ready" or image.get("inspection_status") in {"queued", "running"}:
+                raise HTTPException(409, "Wait for successful inspection before planning machine migration")
+            return plan_platform(image["inspection"], body.platform_migration.model_dump(), body.allow_network,
+                                 body.oci.model_dump() if body.oci else None, target_provider=body.target,
+                                 boot_migration=body.boot_migration.model_dump() if body.boot_migration else None)
 
     @app.get("/api/images/{image_id}")
     def image_detail(image_id: str):
@@ -272,6 +296,18 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
             if recipe.disk_size_gib and recipe.disk_size_gib > settings.max_virtual_gib:
                 raise HTTPException(422, "Requested virtual size exceeds FORGE_MAX_VIRTUAL_GIB")
             migration = recipe.boot_migration.model_dump() if recipe.boot_migration else None
+            if recipe.storage_rebuild and recipe.storage_rebuild.enabled:
+                from .storage import plan_rebuild
+                storage_plan = plan_rebuild(image["inspection"], recipe.storage_rebuild.model_dump(), recipe.disk_size_gib)
+                if not storage_plan["ready"]:
+                    raise HTTPException(422, "Storage rebuild: " + " ".join(storage_plan["blockers"]))
+            if recipe.platform_migration and recipe.platform_migration.enabled:
+                from .platform import plan_platform
+                platform_plan = plan_platform(image["inspection"], recipe.platform_migration.model_dump(), recipe.allow_network,
+                                              recipe.oci.model_dump() if recipe.oci else None, target_provider=recipe.target,
+                                              boot_migration=migration)
+                if not platform_plan["ready"]:
+                    raise HTTPException(422, "Machine migration: " + " ".join(platform_plan["blockers"]))
             if migration and migration["enabled"]:
                 from .uefi import plan_migration
                 migration_plan = plan_migration(image["inspection"], migration, recipe.allow_network)
@@ -281,7 +317,8 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
                 if capacity + migration_plan.get("growth_bytes", 0) > settings.max_virtual_gib * 1024**3:
                     raise HTTPException(422, "UEFI migration would exceed FORGE_MAX_VIRTUAL_GIB")
             if recipe.oci:
-                plan = compatibility_plan(image["inspection"], recipe.oci, recipe.allow_network, migration)
+                plan = compatibility_plan(image["inspection"], recipe.oci, recipe.allow_network, migration,
+                                          platform_migration=recipe.platform_migration.model_dump() if recipe.platform_migration else None)
                 if plan["blockers"]:
                     raise HTTPException(422, "OCI compatibility: " + " ".join(plan["blockers"]))
             job = app.state.jobs.build(image, recipe.model_dump())

@@ -450,3 +450,72 @@ def test_uefi_migration_growth_respects_server_capacity(client, monkeypatch):
         "disk_size_gib": client.app.state.settings.max_virtual_gib, "boot_migration": {"enabled": True}})
     assert response.status_code == 422 and "FORGE_MAX_VIRTUAL_GIB" in response.text
     assert len(client.get("/api/jobs").json()) == 1
+
+
+@pytest.mark.parametrize("route,field", [("storage", "storage_rebuild"), ("platform", "platform_migration")])
+def test_new_plans_require_refresh_for_old_imports_without_mutating_sources(client, tmp_path, route, field):
+    image_id = imported(client)
+    before = client.get(f"/api/images/{image_id}").json()
+    payload = {field: {"enabled": True}}
+    preview = client.post(f"/api/images/{image_id}/{route}/plan", json=payload)
+    assert preview.status_code == 200, preview.text
+    assert not preview.json()["ready"]
+    assert "refresh" in " ".join(preview.json()["blockers"]).lower()
+    assert client.get(f"/api/images/{image_id}").json() == before
+    assert client.post(f"/api/images/{image_id}/build", json=payload).status_code == 422
+    assert len(client.get("/api/jobs").json()) == 1
+    assert (tmp_path / "images" / image_id / "source").read_bytes() == b"test-source"
+
+
+@pytest.mark.parametrize("route,field", [("storage", "storage_rebuild"), ("platform", "platform_migration")])
+def test_new_plans_wait_for_in_progress_inspection(client, route, field):
+    image_id = imported(client)
+    client.app.state.store.update("image", image_id, inspection_status="running")
+    assert client.post(f"/api/images/{image_id}/{route}/plan", json={field: {"enabled": True}}).status_code == 409
+
+
+@pytest.mark.parametrize("recipe", [
+    {"storage_rebuild": {"enabled": True, "sizes": [{"device": "/dev/sda1", "size_mib": 512}]},
+     "expand_partition": "/dev/sda1"},
+    {"storage_rebuild": {"enabled": True, "sizes": [{"device": "/dev/vg/root", "size_mib": 512}] * 2}},
+    {"storage_rebuild": {"enabled": True, "sizes": [{"device": "/dev/../etc", "size_mib": 512}]}},
+    {"platform_migration": {"enabled": True, "source": "vm", "target": "vm"}},
+    {"platform_migration": {"enabled": True, "nic_driver": "mlx5_core; reboot"}},
+])
+def test_migration_and_rebuild_schema_reject_ambiguous_or_unsafe_inputs(client, recipe):
+    image_id = imported(client)
+    assert client.post(f"/api/images/{image_id}/build", json=recipe).status_code == 422
+    assert len(client.get("/api/jobs").json()) == 1
+
+
+def test_real_storage_plan_is_admitted_and_recipe_survives_worker_and_manifest(client, tmp_path):
+    from test_storage import inspected, OPTIONS
+    image_id = imported(client)
+    client.app.state.store.update("image", image_id, inspection=inspected())
+    recipe = {"storage_rebuild": OPTIONS, "disk_size_gib": 10_000_000_000 / 1024**3}
+    preview = client.post(f"/api/images/{image_id}/storage/plan", json=recipe)
+    assert preview.status_code == 200 and preview.json()["ready"], preview.text
+    assert preview.json()["layout"]["disk_size_after"] == 10_000_000_000
+    response = client.post(f"/api/images/{image_id}/build", json=recipe)
+    assert response.status_code == 202, response.text
+    job = finished(client, response.json()["job_id"])
+    assert job["status"] == "succeeded"
+    manifest = client.get(f"/api/artifacts/{job['result']['artifact_id']}/manifest").json()
+    assert manifest["recipe"]["storage_rebuild"] == OPTIONS
+    assert manifest["recipe"]["disk_size_gib"] == recipe["disk_size_gib"]
+    assert (tmp_path / "images" / image_id / "source").read_bytes() == b"test-source"
+
+
+def test_real_vm_plan_and_profile_survive_worker_and_manifest(client):
+    from test_platform import image, options
+    image_id = imported(client)
+    client.app.state.store.update("image", image_id, inspection=image())
+    profile = options()
+    preview = client.post(f"/api/images/{image_id}/platform/plan", json={"platform_migration": profile})
+    assert preview.status_code == 200 and preview.json()["ready"], preview.text
+    response = client.post(f"/api/images/{image_id}/build", json={"platform_migration": profile})
+    assert response.status_code == 202, response.text
+    job = finished(client, response.json()["job_id"])
+    manifest = client.get(f"/api/artifacts/{job['result']['artifact_id']}/manifest").json()
+    for key, value in profile.items():
+        assert manifest["recipe"]["platform_migration"][key] == value
