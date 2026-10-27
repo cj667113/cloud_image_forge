@@ -1,0 +1,187 @@
+# Cloud Image Forge
+
+Cloud Image Forge is a self-hosted web application for editing offline Linux virtual machine images. Import a local disk image or an object from S3, inspect its filesystems, change guest configuration, then download a new image or upload it to an S3-compatible endpoint. Each build starts from an immutable imported source.
+
+The application includes a FastAPI service, a dependency-free browser interface, a persistent job queue, and a Linux image engine built on QEMU and libguestfs. Disk operations run inside a libguestfs appliance, without mounting guest filesystems or activating guest LVM volumes on the host.
+
+## Start with Docker
+
+Use a **Linux x86_64 host** with Docker Engine and Docker Compose. Budget several gigabytes of RAM and enough storage for the source, working copies, and output. RAW and fixed VHD exports can approach the full virtual disk size, regardless of how small the input QCOW2 file is.
+
+```sh
+cp .env.example .env
+docker compose up --build -d
+```
+
+Open **http://localhost:8080**. The default configuration binds only to loopback and uses software emulation, so it does not need `/dev/kvm`, privileged mode, or access to host disks. The first build includes a Linux kernel and image tooling and will take longer than a typical web application image.
+
+The Docker image targets `linux/amd64`. Docker Desktop on macOS or Windows adds a Linux VM, and ARM hosts add another architecture emulation layer. Real image operations on those configurations have not been validated; use a Linux x86_64 worker for image builds. The API and browser UI can be developed on macOS without the image tools, but image operations will report the missing engine dependencies.
+
+The named `forge-data` volume stores imported images, jobs, build outputs, and metadata. `docker compose down` preserves it. Do not use `docker compose down -v` if you need to retain your images. Run **one API process and one replica per data directory**; an exclusive workspace lock rejects a second process using the same directory.
+
+## Import, customize, export
+
+1. Start at **Source**. Import an offline local file, enter an `s3://bucket/path/image.qcow2` or public/presigned HTTPS URL, or select a previously imported image. Custom S3 endpoints and regions are supported; credentials come from the server's AWS SDK configuration.
+2. Continue to **Inspect** when import finishes. Review the operating system, disk capacity, partitions, filesystems, detected boot support, and warnings.
+3. Use **Next** through **Storage**, **Startup**, **Mounts**, and **Boot & kernel**. Set the changes you need or keep the existing settings. **Back** and the available step buttons let you revisit choices without clearing them.
+4. Choose the provider and output format in **Destination**. Oracle Cloud adds an **OCI compatibility** step for optional capability settings and guest preparation.
+5. Check the changes and edited configuration files in **Review**. Use each card's **Edit** action to revise them, then select **Build image**.
+6. Stay in **Build & export** to follow progress and logs. Download the completed image and manifest, or upload it to S3 using an optional custom endpoint. OCI configuration is available when included in the build. **Exports** and **Activity** also provide access to completed files and job history.
+
+The wizard shows the current step and keeps your choices while you navigate. Inspection, field validation, and required migration or OCI checks must finish before the relevant step can continue.
+
+Images must be shut down before export from the source hypervisor. Supported inputs are standalone **QCOW2, RAW, and fixed/dynamic VHD** disk files. The importer also accepts the reference project's two-member OCI export archive: regular root-level files named exactly `output.QCOW2` and `image_metadata.json`. It retains the metadata with the source and edits the extracted disk; it does not generate a new OCI metadata bundle on export.
+
+VMDK, VHDX, general OVA/tar archives, backing-file chains, encrypted disks, multidisk guests, and multiple operating systems are unsupported. Extract or convert these to a supported standalone disk before import. The engine does not guess missing disks or decryption keys, and all configured local guest filesystems must be available.
+
+### Boot detection
+
+**Inspect** and **Boot & kernel** show **UEFI**, **legacy BIOS**, **dual**, or **unknown**, with the disk and loader evidence behind the result. Inspection checks EFI system partitions even when they are absent from `fstab`, validates recognized x86_64 EFI applications, and checks installed GRUB BIOS structures. GPT, an empty EFI partition, or a boot-sector signature alone does not establish a boot mode. Unknown means the supported checks could not establish a mode; it does not prove the image cannot boot.
+
+One detected firmware mode initializes the OCI firmware choice when the selected schema permits it. Dual-mode images require an explicit choice, and OCI preparation checks the selected modes against the detected support. This is offline evidence, not the VM's last firmware setting or a successful boot test. Firmware NVRAM is outside the disk image; vendor-only EFI paths may require a destination boot entry. See [detection and validation limits](docs/architecture.md#boot-mode-evidence).
+
+Use **Refresh inspection** for older imports or to rerun detection against the preserved source without uploading it again. The API is `POST /api/images/{image_id}/inspect`; it returns a job with HTTP 202. Refreshing preserves the source and the editor draft. The previous inspection remains available if refresh fails, and new builds and OCI plans wait while refresh is queued or running.
+
+### Add UEFI support to a BIOS image
+
+The **Boot & kernel** step offers explicit **BIOS-to-UEFI migration** with a preview of changes and blockers. It supports eligible x86_64 Debian/Ubuntu, Enterprise Linux 9/10 derivatives, and Fedora 34+ images with detected BIOS support and suitable kernels, filesystems, and GRUB tooling. Refresh older imports to collect the migration prerequisites.
+
+The preview uses the imported source. Storage and package edits run first during a build, then migration is replanned against the changed working disk; those edits can change eligibility and final capacity.
+
+Migration runs on the working copy. It reuses one suitable FAT32 EFI system partition without formatting it, or grows the disk and appends a new ESP (512 MiB by default, plus alignment space). Existing partitions stay in place. It installs an EFI fallback loader, updates the ESP's UUID mount in `fstab`, regenerates GRUB configuration, and checks that BIOS structures and UEFI support remain detectable. Previous EFI files, `fstab`, and GRUB configuration are backed up inside the output guest.
+
+The partition table remains GPT or MBR; MBR requires a free primary slot and capacity below its addressing limit. Hybrid tables, extended/logical MBR layouts, ambiguous ESPs, unsupported boot filesystems, and missing kernel EFI support produce blockers. Required guest packages need both migration package permission and guest network permission. RPM migrations reinstall package-provided EFI GRUB; Debian/Ubuntu can use existing EFI tooling offline.
+
+Boot the result with **Secure Boot disabled** and test both desired firmware modes. Firmware NVRAM is not changed, and future package upgrades may require refreshing the fallback loader. OCI firmware selection can use the planned migration, but publication requires UEFI evidence in the final image. OCI's Linux import guide still specifies BIOS source requirements while its capability schema exposes UEFI; validate the imported image and intended launch configuration in OCI. [OCI Linux import requirements](https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/importingcustomimagelinux.htm), [OCI image capabilities](https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/configuringimagecapabilities.htm)
+
+### Guest changes
+
+| Area | Available operations |
+| --- | --- |
+| Storage | Grow physical partitions; shrink direct ext2/3/4 partitions offline; expand a selected partition/LVM PV and one logical volume |
+| Startup | Enable, disable, mask, or unmask systemd units; edit custom `.service` units |
+| Scheduling | Edit `/etc/crontab` and files in `/etc/cron.d/` |
+| Mounts | Edit `/etc/fstab` using the inspected contents as a starting point |
+| Boot | Edit `/etc/default/grub`, change kernel arguments, regenerate GRUB configuration; add UEFI support to eligible BIOS images |
+| Kernel | Install/remove packages, choose a supported installed default kernel, rebuild initramfs |
+| Modules | Edit `/etc/modules-load.d/cloud-image-forge.conf` and `/etc/modprobe.d/cloud-image-forge.conf` |
+| Output | Optional sparsification, QCOW2 compression, conversion, comparison, SHA-256 hashing |
+
+Guest package operations require explicitly enabling network access in the recipe. Package repositories and package names belong to the guest distribution. A new kernel must be compatible with the guest's bootloader, filesystem, and destination hypervisor; selecting a provider preset does not install or configure that provider's agent automatically. Default-kernel selection currently requires the guest's `grubby` command. Initramfs rebuilding uses `dracut` or `update-initramfs`; GRUB regeneration uses `update-grub` or `grub2-mkconfig`. Unsupported guest tooling produces an explicit job error.
+
+**XFS cannot shrink in place.** Reducing an XFS filesystem requires a separate rebuild-and-restore workflow that preserves ownership, ACLs, extended attributes, SELinux labels, filesystem UUIDs, and EFI boot content. This application does not automate that reconstruction or shrinking LVM volumes; it rejects those requests instead of truncating live data. Direct ext2/3/4 partition shrinking is supported with an offline filesystem resize before partition reduction. Other resize requests are subject to filesystem and layout validation. See the [libguestfs resize documentation](https://libguestfs.org/virt-resize.1.html) for the underlying tool's behavior.
+
+### Export presets
+
+| Preset | Artifact | Destination preparation still required |
+| --- | --- | --- |
+| Oracle Cloud | Standalone QCOW2 with zlib compression and 128 KiB clusters when compression is enabled | Check firmware, launch mode, storage/network drivers, cloud agent, and supported shape |
+| AWS EC2 | RAW disk image | Use VM Import/Export with its IAM role, supported OS/kernel, boot mode, and S3 region requirements |
+| Microsoft Azure | Fixed VHD with virtual capacity aligned to 1 MiB | Verify Hyper-V drivers, provisioning agent, generation, and Azure guest preparation |
+| Google Cloud | Gzip-compressed GNU tar containing `disk.raw` | Copy to Cloud Storage, prepare guest environment, and create a Compute Engine image |
+| Generic | QCOW2, RAW, or fixed VHD | Match the destination hypervisor's requirements |
+
+These presets produce **import-format candidates**, not cloud certification. The application does not register images, create virtual machines, verify licensing, or prove that an artifact boots. Test an import and launch in the destination account before replacing a working image. OCI metadata bundles (`.oci`) are not generated; a standalone QCOW2 does not carry a separate source `image_metadata.json` into the imported image's launch settings. OCI's Native import recommendation specifically applies to QCOW2 images exported from OCI. [OCI import documentation](https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/custom-images-import.htm)
+
+Provider requirements change. Check the current [AWS VM Import/Export requirements](https://docs.aws.amazon.com/vm-import/latest/userguide/prerequisites.html), [Azure Linux image preparation](https://learn.microsoft.com/en-us/azure/virtual-machines/linux/create-upload-generic), and [Google Cloud manual disk import requirements](https://docs.cloud.google.com/compute/docs/import/import-existing-image) for your source OS and destination.
+
+### OCI compatibility and guest preparation
+
+The **OCI compatibility** step exposes all 13 image capability keys in Oracle's published global schema: firmware, launch mode, NIC and three storage attachment types, consistent volume naming, PV encryption/attachment version, iSCSI multipath, IPv6-only, AMD SEV, and Secure Boot. Enum controls distinguish allowed choices from the preferred choice. Secure Boot stays disabled because OCI custom images do not support it.
+
+Enable OCI preparation, select the capabilities, and use **Preview changes** to review guest changes and blockers before building. Preparation checks boot support and selected device drivers, and can configure initramfs, supported networking, OCI cloud-init discovery, and a serial console. Explicit BIOS-to-UEFI migration is available from **Boot & kernel** when the source is eligible. Package installation requires its preparation or migration option and guest network permission. Unsupported layouts, missing required boot support, and incompatible advanced capabilities produce blockers rather than an image advertised as ready.
+
+You can load a global schema downloaded from the destination region to use its current keys and values. Additional schema keys appear in the editor and export, with an explicit warning when Forge has no guest preparation adapter for them. Firmware and architecture still have to match the source guest; selecting a capability cannot translate an x86_64 image into an Arm image.
+
+Optional import metadata includes compartment, namespace/bucket/object or object URI, display name, OS/version, import mode, tags, and shape compatibility with OCPU/memory bounds. These are exported configuration. After a successful OCI build, download **OCI configuration** alongside the QCOW2. The configuration ZIP contains CLI JSON, schema data, optional instance launch settings, shape entries, the profile, and operator instructions. It is **not** an `.oci` disk-image archive, and creating it performs no cloud import or launch. A supplied presigned object URI remains in the ZIP and profile, so keep those files private.
+
+See the [OCI compatibility reference](docs/oci-compatibility.md) for the exact capability keys, guest-versus-cloud behavior, import/API field mapping, and validation limits.
+
+## S3-compatible storage
+
+The browser provides object locations and optional endpoint/region values. AWS access keys are configured on the server through the SDK credential chain; they are never fields in the browser UI or saved in a build recipe.
+
+For a simple local deployment, set `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and optionally `AWS_SESSION_TOKEN` in `.env`. For production, inject credentials through your container platform or configure a workload role. The default Compose configuration disables EC2 metadata credential lookup; set `AWS_EC2_METADATA_DISABLED=false` only when using an EC2 instance role intentionally.
+
+Custom endpoints can use services such as MinIO or OCI's S3-compatible Object Storage API. Set the service-specific endpoint URL in the import or upload form and use the corresponding server-side credentials. HTTPS certificate verification remains enabled. Private or loopback endpoints require the server operator to set `FORGE_ALLOW_PRIVATE_ENDPOINTS=true`; this allows access to private network destinations and should only be enabled on a trusted deployment.
+
+For profile-based credentials, mount an appropriate AWS configuration directory read-only into `/home/forge/.aws`, with files readable by UID 10001. Never bake credentials into the image or place them in the repository.
+
+## Access and resource configuration
+
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `API_TOKEN` | Empty | Shared access token; the UI exchanges it for a session cookie |
+| `FORGE_BIND_ADDRESS` | `127.0.0.1` | Host interface published by Compose |
+| `FORGE_PORT` | `8080` | Host port published by Compose |
+| `FORGE_DATA_DIR` | `/data` in Docker | Durable application and image storage |
+| `FORGE_MAX_UPLOAD_GIB` | `64` | Maximum received file/object size |
+| `FORGE_MAX_VIRTUAL_GIB` | `2048` | Maximum expanded virtual disk capacity |
+| `FORGE_ALLOW_PRIVATE_ENDPOINTS` | `false` | Permit trusted private object-storage destinations |
+| `LIBGUESTFS_BACKEND_SETTINGS` | `force_tcg` | Software emulation; use `force_kvm` only with KVM configured |
+
+Set a long random `API_TOKEN` before publishing the service beyond localhost. For remote use, place it behind an HTTPS reverse proxy with an upload limit and timeout suitable for large disk images. Forward the original `Host` and scheme, and configure Uvicorn's `FORWARDED_ALLOW_IPS` to trust only your proxy's address so HTTPS sessions and same-origin checks work correctly. This is a single-operator tool; the shared token does not provide tenant isolation or per-user permissions. Imported disks contain executable guest software; use trusted source images and a dedicated image-build host.
+
+Jobs are serialized because each appliance and disk conversion consumes substantial memory and I/O. Interrupting the server interrupts in-flight jobs; interrupted work is marked failed on startup and can be submitted again. Startup recovery removes incomplete imports and unpublished build directories while retaining completed source images and artifacts. Maintain sufficient free disk space for concurrent stored images as well as one active working set. Multipart local uploads are first spooled to `/data/tmp` and then copied into the source directory, so allow room for both copies on the data volume during import. The libguestfs appliance cache remains in the container's `/var/tmp/forge` directory.
+
+### Optional KVM acceleration
+
+On a Linux x86_64 host with hardware virtualization and an accessible `/dev/kvm`, create `compose.kvm.yaml`:
+
+```yaml
+services:
+  forge:
+    devices:
+      - /dev/kvm:/dev/kvm
+    group_add:
+      - "${KVM_GID}"
+    environment:
+      LIBGUESTFS_BACKEND_SETTINGS: force_kvm
+```
+
+Start with the host device's group ID:
+
+```sh
+KVM_GID=$(stat -c '%g' /dev/kvm) docker compose -f compose.yaml -f compose.kvm.yaml up -d
+```
+
+There is no need to expose host block devices or use `--privileged`. If the appliance cannot start, inspect `docker compose logs forge` and run `docker compose exec forge libguestfs-test-tool`. [libguestfs troubleshooting](https://libguestfs.org/guestfs-faq.1.html)
+
+## Development and verification
+
+For API/UI development with Python 3.11 or later on Linux or macOS:
+
+```sh
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.lock
+FORGE_DATA_DIR=./data .venv/bin/uvicorn forge.main:app --host 127.0.0.1 --port 8080
+```
+
+Actual image operations require Linux, the system image tools, and the matching `python3-guestfs` binding. A Linux development venv should be created with `--system-site-packages` to expose that binding. The Dockerfile lists the required Debian packages.
+
+API documentation is available at `/docs`. Run automated tests with:
+
+```sh
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest -q
+```
+
+These tests use mocked image tooling to verify application behavior without a VM. A separate smoke check exercises a real offline Linux image, writes a harmless cron comment into the output, verifies that edit, validates the artifact checksum, and confirms the source bytes are unchanged:
+
+```sh
+./scripts/smoke-image.sh /path/to/source.qcow2 /path/to/new-output-directory
+```
+
+Run that script in the project Python environment on Linux x86_64 or inside the supplied container with a read-only source mount and a writable output location. The output directory must not already exist. This smoke check is separate from a guest boot test and a provider import/launch test.
+
+For a fixture whose boot arrangement you already know, set `FORGE_EXPECT_BOOT_MODE=uefi`, `bios`, `dual`, or `unknown` when running the script. It checks the detected result against that explicit expectation and verifies the source checksum immediately after inspection. This assertion still does not boot the guest.
+
+Set `FORGE_SMOKE_UEFI_MIGRATION=1` to exercise migration on a BIOS-only fixture with the required EFI tools already installed. This smoke mode keeps guest networking and package installation disabled, so use an eligible Debian/Ubuntu fixture; the RPM migration path requires an explicit package workflow. The script additionally checks the output's EFI fallback loader and retained BIOS detection. It still requires separate UEFI and legacy VM boot tests.
+
+The initial implementation was developed on macOS without Docker or libguestfs. Container build, appliance startup, real image operations, and cloud import/launch must be validated on the intended Linux host before operational use.
+
+## Relationship to the QCOW2 optimization record
+
+The supplied Oracle Linux optimization record informed source preservation, isolated libguestfs access, optional sparsification, zlib QCOW2 output, and guest-visible byte comparison after conversion. Its XFS shrink procedure was a layout-specific filesystem rebuild, not a general `qemu-img resize` operation. Cloud Image Forge deliberately does not turn that procedure into an unvalidated automatic shrink path.
+
+The record also distinguishes virtual capacity, compressed file length, and allocated host blocks. The UI preserves that distinction: reducing virtual disk size is not the same as reducing transfer bytes, and a smaller exported disk does not guarantee a smaller provisioned cloud boot volume. See [architecture and validation notes](docs/architecture.md) for implementation details.

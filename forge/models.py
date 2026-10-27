@@ -1,0 +1,126 @@
+"""Strict recipes keep host paths and command options out of job inputs."""
+import re
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from .oci import OciConfig
+
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+
+class ObjectLocation(StrictModel):
+    url: str = Field(min_length=1, max_length=16384)
+    endpoint_url: str | None = Field(default=None, max_length=2048)
+    region: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9-]+$")
+
+
+class FileEdit(StrictModel):
+    path: str = Field(max_length=256)
+    content: str = Field(max_length=262144)
+
+    @field_validator("path")
+    @classmethod
+    def allowed_path(cls, value: str) -> str:
+        fixed = {"/etc/fstab", "/etc/default/grub", "/etc/crontab",
+                 "/etc/modules-load.d/cloud-image-forge.conf", "/etc/modprobe.d/cloud-image-forge.conf"}
+        if value not in fixed and not re.fullmatch(r"/etc/(cron\.d/[A-Za-z0-9_-]+|systemd/system/[A-Za-z0-9_@.-]+\.service)", value):
+            raise ValueError("Choose a supported configuration file, cron file, or systemd service unit")
+        if ".." in value:
+            raise ValueError("Parent paths are not allowed")
+        return value
+
+    @field_validator("content")
+    @classmethod
+    def text_only(cls, value: str) -> str:
+        if "\0" in value:
+            raise ValueError("Configuration must be text without NUL bytes")
+        return value
+
+
+class ServiceChange(StrictModel):
+    name: str = Field(min_length=1, max_length=160, pattern=r"^[A-Za-z0-9_][A-Za-z0-9_@.:-]*\.(service|timer|socket|target)$")
+    action: Literal["enable", "disable", "mask", "unmask"]
+
+
+class PartitionChange(StrictModel):
+    device: str = Field(pattern=r"^/dev/sda[1-9][0-9]*$")
+    size_mib: int = Field(ge=32, le=2097152)
+
+
+class BootMigration(StrictModel):
+    enabled: bool = False
+    esp_size_mib: int = Field(default=512, ge=512, le=2048)
+    install_packages: bool = False
+
+
+class Recipe(StrictModel):
+    target: Literal["oci", "aws", "azure", "gcp", "generic"] = "oci"
+    output_format: Literal["qcow2", "raw", "vhd", "gcp"] = "qcow2"
+    disk_size_gib: float | None = Field(default=None, gt=0, le=2048)
+    partition_changes: list[PartitionChange] = Field(default_factory=list, max_length=128)
+    expand_partition: str | None = Field(default=None, pattern=r"^/dev/sda[1-9][0-9]*$")
+    expand_lv: str | None = Field(default=None, pattern=r"^/dev/[A-Za-z0-9_+.-]+/[A-Za-z0-9_+.-]+$")
+    files: list[FileEdit] = Field(default_factory=list, max_length=100)
+    services: list[ServiceChange] = Field(default_factory=list, max_length=100)
+    packages_install: list[str] = Field(default_factory=list, max_length=100)
+    packages_remove: list[str] = Field(default_factory=list, max_length=100)
+    kernel_default: str | None = Field(default=None, max_length=256, pattern=r"^/boot/vmlinuz-[A-Za-z0-9_.+-]+$")
+    kernel_args: str | None = Field(default=None, max_length=4096)
+    rebuild_initramfs: bool = False
+    regenerate_grub: bool = False
+    sparsify: bool = True
+    compress: bool = True
+    allow_network: bool = False
+    boot_migration: BootMigration | None = None
+    oci: OciConfig | None = None
+
+    @field_validator("packages_install", "packages_remove")
+    @classmethod
+    def package_names(cls, values: list[str]) -> list[str]:
+        if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+_:~=-]{0,159}", item) for item in values):
+            raise ValueError("Use package names or versions, without paths, wildcards, or command options")
+        return values
+
+    @field_validator("kernel_args")
+    @classmethod
+    def single_line(cls, value: str | None) -> str | None:
+        if value is not None and any(c in value for c in "\r\n\0"):
+            raise ValueError("Boot parameters must be a single line")
+        return value
+
+    @model_validator(mode="after")
+    def compatible_recipe(self):
+        if self.oci is not None and self.target != "oci":
+            raise ValueError("OCI capabilities can be applied only to an OCI export")
+        expected = {"oci": "qcow2", "aws": "raw", "azure": "vhd", "gcp": "gcp"}
+        if self.target in expected and self.output_format != expected[self.target]:
+            raise ValueError(f"{self.target} requires the {expected[self.target]} export preset")
+        if self.packages_install and not self.allow_network:
+            raise ValueError("Enable guest network access to install packages from guest repositories")
+        devices = [c.device for c in self.partition_changes]
+        if len(devices) != len(set(devices)) or self.expand_partition in devices:
+            raise ValueError("Each partition can have one resize action")
+        paths = [f.path for f in self.files]
+        if len(paths) != len(set(paths)):
+            raise ValueError("Each configuration file can be edited once")
+        if set(self.packages_install) & set(self.packages_remove):
+            raise ValueError("A package cannot be both installed and removed")
+        return self
+
+
+class OciPlanRequest(StrictModel):
+    oci: OciConfig
+    allow_network: bool = False
+    boot_migration: BootMigration | None = None
+
+
+class UefiPlanRequest(StrictModel):
+    boot_migration: BootMigration
+    allow_network: bool = False
+
+
+class OciSchemaRequest(StrictModel):
+    schema_data: dict = Field(alias="schema")

@@ -1,0 +1,31 @@
+services:
+  forge:
+    build: .
+    platform: linux/amd64
+    ports:
+      - "${FORGE_BIND_ADDRESS:-127.0.0.1}:${FORGE_PORT:-8080}:8080"
+    environment:
+      FORGE_DATA_DIR: /data
+      API_TOKEN: ${API_TOKEN:-}
+      FORGE_MAX_UPLOAD_GIB: ${FORGE_MAX_UPLOAD_GIB:-64}
+      FORGE_MAX_VIRTUAL_GIB: ${FORGE_MAX_VIRTUAL_GIB:-2048}
+      FORGE_ALLOW_PRIVATE_ENDPOINTS: ${FORGE_ALLOW_PRIVATE_ENDPOINTS:-false}
+      LIBGUESTFS_BACKEND: direct
+      LIBGUESTFS_BACKEND_SETTINGS: ${LIBGUESTFS_BACKEND_SETTINGS:-force_tcg}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_EC2_METADATA_DISABLED: ${AWS_EC2_METADATA_DISABLED:-true}
+    volumes:
+      - forge-data:/data
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  forge-data:
