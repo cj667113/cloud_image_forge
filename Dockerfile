@@ -38,7 +38,7 @@ USER forge
 EXPOSE 8080
 VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=4)" || exit 1
+    CMD python -c "import json, sys, urllib.request; health = json.load(urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=4)); sys.exit(0 if health.get('status') == 'ok' and health.get('engine', {}).get('available') is True else 1)" || exit 1
 
 # One process owns the persistent queue. Do not add uvicorn workers.
 CMD ["uvicorn", "forge.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
