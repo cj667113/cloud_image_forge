@@ -56,6 +56,10 @@ New UI checks start with **Preserve & validate**. Existing API recipes that omit
 
 Preservation requires actual offline evidence from each non-rescue kernel and its initramfs, a resolvable local root, compatible firmware and destination drivers, and an established network startup path. A missing requirement blocks the check. An unreadable archive, unsupported boot syntax, or unrecognized provisioning implementation is **unknown**, which also prevents export in preservation mode. Neither outcome establishes that the original image cannot boot; it means Forge cannot prove the selected offline prerequisites without further work. Refresh older inspections to collect this evidence.
 
+Oracle initramfs images can combine an early microcode CPIO archive with a compressed main archive. A fingerprint alone does not establish that both archives were inspected. Forge requires readable main-archive evidence, including its drivers, LVM tools and relevant dracut hooks. Standard boot variables are resolved only from inspected literal values; unresolved or dynamic expressions remain unverified.
+
+When the appliance's archive reader cannot decode this layout, a data-only fallback reads raw `newc` CPIO and gzip streams without extracting members or executing guest code. It caps input at 256 MiB, expanded content at 1 GiB, inventory at 100,000 entries and eight archives, retained evidence at 16 MiB, and decoding at 60 seconds. Malformed, ambiguous or unsupported content remains unverified. The fallback adds no guest packages and does not rebuild the initramfs.
+
 OCI guest preparation must be set to **Validate only** while preserving hardware settings. Otherwise it would independently rebuild initramfs and replace networking. Other explicitly requested operations—such as filesystem resizing or edits in Boot & kernel—still run. The preservation baseline is taken after those edits; final verification checks readiness and retained configuration before publishing the converted artifact. This mode does not promise that the entire exported image is byte-identical to the imported source.
 
 `POST /api/images/{image_id}/platform/plan` accepts, for example:

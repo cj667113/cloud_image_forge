@@ -35,6 +35,21 @@ def inspected():
 
 
 class PlanTests(unittest.TestCase):
+    def test_validate_only_reuses_verified_bounded_archive_for_the_same_initrd(self):
+        image, profile = inspected(), config(prepare=False)
+        kernel = image["oci_evidence"]["kernels"][VERSION]
+        kernel["initrd_modules"] = None
+        self.assertTrue(plan_guest(image, profile)["blockers"])
+        archive = {"initrd": kernel["initrd"], "initrd_sha256": "a" * 64,
+                   "initrd_modules": list(MODULE_CONFIG), "portability": {"readable": True}}
+        image["platform"] = {"kernels": {VERSION: archive}}
+        self.assertFalse(plan_guest(image, profile)["blockers"])
+        archive["initrd"] = "/boot/different.img"
+        self.assertTrue(plan_guest(image, profile)["blockers"])
+        archive["initrd"] = kernel["initrd"]
+        archive["portability"]["readable"] = False
+        self.assertTrue(plan_guest(image, profile)["blockers"])
+
     def test_verified_oracle_bootstrap_can_preserve_prior_nic_profiles_without_claiming_ipv6(self):
         image, profile = inspected(), config(prepare=False)
         image["oci_evidence"].update(network_ready=False, cloud_init_ready=False)

@@ -279,7 +279,12 @@ def plan_guest(inspection: dict, config: dict, allow_network=False, planned_firm
         if missing:
             blockers.append(f"Kernel {version} lacks installed or built-in drivers: {', '.join(missing)}. Install a suitable kernel/module package before OCI preparation.")
         if not prepare:
-            not_in_initrd = sorted(module for module in required if module not in kernel.get("builtin", []) and module not in (kernel.get("initrd_modules") or []))
+            archived = kernel.get("initrd_modules")
+            fallback = inspection.get("platform", {}).get("kernels", {}).get(version, {})
+            if (archived is None and fallback.get("initrd") == kernel.get("initrd")
+                    and fallback.get("initrd_sha256") and fallback.get("portability", {}).get("readable") is True):
+                archived = fallback.get("initrd_modules")
+            not_in_initrd = sorted(module for module in required if module not in kernel.get("builtin", []) and module not in (archived or []))
             if not_in_initrd:
                 blockers.append(f"Kernel {version}: initramfs inclusion cannot be verified for {', '.join(not_in_initrd)}. Enable guest preparation to rebuild and verify it.")
     conflicts = sorted(required & set(evidence.get("blacklisted_modules", [])))

@@ -158,6 +158,17 @@ def test_boot_entry_must_use_the_inspected_kernel_and_archive():
     assert any("paths" in error for error in assess_portability(source, options())["blockers"])
 
 
+def test_bls_optional_tuned_initrd_requires_observed_empty_environment():
+    source = image()
+    path = "/boot/loader/entries/test.conf"
+    source["platform"]["boot_files"][path] = source["platform"]["boot_files"][path].replace(f"initrd /initramfs-{KERNEL}.img", f"initrd /initramfs-{KERNEL}.img $tuned_initrd")
+    assert not assess_portability(source, options())["ready"]
+    source["platform"]["boot_environment"] = {"tuned_initrd": ""}
+    assert assess_portability(source, options())["ready"]
+    source["platform"]["boot_environment"]["tuned_initrd"] = "/uninspected.img"
+    assert not assess_portability(source, options())["ready"]
+
+
 def test_legacy_grub_kernel_initrd_pair_is_checked_without_execution():
     source = image("root=UUID=" + ROOT_UUID)
     source["platform"]["generated_grub"]["/boot/grub2/grub.cfg"] = f"menuentry 'Test' {{\n linux /vmlinuz-{KERNEL} root=UUID={ROOT_UUID}\n initrd /initramfs-{KERNEL}.img\n}}\n"

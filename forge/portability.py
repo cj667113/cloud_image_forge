@@ -393,9 +393,13 @@ def assess_portability(inspection, options, target_provider="oci"):
                 problems.append(f"Kernel {version}: missing installed/built-in drivers: {', '.join(absent)}.")
             if absent_initrd:
                 problems.append(f"Kernel {version}: missing archived/built-in drivers: {', '.join(absent_initrd)}.")
-        if archive.get("version") != VERSION or not archive.get("readable") or kernel.get("initrd_modules") is None or not kernel.get("initrd_sha256"):
+        if archive.get("version") != VERSION or not archive.get("readable") or kernel.get("initrd_modules") is None:
             status = "unknown" if status == "ready" else status
-            problems.append(f"Kernel {version}: initramfs contents or fingerprint cannot be read. Preserve mode cannot assume existing driver coverage.")
+            problems.append(f"Kernel {version}: initramfs contents cannot be read. Preserve mode cannot assume existing driver coverage.")
+            problems.extend(f"Kernel {version}: {error}" for error in archive.get("errors", []))
+        if not kernel.get("initrd_sha256"):
+            status = "unknown" if status == "ready" else status
+            problems.append(f"Kernel {version}: initramfs fingerprint cannot be read.")
         if boot == "iscsi" or version in optional_versions:
             if not kernel.get("initrd_iscsi_userspace"):
                 status = "unknown" if status == "ready" else status

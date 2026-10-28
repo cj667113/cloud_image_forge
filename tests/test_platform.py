@@ -111,6 +111,20 @@ class Guest:
 
 
 class InspectionTests(unittest.TestCase):
+    def test_tuned_initrd_resolves_only_saved_or_observed_literal_values(self):
+        g = Guest({"/boot/grub2/grubenv": "# GRUB Environment Block\n####\n",
+                   "/boot/grub2/grub.cfg": 'set tuned_initrd=""\nexport tuned_initrd\n'})
+        environment, errors, _ = _inspect_boot_environment(g)
+        self.assertFalse(errors)
+        self.assertEqual(_boot_args("/initramfs-test.img $tuned_initrd", environment=environment), ["/initramfs-test.img"])
+        g.files["/boot/grub2/grub.cfg"] = "export tuned_initrd\n"
+        environment, _, _ = _inspect_boot_environment(g)
+        with self.assertRaisesRegex(ValueError, "unresolved"):
+            _boot_args("$tuned_initrd", environment=environment)
+        g.files["/boot/grub2/grub.cfg"] = 'set tuned_initrd="$(touch /tmp/never)"\n'
+        _, errors, _ = _inspect_boot_environment(g)
+        self.assertTrue(any("Dynamic tuned_initrd" in error for error in errors))
+
     def test_generated_grub_reads_actual_esp_mount_and_reports_oversized_files(self):
         path = "/firmware/EFI/vendor/grub.cfg"
         g = Guest({path: f"linuxefi /vmlinuz-{KERNEL} root=/dev/sda1\n"})

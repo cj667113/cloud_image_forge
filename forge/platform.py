@@ -193,7 +193,7 @@ def _fstab_evidence(g, partitions):
 
 def _inspect_boot_environment(g):
     """Parse GRUB's data file, never source/evaluate guest shell configuration."""
-    allowed = {"kernelopts", "tuned_params"}
+    allowed = {"kernelopts", "tuned_params", "tuned_initrd"}
     environments, errors, paths = [], [], []
     for path in ("/boot/grub2/grubenv", "/boot/grub/grubenv"):
         if not g.is_file(path):
@@ -227,7 +227,7 @@ def _inspect_boot_environment(g):
     assignments = {name: [] for name in allowed}
     for path in ("/boot/grub2/grub.cfg", "/boot/grub/grub.cfg", "/boot/grub2/custom.cfg", "/boot/grub/custom.cfg"):
         for line in _read(g, path).splitlines():
-            match = re.match(r"^\s*set\s+(kernelopts|tuned_params)=(.*)$", line)
+            match = re.match(r"^\s*set\s+(kernelopts|tuned_params|tuned_initrd)=(.*)$", line)
             if not match:
                 continue
             try:
@@ -243,6 +243,11 @@ def _inspect_boot_environment(g):
             values["tuned_params"] = next(iter(candidates), "")
         else:
             errors.append("Multiple tuned_params assignments are ambiguous.")
+    candidates = set(assignments["tuned_initrd"])
+    if len(candidates) > 1 or candidates and "tuned_initrd" in values and candidates != {values["tuned_initrd"]}:
+        errors.append("Multiple tuned_initrd values are ambiguous.")
+    elif "tuned_initrd" not in values and len(candidates) == 1:
+        values["tuned_initrd"] = next(iter(candidates))
     # An unset kernelopts is only recoverable from a single literal fallback.
     if not values.get("kernelopts"):
         candidates = set(assignments["kernelopts"])
@@ -321,10 +326,28 @@ def _inspect_platform(g, root, partitions, kernels, oci_evidence=None):
                 digest = g.checksum("sha256", initrd)
             except RuntimeError:
                 pass
+        archive = inspect_archive(g, initrd, members)
+        if initrd and (members is None or not archive.get("readable") or "early_cpio" in members):
+            try:
+                from .initramfs import read_archive
+                parsed = read_archive(g, initrd, digest)
+                members = parsed.initrd_list(initrd)
+                listed = sorted({match.group(1).replace("-", "_") for name in members
+                                 if (match := re.search(r"/([A-Za-z0-9_-]+)\.ko(?:\.(?:xz|gz|zst))?$", "/" + name))})
+                iscsi_userspace = _iscsi_archive_ready(parsed, initrd, members)
+                archive = inspect_archive(parsed, initrd, members)
+                archive["decoder"] = "bounded_newc_gzip"
+                digest = parsed.sha256
+            except (RuntimeError, ValueError, OSError, AttributeError) as exc:
+                archive["readable"] = False
+                archive["errors"].append("Bounded initramfs reader: " + str(exc))
+                # An early CPIO listing is not the main archive's inventory.
+                if members is not None and "early_cpio" in members:
+                    listed = None
         inventory[version] = {"modules": sorted(installed), "builtin": sorted(builtin),
                               "initrd": initrd, "initrd_modules": listed, "initrd_sha256": digest,
                               "initrd_iscsi_userspace": iscsi_userspace,
-                              "portability": inspect_archive(g, initrd, members)}
+                              "portability": archive}
     tools = dict(base.get("tools", {}))
     for name in ("iscsistart", "iscsid", "iscsi-iname", "dnf", "yum", "apt-get"):
         tools[name] = any(g.is_file(directory + "/" + name) for directory in ("/usr/sbin", "/usr/bin", "/sbin", "/bin"))
@@ -371,7 +394,7 @@ def _boot_args(text, *, assignment=False, environment=None):
         def expand(value, stack=()):
             def replace(match):
                 name = match[1] or match[2]
-                if name not in {"kernelopts", "tuned_params"} or name not in (environment or {}) or name in stack:
+                if name not in {"kernelopts", "tuned_params", "tuned_initrd"} or name not in (environment or {}) or name in stack:
                     raise ValueError("Boot arguments contain unresolved shell expansion: " + name)
                 return expand(environment[name], stack + (name,))
             value = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)", replace, value)
