@@ -23,6 +23,16 @@ function revealEditorField(field) {
   field.scrollIntoView({block:'center',behavior:matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth'});
 }
 function updateOciVisibility() { const settings = $('#oci-settings'); if (settings) settings.hidden = !$('#oci-enabled').checked; }
+function ociValueLabel(value) { return value === 'ACCELERATEDPV' ? 'Accelerated PV' : value; }
+function ociAcceleratedKeys(capabilities = readOciCapabilities(false)) {
+  const keys = new Set(['Compute.LaunchMode','Network.AttachmentType'].filter(key => capabilities[key]?.default_value === 'ACCELERATEDPV' || capabilities[key]?.values?.includes('ACCELERATEDPV')));
+  if ($('#platform-enabled')?.checked && $('#platform-network')?.value === 'accelerated') keys.add('Network.AttachmentType');
+  return [...keys];
+}
+function ociAcceleratedSchemaError(catalog = state.ociCatalog, capabilities) {
+  const missing = ociAcceleratedKeys(capabilities).filter(key => !catalog?.capabilities?.find(item => item.key === key)?.values?.includes('ACCELERATEDPV'));
+  return missing.length ? `This OCI schema does not allow Accelerated PV for ${missing.join(', ')}. Use a regional schema that supports it or change the accelerated selections.` : '';
+}
 function updateDisclosureSummaries() {
   updateOciVisibility();
   const serviceSummary=$('[data-service-change-count]');
@@ -47,8 +57,9 @@ function updateDisclosureSummaries() {
     const summary = $('.oci-group-summary',group); if (summary) summary.textContent = values.join(' · ');
   });
   $$('[data-allowed-summary]').forEach(node => {
-    node.textContent = $$('[data-oci-allowed]',node.closest('details')).filter(input => input.checked).map(input => JSON.parse(input.value)).join(', ') || 'None selected';
+    node.textContent = $$('[data-oci-allowed]',node.closest('details')).filter(input => input.checked).map(input => ociValueLabel(JSON.parse(input.value))).join(', ') || 'None selected';
   });
+  const accelerated = $('#oci-accelerated-note'); if (accelerated) { const issue=ociAcceleratedSchemaError(); accelerated.hidden=!ociAcceleratedKeys().length&&$('#oci-launch-mode')?.value!=='ACCELERATEDPV'; accelerated.className=`notice ${issue?'error':'warning'}`; accelerated.textContent=issue||'Accelerated PV requires a supported Acceleron shape and compatible image. Advertised image capabilities must match the regional schema. Validate with an OCI test launch.'; }
   const preparation = $('#oci-preparation-summary'); if (preparation) preparation.textContent = $('#oci-prepare').checked ? 'Enabled' : 'Validate only';
 }
 function toast(message) { const node = $('#toast'); node.textContent = message; node.hidden = false; clearTimeout(toast.timer); toast.timer = setTimeout(() => node.hidden = true, 5000); }
@@ -448,6 +459,7 @@ function renderOciPanel() {
     <div id="oci-target-notice" class="notice info" hidden>OCI settings are saved in this form, but the current export target is not Oracle Cloud. <button type="button" class="button ghost small" data-action="oci-use-target">Use OCI export${icon('arrow')}</button></div>
     <div id="oci-catalog-error" class="notice error" role="alert"${state.ociCatalog ? ' hidden' : ''}>${esc(state.ociCatalogError || 'The OCI capability catalog is not available yet. Refresh the catalog to configure this image.')} <button type="button" class="button ghost small" data-action="oci-refresh-catalog">Refresh catalog</button></div>
     <div id="oci-settings" hidden><div id="oci-firmware-alert">${['dual','unknown'].includes(studioImage()?.inspection?.boot?.mode) ? `<div class="notice warning">${studioImage().inspection.boot.mode === 'dual' ? 'Both firmware modes are present. Confirm your firmware choice under Compute.' : 'Firmware support is unknown. Refresh inspection before choosing OCI firmware.'}</div>` : !studioImage()?.inspection?.boot ? '<div class="notice warning">Refresh inspection to detect firmware support.</div>' : ''}</div>
+    <div id="oci-accelerated-note" class="notice warning" hidden></div>
     <div id="oci-capabilities"></div>
     <details class="editor-disclosure oci-section" data-disclosure="oci-preparation"><summary>Guest preparation <span class="disclosure-meta" id="oci-preparation-summary">Enabled</span></summary><div class="details-content">
       <label class="check-field"><input type="checkbox" id="oci-prepare" checked><span>Prepare this guest for the selected capabilities<small>Apply supported driver, initramfs, network, cloud-init, and console changes to the working image.</small></span></label>
@@ -464,7 +476,7 @@ function renderOciPanel() {
       <p class="panel-intro">Included in the configuration download; no cloud resources are created.</p>
       <div class="form-grid">
         <label class="field">Display name<input id="oci-display-name" placeholder="custom-linux-image"></label>
-        <label class="field">Import launch mode<select id="oci-launch-mode"><option value="NATIVE">Native</option><option value="PARAVIRTUALIZED" selected>Paravirtualized</option><option value="EMULATED">Emulated</option><option value="CUSTOM">Custom</option><option value="ACCELERATEDPV">Accelerated paravirtualized</option></select></label>
+        <label class="field">Import launch mode<select id="oci-launch-mode"><option value="NATIVE">Native</option><option value="PARAVIRTUALIZED" selected>Paravirtualized</option><option value="EMULATED">Emulated</option><option value="CUSTOM">Custom</option><option value="ACCELERATEDPV">Accelerated PV</option></select>${helpHint('ACCELERATEDPV is an OCI API launch mode for supported Acceleron shapes and compatible images. Image capability choices are checked against the regional schema separately.','Import launch mode')}</label>
         <label class="field">Operating system<input id="oci-operating-system" placeholder="Oracle Linux"></label>
         <label class="field">Operating system version<input id="oci-os-version" placeholder="9"></label>
         <label class="field">Compartment OCID<input id="oci-compartment" placeholder="ocid1.compartment.oc1…" autocomplete="off"></label>
@@ -509,7 +521,7 @@ function renderOciCapabilities(previous = {}) {
     const id = `oci-capability-${capability.index}`;
     let control;
     if (type === 'boolean') control = `<label class="check-field oci-boolean"><input type="checkbox" id="${id}" data-oci-default="${esc(key)}" aria-label="${esc(label)}"${value ? ' checked' : ''}${secure ? ' disabled' : ''}><span>${secure ? 'Unavailable for OCI custom images' : 'Enabled'}<small>${secure ? 'Secure Boot remains disabled. Selecting a capability cannot make an unsupported custom-image feature available.' : 'Allow this capability on the imported image.'}</small></span></label>`;
-    else if (options.length) control = `<label class="field">Preferred value<select id="${id}" data-oci-default="${esc(key)}" aria-label="Preferred ${esc(label)}">${options.map(option => `<option value="${esc(JSON.stringify(option))}"${option === value ? ' selected' : ''}>${esc(option)}</option>`).join('')}</select></label><details class="oci-allowed-options" data-disclosure="oci-allowed-${esc(key)}"><summary>Allowed values <span class="disclosure-meta" data-allowed-summary></span></summary><fieldset class="oci-allowed" aria-label="Allowed values for ${esc(label)}"><legend>Allowed values</legend>${options.map(option => `<label><input type="checkbox" data-oci-allowed="${esc(key)}" value="${esc(JSON.stringify(option))}"${allowed.includes(option) ? ' checked' : ''}><span>${esc(option)}</span></label>`).join('')}</fieldset></details>`;
+    else if (options.length) control = `<label class="field">Preferred value<select id="${id}" data-oci-default="${esc(key)}" aria-label="Preferred ${esc(label)}">${options.map(option => `<option value="${esc(JSON.stringify(option))}"${option === value ? ' selected' : ''}>${esc(ociValueLabel(option))}</option>`).join('')}</select></label><details class="oci-allowed-options" data-disclosure="oci-allowed-${esc(key)}"><summary>Allowed values <span class="disclosure-meta" data-allowed-summary></span></summary><fieldset class="oci-allowed" aria-label="Allowed values for ${esc(label)}"><legend>Allowed values</legend>${options.map(option => `<label><input type="checkbox" data-oci-allowed="${esc(key)}" value="${esc(JSON.stringify(option))}"${allowed.includes(option) ? ' checked' : ''}><span>${esc(ociValueLabel(option))}</span></label>`).join('')}</fieldset></details>`;
     else control = `<label class="field">Preferred value<input id="${id}" data-oci-default="${esc(key)}" type="${type.includes('integer') ? 'number' : 'text'}"${type.includes('integer') ? ' step="1"' : ''} value="${esc(value)}"></label>`;
     return `<article class="oci-capability" data-oci-capability="${esc(key)}"><div class="oci-capability-title"><h4>${esc(label)}</h4>${helpHint([capability.description,Array.isArray(capability.guest_action)?capability.guest_action.join(' '):capability.guest_action,`Schema key: ${key}`].filter(Boolean).join(' '),label)}</div>${control}${key === 'Compute.Firmware' ? ociFirmwareHint() : ''}</article>`;
   }).join('')}</div></details>`).join('');
@@ -538,6 +550,7 @@ function parseOciJson(selector, label, fallback = {}) {
 }
 function getOciConfig() {
   if (!state.ociCatalog?.capabilities?.length) throw new Error('Load the OCI capability catalog before building with OCI settings.');
+  const acceleratedIssue=ociAcceleratedSchemaError(); if(acceleratedIssue)throw editorError(acceleratedIssue,'#oci-schema-json');
   const boot = state.images.find(image => image.id === state.selected)?.inspection?.boot;
   if (boot?.mode === 'dual' && !state.ociFirmwareEdited && state.ociCatalog.capabilities.some(capability => capability.key === 'Compute.Firmware')) throw editorError('Confirm the OCI firmware choice for this dual-mode image.','#oci-firmware-confirm');
   const global_schema = parseOciJson('#oci-schema-json','Global capability schema',null);
@@ -600,6 +613,7 @@ async function changeOciSchema(reset = false) {
     if (!reset && !schema) throw new Error('Paste a global capability schema before loading it.');
     const catalog = await loadOciCatalog(schema,false);
     if (state.selected !== imageId || state.editorRevision !== revision) throw new Error('The source or settings changed while loading the schema. Load it again for the current image.');
+    const acceleratedIssue=ociAcceleratedSchemaError(catalog,previous); if(acceleratedIssue)throw editorError(acceleratedIssue,'#oci-schema-json');
     state.ociCatalog = catalog; if (!schema) state.ociBaseCatalog = catalog; state.ociCatalogError = null; state.ociLoadedSchema = schema; state.editorRevision++;
     if (reset) { $('#oci-schema-json').value = ''; $('#oci-schema-version').value = ''; }
     $('#oci-schema-status').textContent = schema ? 'Current OCI schema loaded' : 'Bundled catalog';

@@ -207,6 +207,67 @@ class InspectionTests(unittest.TestCase):
 
 
 class PlanTests(unittest.TestCase):
+    def test_accelerated_vm_profile_requires_virtio_network_and_distinct_oci_mode(self):
+        profile = options(network_attachment="accelerated")
+        oci = {"capabilities": {"Storage.BootVolumeType": {"default_value": "PARAVIRTUALIZED"},
+                                "Network.AttachmentType": {"default_value": "ACCELERATEDPV"},
+                                "Compute.Firmware": {"default_value": "UEFI_64"},
+                                "Compute.LaunchMode": {"default_value": "ACCELERATEDPV"}}}
+        result = plan_platform(image(), profile, oci_config=oci)
+        self.assertTrue(result["ready"], result["blockers"])
+        self.assertTrue({"virtio_net", "virtio_pci", "virtio_scsi"} <= set(result["required_modules"]))
+        self.assertNotIn("nvme", result["required_modules"])
+        self.assertTrue(any("AcceleratedPV" in action for action in result["actions"]))
+        oci["capabilities"]["Network.AttachmentType"]["default_value"] = "PARAVIRTUALIZED"
+        self.assertTrue(any("Network.AttachmentType" in error for error in plan_platform(image(), profile, oci_config=oci)["blockers"]))
+        oci["capabilities"]["Network.AttachmentType"]["default_value"] = "ACCELERATEDPV"
+        oci["capabilities"]["Compute.LaunchMode"]["default_value"] = "PARAVIRTUALIZED"
+        self.assertTrue(any("Compute.LaunchMode" in error for error in plan_platform(image(), profile, oci_config=oci)["blockers"]))
+
+    def test_accelerated_network_is_not_a_bare_metal_driver_profile(self):
+        result = plan_platform(image(), options(source="vm", target="bare_metal", boot_attachment="iscsi",
+                                                network_attachment="accelerated", nic_driver="mlx5_core"))
+        self.assertFalse(result["ready"])
+        self.assertTrue(any("hardware/VFIO" in error for error in result["blockers"]))
+
+    def test_accelerated_profile_blocks_missing_or_unverified_network_driver(self):
+        source = image()
+        source["platform"]["kernels"][KERNEL]["modules"].remove("virtio_net")
+        result = plan_platform(source, options(network_attachment="accelerated"))
+        self.assertTrue(any("virtio_net" in error for error in result["blockers"]))
+        source = image()
+        source["platform"]["kernels"][KERNEL]["initrd_modules"].remove("virtio_net")
+        result = verify_platform(source, options(network_attachment="accelerated"))
+        self.assertTrue(any("virtio_net" in error and "initramfs" in error for error in result["blockers"]))
+
+    def test_iscsi_adaptation_retains_audited_session_timeout_and_root_policy(self):
+        policy = "rd.iscsi.param=node.session.timeo.replacement_timeout=6000"
+        original = ["root=/dev/mapper/ocivolume-root", "ro", "rootflags=prjquota", "rd.lvm.vg=ocivolume",
+                    "rd.lvm.lv=ocivolume/root", "rd.net.timeout.dhcp=10", "rd.net.timeout.carrier=5",
+                    "net.ifnames=1", "rd.luks=0", "rd.md=0", "rd.dm=0", "nvme_core.shutdown_timeout=10",
+                    policy, "rd.iscsi.initiator=old-identity", "iscsi_username=old-user",
+                    "rd.iscsi.param=node.session.auth.password=old-secret"]
+        profile = options(source="vm", target="bare_metal", boot_attachment="iscsi", network_attachment="vfio", nic_driver="mlx5_core")
+        result = _adapt_args(original, {"root_uuid": ROOT_UUID}, profile)
+        self.assertIn(policy, result)
+        for word in original[1:12]:
+            self.assertIn(word, result)
+        self.assertIn("root=UUID=" + ROOT_UUID, result)
+        self.assertTrue({"netroot=iscsi", "rd.iscsi.firmware=1", "rd.neednet=1"} <= set(result))
+        self.assertFalse(any("old-" in word for word in result))
+        self.assertEqual(result, _adapt_args(result, {"root_uuid": ROOT_UUID}, profile))
+        self.assertNotIn(policy, _adapt_args(original, {"root_uuid": ROOT_UUID}, options(network_attachment="accelerated")))
+
+    def test_iscsi_timeout_preservation_is_strictly_numeric_and_bounded(self):
+        prefix = "rd.iscsi.param=node.session.timeo.replacement_timeout="
+        profile = options(source="vm", target="bare_metal", boot_attachment="iscsi", network_attachment="vfio", nic_driver="mlx5_core")
+        for value in ("-2147483648", "-1", "0", "6000", "2147483647"):
+            with self.subTest(value=value):
+                self.assertIn(prefix + value, _adapt_args([prefix + value], {"root_uuid": ROOT_UUID}, profile))
+        for value in ("-2147483649", "2147483648", "6000,other=value", "6000;bad", "6000=bad", ""):
+            with self.subTest(value=value):
+                self.assertNotIn(prefix + value, _adapt_args([prefix + value], {"root_uuid": ROOT_UUID}, profile))
+
     def test_older_rpm_efi_menu_layout_is_not_silently_written_to_wrong_path(self):
         source = image()
         source["platform"]["os_version"]["major"] = 8

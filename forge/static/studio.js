@@ -256,8 +256,9 @@ function renderPlatformStudio() {
       ${!studioImage()?.inspection?.platform?'<div class="notice warning">Refresh inspection to check hardware support. <button type="button" class="button ghost small" data-action="refresh-inspection">Refresh</button></div>':''}
       <div class="platform-direction"><label class="field">From<select id="platform-source"><option value="vm">Virtual machine</option><option value="bare_metal">Bare metal</option></select></label><span class="direction-arrow" aria-hidden="true">${icon('arrow')}</span><label class="field">To<select id="platform-target"><option value="bare_metal">Bare metal</option><option value="vm">Virtual machine</option></select></label></div>
       <div class="notice warning" id="platform-provider-warning"></div>
-      <div class="form-grid"><label class="field">Boot attachment<select id="platform-boot"><option value="iscsi">Firmware iSCSI</option><option value="paravirtualized">Paravirtualized</option></select>${helpHint('Bare-metal boot needs an iBFT table from the target firmware. Target addresses and credentials are never invented.','Boot attachment')}</label><label class="field">Network attachment<select id="platform-network"><option value="vfio">Physical / VFIO</option><option value="paravirtualized">Paravirtualized</option></select>${helpHint('Choose the adapter type exposed by the destination. Physical networking needs a matching guest NIC driver.','Network attachment')}</label></div>
-      <label class="field" id="platform-nic-field">NIC driver<select id="platform-nic"><option value="">Select target driver</option>${['ixgbe','ixgbevf','i40e','iavf','mlx4_en','mlx5_core','bnxt_en'].map(driver=>`<option value="${driver}">${driver}</option>`).join('')}</select>${helpHint('Select the module for the destination NIC. The plan checks every installed kernel.','NIC driver')}</label>
+      <div class="form-grid"><label class="field">Boot attachment<select id="platform-boot"><option value="iscsi">Firmware iSCSI</option><option value="paravirtualized">Paravirtualized</option></select>${helpHint('Bare-metal boot needs an iBFT table from the target firmware. Target addresses and credentials are never invented.','Boot attachment')}</label><label class="field">Network attachment<select id="platform-network"><option value="vfio">Physical / VFIO</option><option value="paravirtualized">Paravirtualized</option><option value="accelerated">Accelerated PV</option></select>${helpHint('Choose the adapter exposed by the destination. Accelerated PV requires a supported Acceleron shape and compatible image. Physical networking needs the matching NIC driver.','Network attachment')}</label></div>
+      <div id="platform-accelerated-note" class="notice warning" hidden>Accelerated PV is shape-dependent. Confirm image and regional schema support, then test the OCI launch.</div>
+      <label class="field" id="platform-nic-field">NIC driver<select id="platform-nic"><option value="">Select target driver</option>${['ixgbe','ixgbevf','i40e','iavf','mlx4_en','mlx5_core','bnxt_en'].map(driver=>`<option value="${driver}">${driver}</option>`).join('')}</select>${helpHint('Select the destination NIC module; every installed kernel is checked. The reviewed BM.Standard.E5.192 host uses mlx5_core (ConnectX-6 Dx). Confirm your target hardware.','NIC driver')}</label>
       <details class="editor-disclosure" data-disclosure="platform-options"><summary>Preparation options <span class="disclosure-meta">Network, console & packages</span></summary><div class="details-content platform-options">
         <label class="check-field"><input type="checkbox" id="platform-configure-network" checked><span>Configure network startup${helpHint('Replaces machine-bound network profiles with portable DHCP and prepares early networking when required.','Network startup')}</span></label>
         <label class="check-field"><input type="checkbox" id="platform-serial-console" checked><span>Enable serial console${helpHint('Enables ttyS0 at 115200 baud and a serial login service.','Serial console')}</span></label>
@@ -281,19 +282,24 @@ function syncOciPlatformChoices() {
   if(!$('#platform-enabled')?.checked)return;
   if($('input[name="target"]:checked')?.value!=='oci'){studioSession().pendingOciPlatformSync=true;return;}
   studioSession().pendingOciPlatformSync=false;
-  const boot=$('#platform-boot').value==='iscsi'?'ISCSI':'PARAVIRTUALIZED',network=$('#platform-network').value==='vfio'?'VFIO':'PARAVIRTUALIZED';
-  const settings={'Storage.BootVolumeType':boot,'Network.AttachmentType':network,'Compute.LaunchMode':boot==='ISCSI'&&network==='VFIO'?'NATIVE':boot==='PARAVIRTUALIZED'&&network==='PARAVIRTUALIZED'?'PARAVIRTUALIZED':'CUSTOM'};
+  const boot=$('#platform-boot').value==='iscsi'?'ISCSI':'PARAVIRTUALIZED',network={vfio:'VFIO',paravirtualized:'PARAVIRTUALIZED',accelerated:'ACCELERATEDPV'}[$('#platform-network').value];
+  const settings={'Storage.BootVolumeType':boot,'Network.AttachmentType':network,'Compute.LaunchMode':boot==='ISCSI'&&network==='VFIO'?'NATIVE':boot==='PARAVIRTUALIZED'&&['PARAVIRTUALIZED','ACCELERATEDPV'].includes(network)?network:'CUSTOM'};
   if($('#platform-target').value==='bare_metal')settings['Compute.Firmware']='UEFI_64';
-  const unavailable=[];
+  const unavailable=Object.entries(settings).filter(([key,value])=>{const input=$$('[data-oci-default]').find(node=>node.dataset.ociDefault===key);return !input||![...input.options].some(option=>option.value===JSON.stringify(value));}).map(([key])=>key);
+  if(unavailable.length) {
+    const customKept=unavailable.length===1&&unavailable[0]==='Compute.LaunchMode'&&$$('[data-oci-default]').find(node=>node.dataset.ociDefault==='Compute.LaunchMode')?.value===JSON.stringify('CUSTOM');
+    const note=$('#platform-oci-note');note.className=`notice ${customKept?'warning':'error'}`;
+    note.textContent=`Automatic sync could not select ${unavailable.map(key=>`${settings[key]} for ${key}`).join(', ')}. Existing OCI choices were kept.${customKept?' CUSTOM remains selected; review the attachments under OCI compatibility.':' Review the OCI choices or load a regional schema that supports these preferences.'}`;
+    if($('#oci-enabled')?.checked)markOciChanged();else updateDisclosureSummaries();return;
+  }
   for(const [key,value] of Object.entries(settings)) {
     const input=$$('[data-oci-default]').find(node=>node.dataset.ociDefault===key);
-    if(!input||![...input.options].some(option=>option.value===JSON.stringify(value))){unavailable.push(key);continue;}
     input.value=JSON.stringify(value);$$('[data-oci-allowed]').filter(node=>node.dataset.ociAllowed===key).forEach(node=>node.checked=node.value===JSON.stringify(value));
     if(key==='Compute.Firmware'){state.ociFirmwareEdited=true;if($('#oci-firmware-confirm'))$('#oci-firmware-confirm').checked=true;}
   }
   if($('#oci-launch-mode'))$('#oci-launch-mode').value=settings['Compute.LaunchMode'];
-  $('#platform-oci-note').textContent=unavailable.length?`The OCI schema cannot represent ${unavailable.join(', ')}. Review the schema and plan.`:'Attachments synced with OCI.';
-  if($('#oci-enabled')?.checked)markOciChanged();
+  $('#platform-oci-note').className='platform-oci-note';$('#platform-oci-note').textContent='Attachments synced with OCI.';
+  if($('#oci-enabled')?.checked)markOciChanged();else updateDisclosureSummaries();
 }
 function updatePlatformStudio() {
   if(!$('#platform-studio'))return;
@@ -302,6 +308,8 @@ function updatePlatformStudio() {
   $('#platform-provider-warning').hidden=!bare;
   $('#platform-provider-warning').textContent=oci?'Experimental: OCI BYOI does not support bare metal. Test the output on the target hardware.':'Experimental hardware preparation. A destination boot test is required.';
   $('#platform-nic-field').hidden=!bare&&$('#platform-network').value!=='vfio';
+  const accelerated=$('#platform-accelerated-note'),issue=oci?ociAcceleratedSchemaError():'';
+  accelerated.hidden=$('#platform-network').value!=='accelerated';accelerated.className=`notice ${issue?'error':'warning'}`;accelerated.textContent=issue||'Accelerated PV is shape-dependent. Confirm image and regional schema support, then test the destination launch.';
   const note=$('#platform-oci-note');note.hidden=!oci||!note.textContent;
   $('#platform-allow-network').checked=Boolean($('#allow-network')?.checked);
   const button=$('#platform-plan-button');button.disabled=wizardInspectionPending()||button.getAttribute('aria-busy')==='true';

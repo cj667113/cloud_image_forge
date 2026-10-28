@@ -56,12 +56,27 @@ def _glob(g, pattern):
         return []
 
 
-def _module_names(paths):
+def _module_names(paths, guest=None, version=None):
     result = set()
-    for path in paths:
-        name = path.split(":", 1)[0].rsplit("/", 1)[-1].split(".ko", 1)[0].replace("-", "_")
-        if name in MODULE_CONFIG:
-            result.add(name)
+    for entry in paths:
+        path = entry.split(":", 1)[0].strip()
+        match = re.search(r"/([A-Za-z0-9_-]+)\.ko(?:\.(?:xz|gz|zst))?$", "/" + path)
+        if not match:
+            continue
+        name = match[1].replace("-", "_")
+        if name not in MODULE_CONFIG:
+            continue
+        if guest is not None:
+            # modules.dep can outlive a removed module package. A modular config
+            # option or index entry alone is not proof of an installed driver.
+            if path.startswith("/") or ".." in PurePosixPath(path).parts:
+                continue
+            try:
+                if not guest.is_file(f"/lib/modules/{version}/{path}"):
+                    continue
+            except RuntimeError:
+                continue
+        result.add(name)
     return sorted(result)
 
 
@@ -123,7 +138,7 @@ def inspect_guest(g, root: str, partitions: list, kernels: list, boot: dict | No
             continue
         config = dict(re.findall(r"^(CONFIG_[A-Z0-9_]+)=([ym])$", _read(g, f"/boot/config-{version}"), re.M))
         config = {key: value for key, value in config.items() if key in {*MODULE_CONFIG.values(), "CONFIG_AMD_MEM_ENCRYPT", "CONFIG_IPV6"}}
-        modules = _module_names(_read(g, f"/lib/modules/{version}/modules.dep", 16 * 1024 * 1024).splitlines())
+        modules = _module_names(_read(g, f"/lib/modules/{version}/modules.dep", 16 * 1024 * 1024).splitlines(), g, version)
         builtin = set(_module_names(_read(g, f"/lib/modules/{version}/modules.builtin").splitlines()))
         builtin.update(name for name, key in MODULE_CONFIG.items() if config.get(key) == "y")
         initrd = next((p for p in (f"/boot/initramfs-{version}.img", f"/boot/initrd.img-{version}", f"/boot/initrd-{version}") if g.is_file(p)), None)
@@ -210,8 +225,10 @@ def plan_guest(inspection: dict, config: dict, allow_network=False, planned_firm
                 blockers.append(f"{key}={kind}: no validated guest driver adapter is available.")
             required.update(STORAGE_DRIVERS.get(kind, set()))
     for kind in _values(config, "Network.AttachmentType"):
-        if kind == "PARAVIRTUALIZED":
+        if kind in {"PARAVIRTUALIZED", "ACCELERATEDPV"}:
             required.update({"virtio_pci", "virtio_net"})
+            if kind == "ACCELERATEDPV":
+                warnings.append("The audited VM.Standard.E6.Ax.Flex AcceleratedPV guest uses virtio_net with virtio_pci. These guest drivers do not by themselves prove shape/image compatibility; validate a launch on the selected shape.")
         elif kind == "E1000":
             required.add("e1000")
         elif kind == "VFIO":

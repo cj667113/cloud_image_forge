@@ -1,10 +1,10 @@
 # OCI image compatibility
 
-Reviewed against Oracle's public documentation on **2026-10-27**.
+Reviewed against Oracle's public documentation and two running hosts on **2026-10-28**.
 
 OCI image compatibility has three parts: the software and boot layout inside the disk, the image's cloud capability schema, and the hardware/network/storage selected when an instance is launched. A QCOW2 conversion only changes the disk container. Declaring a capability does not install a driver or prove that an instance boots.
 
-This document covers the complete 13-key global image capability schema shown in Oracle's current overview, plus the corresponding image-import and instance-launch fields. Account resources such as compartments, subnets, shapes, encryption keys, and IAM policies remain cloud configuration. Cloud Image Forge generates an image and configuration handoff; it does not create those resources.
+This document covers the 13-key global image capability schema shown in Oracle's current overview, plus the corresponding image-import and instance-launch fields. Forge's reference catalog additionally exposes `ACCELERATEDPV` from the current launch API; it is not a downloaded regional schema. Account resources such as compartments, subnets, shapes, encryption keys, and IAM policies remain cloud configuration. Cloud Image Forge generates an image and configuration handoff; it does not create those resources.
 
 ## Cloud Image Forge workflow
 
@@ -60,7 +60,30 @@ The following are the exact case-sensitive keys and published values. The **glob
 
 **Custom images do not support Secure Boot**, even though the global schema contains that key. IPv6-only capability requires a validated IPv6-only guest; iSCSI boot and remote-volume attachments are incompatible with Customer VMI IPv6-only launches. The capability does not create or configure an IPv6 VCN, subnet, or VNIC. [Oracle capability restrictions](https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/configuringimagecapabilities.htm)
 
-Oracle's current SDK and CLI expose some newer launch values that are absent from that overview: `ACCELERATEDPV` networking/launch mode and `VFIO`/`NVME` storage values. Their presence in the SDK does not make them valid in every image capability schema version. A generated schema must be a subset of the values in the region's selected global schema. [Current LaunchOptions model](https://docs.oracle.com/en-us/iaas/tools/python/latest/api/core/models/oci.core.models.LaunchOptions.html), [current image-import command](https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/compute/image/import/from-object.html)
+Oracle's current SDK and CLI expose some newer launch values that are absent from that overview: `ACCELERATEDPV` networking/launch mode and `VFIO`/`NVME` storage values. Forge adds `ACCELERATEDPV` to its reference catalog for both `Compute.LaunchMode` and `Network.AttachmentType`. Their presence in the SDK does not make them valid in every image capability schema version. A generated schema must be a subset of the values in the region's selected global schema. Loading a regional schema replaces the reference choices; Forge does not inject unsupported values into it. The storage defaults remain unchanged: the reviewed Ax VM uses VirtIO SCSI, not NVMe. [Current LaunchOptions model](https://docs.oracle.com/en-us/iaas/tools/python/latest/api/core/models/oci.core.models.LaunchOptions.html), [current image-import command](https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/compute/image/import/from-object.html)
+
+## Reviewed E6 Ax VM and E5 bare-metal configurations
+
+Read-only SSH inspection of user-provided hosts established the following configurations. These are observations of those running instances, not a minimum-kernel specification or certification of a rebuilt image.
+
+| Property | `VM.Standard.E6.Ax.Flex` | `BM.Standard.E5.192` |
+| --- | --- | --- |
+| Guest | Oracle Linux 9.8, x86_64, UEK `6.12.0-207.111.5.1.el9uek.x86_64` | Same |
+| Boot | UEFI, GPT; no Secure Boot enabled | UEFI, GPT; Secure Boot disabled |
+| Primary NIC | `virtio_net` over `virtio_pci`; PCI `1af4:1041`, Oracle subsystem `108e:1200` | ConnectX-6 Dx physical NICs, `mlx5_core`; PCI `15b3:101d` |
+| Boot storage | VirtIO SCSI, PCI `1af4:1048`; no active iSCSI session | iSCSI BlockVolume, active `iscsi_tcp` session and firmware iBFT |
+| Layout | 46.6 GiB disk; 100 MiB ESP, 2 GiB XFS `/boot`, LVM with XFS root and `/var/oled` | Same layout |
+| Portable initramfs | OCI vendor configuration sets `hostonly="no"` | Same; includes firmware iSCSI discovery, network userspace, `mlx5_core`, `iscsi_ibft`, and `iscsi_tcp` |
+
+`ACCELERATEDPV` uses the Acceleron SmartNIC data plane to offload network processing from the host CPU. Oracle lists it as the only networking type for E6 Ax VMs. Inside the inspected Linux guest it still uses VirtIO network drivers, so loading an unrelated physical-NIC driver is not the adaptation. The cloud launch must select AcceleratedPV on a supporting shape with a compatible image. Oracle currently lists Oracle Linux 8/9/10 platform images for this networking type; the host audit does not extend that support statement to arbitrary custom images. [Networking types and supported images](https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/edit-launch-options.htm)
+
+To prepare an E6 Ax candidate, select **Accelerated PV** for the preferred network attachment and launch mode, use PV boot storage, retain working UEFI, and set the import launch mode to Accelerated PV. Add `VM.Standard.E6.Ax.Flex` to the shape entries. For a bare-metal-to-VM conversion, **Destination → Machine migration** offers Accelerated PV networking. The planner requires installed VirtIO drivers across every selected kernel, rebuilds the initramfs when preparation is enabled, and verifies the result. It does not enable hardware offload on an ordinary PV shape.
+
+For the reviewed E5 bare-metal target, use **VM → Bare metal**, iSCSI boot, hardware/VFIO networking, and the `mlx5_core` NIC driver. Keep UEFI and allow iSCSI/VFIO in the OCI capabilities. When `BM.Standard.E5.192` is a shape entry, validation requires that actual driver instead of accepting an unrelated installed VF driver. In this context VFIO is OCI's launch setting; the physical Linux NIC is bound to `mlx5_core`, not `vfio-pci`. The existing preparation workflow requires firmware iSCSI discovery and complete early networking in the initramfs. It preserves the observed numeric `node.session.timeo.replacement_timeout` policy while removing machine-specific targets and identities during migration. It does not copy live host addresses, IQNs, or credentials.
+
+The platform images contain firmware-iSCSI arguments even on the running PV VM; those arguments alone do not prove that a guest actually booted over iSCSI. Transport selection must also use storage and firmware evidence. Forge's explicit VM migration removes iSCSI boot dependencies; the bare-metal path prepares them. The shared filesystem layout is already covered by the supported XFS/LVM rebuild workflow, subject to each imported image's own inspection and sizing checks.
+
+Oracle publishes [engineering guidance for preparing external images for VM and bare-metal boot](https://blogs.oracle.com/cloud-infrastructure/enabling-external-custom-images-virtual-and-bare-metal), while its [BYOI reference still excludes bare-metal support](https://docs.oracle.com/en-us/iaas/Content/Compute/References/bringyourownimage.htm). Forge therefore retains the experimental designation for bare-metal preparation. These audits did not import, launch, or reboot a Forge-built image on either new machine; destination boot validation remains outstanding.
 
 ## Supported values and preferred values
 

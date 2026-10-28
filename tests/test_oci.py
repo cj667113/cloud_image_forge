@@ -58,7 +58,9 @@ def test_catalog_covers_complete_documented_schema_and_all_choices():
     rows = {item["key"]: item for item in catalog()["capabilities"]}
     assert rows.keys() == EXPECTED_KEYS
     assert rows["Compute.Firmware"]["values"] == ["BIOS", "UEFI_64"]
-    assert rows["Network.AttachmentType"]["values"] == ["E1000", "VFIO", "PARAVIRTUALIZED"]
+    assert rows["Network.AttachmentType"]["values"] == ["E1000", "VFIO", "PARAVIRTUALIZED", "ACCELERATEDPV"]
+    assert "ACCELERATEDPV" in rows["Compute.LaunchMode"]["values"]
+    assert catalog()["schema_origin"] == "reference_snapshot"
     assert rows["Storage.ParaVirtualization.AttachmentVersion"]["values"] == [1, 2]
     assert not rows["Compute.SecureBoot"]["custom_image_supported"]
     for key in EXPECTED_KEYS:
@@ -101,7 +103,18 @@ def test_tenancy_schema_supports_cli_and_api_wrappers_without_invented_membershi
     assert config.capabilities["Compute.LaunchMode"].default_value == "ACCELERATEDPV"
     assert len(config.capabilities) == 14
     with pytest.raises(ValidationError):
-        OciConfig(capabilities={"Compute.LaunchMode": setting("ACCELERATEDPV")})
+        OciConfig(capabilities={"Compute.LaunchMode": setting("FUTURE_MODE")})
+
+
+def test_region_schema_is_authoritative_for_accelerated_values():
+    schema = deepcopy(GLOBAL_SCHEMA)
+    for key in ("Compute.LaunchMode", "Network.AttachmentType"):
+        schema[key]["values"].remove("ACCELERATEDPV")
+        with pytest.raises(ValidationError, match="allowed subset"):
+            OciConfig(global_schema=schema, capabilities={key: setting("ACCELERATEDPV")})
+    rows = {row["key"]: row for row in catalog(schema)["capabilities"]}
+    assert "ACCELERATEDPV" not in rows["Network.AttachmentType"]["values"]
+    assert catalog(schema)["schema_origin"] == "supplied"
 
 
 def test_non_oci_recipes_cannot_silently_drop_oci_configuration():
@@ -186,3 +199,86 @@ def test_new_tenancy_key_does_not_claim_guest_adaptation(ready_guest_plan):
     schema = {**GLOBAL_SCHEMA, "Compute.FutureFeature": {"descriptorType": "boolean", "defaultValue": False}}
     plan = compatibility_plan({}, OciConfig(global_schema=schema))
     assert any("no guest adaptation" in message for message in plan["warnings"])
+
+
+def accelerated_config(**options):
+    return OciConfig(capabilities={"Compute.LaunchMode": setting("ACCELERATEDPV"),
+                                   "Network.AttachmentType": setting("ACCELERATEDPV")},
+                     import_options={"launch_mode": "ACCELERATEDPV", **options})
+
+
+def test_accelerated_handoff_preserves_network_and_launch_mode(ready_guest_plan):
+    config = accelerated_config(shape_compatibility=[{"shape": "VM.Standard.E6.Ax.Flex"}])
+    plan = compatibility_plan({"os": {"arch": "x86_64"}}, config)
+    assert plan["ready_to_build"]
+    assert any("region's global schema" in warning for warning in plan["warnings"])
+    files = bundle_files(config, {})
+    assert json.loads(files["image-import.json"])["launchMode"] == "ACCELERATEDPV"
+    assert json.loads(files["instance-launch-options.json"])["networkType"] == "ACCELERATEDPV"
+    assert json.loads(files["instance-launch-options.json"])["bootVolumeType"] == "PARAVIRTUALIZED"
+    schema = json.loads(files["schema-data.json"])
+    assert schema["Network.AttachmentType"]["values"] == ["ACCELERATEDPV"]
+    assert json.loads(files["shape-001.json"])["shapeName"] == "VM.Standard.E6.Ax.Flex"
+
+
+@pytest.mark.parametrize("mode,network", [("ACCELERATEDPV", "PARAVIRTUALIZED"),
+                                          ("PARAVIRTUALIZED", "ACCELERATEDPV")])
+def test_accelerated_and_pv_modes_cannot_silently_interchange(ready_guest_plan, mode, network):
+    config = OciConfig(capabilities={"Compute.LaunchMode": setting(mode), "Network.AttachmentType": setting(network)})
+    plan = compatibility_plan({}, config)
+    assert not plan["ready_to_build"]
+    assert any("launch mode requires" in message for message in plan["blockers"])
+
+
+def test_advertised_accelerated_mode_also_requires_network_support(ready_guest_plan):
+    config = OciConfig(capabilities={"Compute.LaunchMode": setting("CUSTOM", ["CUSTOM", "ACCELERATEDPV"])})
+    assert any("Allowed launch mode ACCELERATEDPV" in message for message in compatibility_plan({}, config)["blockers"])
+
+
+@pytest.mark.parametrize("shape", ["VM.Standard.E6.Ax.Flex", "VM.DenseIO.E6.Ax.Flex", "VM.Standard4.Ax.Flex", "VM.Standard.A4.Ax.Flex"])
+def test_acceleron_shape_rejects_a_pv_only_image(ready_guest_plan, shape):
+    config = OciConfig(import_options={"shape_compatibility": [{"shape": shape}]})
+    assert any("supports only ACCELERATEDPV" in message for message in compatibility_plan({}, config)["blockers"])
+
+
+def test_custom_mode_can_describe_accelerated_networking(ready_guest_plan):
+    config = OciConfig(capabilities={"Compute.LaunchMode": setting("CUSTOM"), "Network.AttachmentType": setting("ACCELERATEDPV")})
+    assert compatibility_plan({}, config)["ready_to_build"]
+
+
+def test_import_mode_does_not_invent_image_capability_membership(ready_guest_plan):
+    schema = deepcopy(GLOBAL_SCHEMA)
+    schema["Compute.LaunchMode"]["values"].remove("ACCELERATEDPV")
+    config = OciConfig(global_schema=schema, capabilities={"Compute.LaunchMode": setting("CUSTOM"),
+                       "Network.AttachmentType": setting("ACCELERATEDPV")},
+                       import_options={"launch_mode": "ACCELERATEDPV"})
+    plan = compatibility_plan({}, config)
+    assert plan["ready_to_build"]
+    assert any("Import launch mode differs" in warning for warning in plan["warnings"])
+    files = bundle_files(config, {})
+    assert json.loads(files["image-import.json"])["launchMode"] == "ACCELERATEDPV"
+    assert json.loads(files["schema-data.json"])["Compute.LaunchMode"]["values"] == ["CUSTOM"]
+
+
+@pytest.mark.parametrize("shape", ["VM.Standard.E6.Ax.Flex", "BM.Standard.E5.192"])
+def test_reviewed_x86_shapes_reject_arm_guest(ready_guest_plan, shape):
+    config = accelerated_config(shape_compatibility=[{"shape": shape}])
+    assert any("requires x86_64" in message for message in compatibility_plan({"os": {"arch": "aarch64"}}, config)["blockers"])
+
+
+def test_bm_e5_requires_iscsi_and_actual_mlx5_driver(monkeypatch):
+    calls = []
+    def guest(*args, **kwargs):
+        calls.append(kwargs)
+        return {"changes": [], "warnings": [], "blockers": []}
+    monkeypatch.setattr("forge.oci_guest.plan_guest", guest)
+    config = OciConfig(import_options={"shape_compatibility": [{"shape": "BM.Standard.E5.192"}]})
+    plan = compatibility_plan({}, config)
+    assert any("BM.Standard.E5.192 requires iSCSI boot" in message for message in plan["blockers"])
+    assert calls[0]["platform_nic_driver"] == "mlx5_core"
+
+
+def test_accelerated_migration_network_roundtrips_recipe():
+    recipe = Recipe(platform_migration={"enabled": True, "source": "bare_metal", "target": "vm",
+                                        "boot_attachment": "paravirtualized", "network_attachment": "accelerated"})
+    assert Recipe.model_validate(recipe.model_dump()).platform_migration.network_attachment == "accelerated"

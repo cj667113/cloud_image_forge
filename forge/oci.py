@@ -1,7 +1,7 @@
 """OCI image capabilities, validation, and offline deployment configuration.
 
-The documented global schema is a starting point, not a claim about a tenancy's
-current schema version or an image's ability to boot on a particular shape.
+The reference schema combines the documented global schema with current launch
+API values. It is not a tenancy schema or proof an image boots on a given shape.
 """
 from __future__ import annotations
 
@@ -20,9 +20,13 @@ SOURCES = [
     {"title": "OCI global image capability schema", "url": "https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/configuringimagecapabilities.htm"},
     {"title": "OCI image import", "url": "https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/compute/image/import/from-object.html"},
     {"title": "OCI image capability schema creation", "url": "https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/compute/image-capability-schema/create.html"},
+    {"title": "OCI networking types and supported shapes", "url": "https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/edit-launch-options.htm"},
+    {"title": "OCI launch option API values", "url": "https://docs.oracle.com/en-us/iaas/tools/python/latest/api/core/models/oci.core.models.LaunchOptions.html"},
 ]
-CHECKED_ON = "2026-10-27"
+CHECKED_ON = "2026-10-28"
 STORAGE_TYPES = ["ISCSI", "SCSI", "IDE", "PARAVIRTUALIZED"]
+ACCELERATED_VM_SHAPES = {"VM.Standard.E6.Ax.Flex", "VM.DenseIO.E6.Ax.Flex",
+                         "VM.Standard4.Ax.Flex", "VM.Standard.A4.Ax.Flex"}
 
 
 def descriptor(kind, default, values=None):
@@ -36,8 +40,8 @@ GLOBAL_SCHEMA = {
     "Compute.AMD_SecureEncryptedVirtualization": descriptor("boolean", False),
     "Compute.Firmware": descriptor("enumstring", "UEFI_64", ["BIOS", "UEFI_64"]),
     "Compute.SecureBoot": descriptor("boolean", False),
-    "Compute.LaunchMode": descriptor("enumstring", "PARAVIRTUALIZED", ["NATIVE", "EMULATED", "PARAVIRTUALIZED", "CUSTOM"]),
-    "Network.AttachmentType": descriptor("enumstring", "PARAVIRTUALIZED", ["E1000", "VFIO", "PARAVIRTUALIZED"]),
+    "Compute.LaunchMode": descriptor("enumstring", "PARAVIRTUALIZED", ["NATIVE", "EMULATED", "PARAVIRTUALIZED", "CUSTOM", "ACCELERATEDPV"]),
+    "Network.AttachmentType": descriptor("enumstring", "PARAVIRTUALIZED", ["E1000", "VFIO", "PARAVIRTUALIZED", "ACCELERATEDPV"]),
     "Network.IPv6Only": descriptor("boolean", False),
     "Storage.BootVolumeType": descriptor("enumstring", "PARAVIRTUALIZED", STORAGE_TYPES),
     "Storage.LocalDataVolumeType": descriptor("enumstring", "PARAVIRTUALIZED", STORAGE_TYPES),
@@ -54,7 +58,7 @@ DETAILS = {
     "Compute.Firmware": ("Firmware", "Verify BIOS/UEFI boot support for every advertised firmware. Optional BIOS-to-UEFI migration must pass its prerequisites and final inspection; metadata alone cannot install a bootloader."),
     "Compute.SecureBoot": ("Secure Boot", "OCI does not support Secure Boot for custom images; this must remain disabled."),
     "Compute.LaunchMode": ("Launch mode", "Match the device model to the guest drivers. Use CUSTOM for mixed settings; import mode is a separate OCI operation."),
-    "Network.AttachmentType": ("Primary network attachment", "Prepare the guest drivers needed for emulated, hardware-assisted, or paravirtualized networking."),
+    "Network.AttachmentType": ("Primary network attachment", "Prepare emulated, hardware-assisted, PV, or Accelerated PV networking. Accelerated PV uses VirtIO guest drivers on the reviewed E6 Ax VM and requires a supported Acceleron shape, compatible image, and regional schema."),
     "Network.IPv6Only": ("IPv6-only networking", "Configure IPv6-capable networking. OCI requires prior IPv6-only validation; VCN/subnet configuration remains external."),
     "Storage.BootVolumeType": ("Boot volume attachment", "Prepare boot storage drivers and initramfs, including early networking for iSCSI boot."),
     "Storage.LocalDataVolumeType": ("Local data volume attachment", "Include drivers for the selected local data volume attachment types."),
@@ -114,7 +118,7 @@ def catalog(schema: dict | None = None) -> dict:
                      "values": item.get("values"), "description": explanation, "guest_action": explanation,
                      "custom_image_supported": key != "Compute.SecureBoot", "guest_adapter_known": key in DETAILS})
     return {"capabilities": rows, "sources": SOURCES, "checked_on": CHECKED_ON,
-            "schema_origin": "supplied" if schema is not None else "documented_snapshot"}
+            "schema_origin": "supplied" if schema is not None else "reference_snapshot"}
 
 
 class StrictModel(BaseModel):
@@ -234,6 +238,7 @@ def compatibility_plan(inspection: dict, config: OciConfig, allow_network=False,
     platform_plan = None
     platform_nic_driver = None
     evidence = inspection
+    bm_e5_selected = any(shape.shape == "BM.Standard.E5.192" for shape in config.import_options.shape_compatibility)
     if platform_migration and platform_migration.get("enabled"):
         from copy import deepcopy
         from .platform import plan_platform
@@ -257,6 +262,10 @@ def compatibility_plan(inspection: dict, config: OciConfig, allow_network=False,
                 for key in ("modules", "builtin"):
                     kernel[key] = sorted(set(kernel.get(key, [])) | set(physical.get(key, [])))
                 kernel["initrd_modules"] = sorted(set(kernel.get("initrd_modules") or []) | set(platform_plan.get("required_modules", [])))
+    # A known hardware target must not pass based on an unrelated installed VF
+    # driver. The reviewed E5 host exposes ConnectX-6 Dx physical functions.
+    if bm_e5_selected:
+        platform_nic_driver = "mlx5_core"
     pending = ()
     if boot_migration and boot_migration.get("enabled"):
         from .uefi import plan_migration
@@ -289,12 +298,21 @@ def compatibility_plan(inspection: dict, config: OciConfig, allow_network=False,
         plan["blockers"].append("PARAVIRTUALIZED launch mode requires paravirtualized boot and networking; use CUSTOM for mixed attachments.")
     if mode == "EMULATED" and (boot not in {"SCSI", "IDE"} or network != "E1000"):
         plan["blockers"].append("EMULATED launch mode requires emulated storage (SCSI/IDE) and E1000 networking; use CUSTOM for mixed attachments.")
+    if mode == "ACCELERATEDPV" and network != "ACCELERATEDPV":
+        plan["blockers"].append("ACCELERATEDPV launch mode requires ACCELERATEDPV networking.")
     for advertised in allowed.get("Compute.LaunchMode", []):
         required = {"NATIVE": ({"ISCSI"}, "VFIO"), "PARAVIRTUALIZED": ({"PARAVIRTUALIZED"}, "PARAVIRTUALIZED"),
                     "EMULATED": ({"SCSI", "IDE"}, "E1000")}.get(advertised)
         if required and (not required[0].intersection(allowed.get("Storage.BootVolumeType", []))
                          or required[1] not in allowed.get("Network.AttachmentType", [])):
             plan["blockers"].append(f"Allowed launch mode {advertised} needs matching allowed boot and network attachment types, not just a preferred value.")
+        if advertised == "ACCELERATEDPV" and "ACCELERATEDPV" not in allowed.get("Network.AttachmentType", []):
+            plan["blockers"].append("Allowed launch mode ACCELERATEDPV needs ACCELERATEDPV in the allowed network attachment types.")
+    accelerated = "ACCELERATEDPV" in allowed.get("Network.AttachmentType", []) or "ACCELERATEDPV" in allowed.get("Compute.LaunchMode", [])
+    if accelerated:
+        if config.global_schema is None:
+            plan["warnings"].append("ACCELERATEDPV is a current OCI launch API value. Load the destination region's global schema to verify it is accepted before applying image capabilities; a schema version name alone does not verify its values.")
+        plan["warnings"].append("AcceleratedPV requires a compatible image and Acceleron shape. The reviewed E6 Ax guest uses virtio_net and virtio_pci; offline driver checks do not prove SmartNIC offload or a successful OCI launch.")
     if values.get("Network.IPv6Only"):
         if any("ISCSI" in allowed.get(k, []) for k in ("Storage.BootVolumeType", "Storage.RemoteDataVolumeType")):
             plan["blockers"].append("OCI IPv6-only launches do not support iSCSI boot or remote data-volume attachments.")
@@ -312,6 +330,19 @@ def compatibility_plan(inspection: dict, config: OciConfig, allow_network=False,
         if (inspection.get("os", {}).get("arch") == "x86_64"
                 and re.match(r"^(?:VM|BM)\.Standard\.A(?:1|2|4)\.", shape.shape)):
             plan["blockers"].append(f"{shape.shape} is an Arm shape. An x86_64 image cannot be converted to Arm by changing image capabilities.")
+        if shape.shape in ACCELERATED_VM_SHAPES and "ACCELERATEDPV" not in allowed.get("Network.AttachmentType", []):
+            plan["blockers"].append(f"{shape.shape} supports only ACCELERATEDPV networking. Include it in the allowed network attachment types.")
+        if shape.shape in {"VM.Standard.E6.Ax.Flex", "BM.Standard.E5.192"}:
+            arch = inspection.get("os", {}).get("arch")
+            if arch and arch != "x86_64":
+                plan["blockers"].append(f"{shape.shape} requires x86_64; changing image capabilities cannot convert the guest architecture.")
+            if "UEFI_64" not in allowed.get("Compute.Firmware", []):
+                plan["warnings"].append(f"The reviewed {shape.shape} host uses UEFI. BIOS compatibility has not been established by that host audit.")
+        if shape.shape == "BM.Standard.E5.192":
+            if "ISCSI" not in allowed.get("Storage.BootVolumeType", []) or "VFIO" not in allowed.get("Network.AttachmentType", []):
+                plan["blockers"].append("BM.Standard.E5.192 requires iSCSI boot and hardware/VFIO networking in the allowed attachment types; its reviewed NIC driver is mlx5_core.")
+            if platform_migration and platform_migration.get("enabled") and platform_migration.get("nic_driver") not in {None, "mlx5_core"}:
+                plan["blockers"].append("BM.Standard.E5.192 uses mlx5_core on the reviewed hardware; the machine migration NIC driver conflicts with that target.")
     if config.import_options.shape_compatibility:
         plan["warnings"].append("Shape compatibility entries only advertise support. Verify the selected shapes' architecture, boot modes, memory/OCPU limits and confidential-computing support in the destination region.")
     for key in config.capabilities.keys() - GLOBAL_SCHEMA.keys():
@@ -382,7 +413,8 @@ def bundle_files(config: OciConfig, artifact: dict) -> dict[str, str]:
         "1. Obtain the target region/tenancy schema (do not guess its version):\n"
         "   oci compute global-image-capability-schema list --all\n"
         "   oci compute global-image-capability-schema-version get --global-image-capability-schema-id SCHEMA_OCID --global-image-capability-schema-version-name VERSION\n"
-        "   Compare schema-data.json with the returned schema. The profile may use a documentation snapshot.\n"
+        "   Compare schema-data.json with the returned schema. The reference catalog combines documentation and API values, not a region's live schema.\n"
+        "   ACCELERATEDPV must be accepted by that schema and supported by both the image and the destination Acceleron shape.\n"
         "2. Check the artifact SHA-256, upload it, then import:\n"
         f"   oci compute image import {method} --from-json file://image-import.json\n"
         "   Wait for image lifecycle state AVAILABLE; substitute its OCID in schema/shape JSON files.\n"

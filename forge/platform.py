@@ -407,6 +407,13 @@ def _adapt_args(words, plan, options):
     result = []
     for word in words:
         key = word.partition("=")[0]
+        # This nonidentity session timeout is present on the audited BM E5
+        # firmware-iSCSI root. Preserve valid policy values only for an iSCSI
+        # destination; never carry source initiator/authentication parameters.
+        timeout = re.fullmatch(r"rd\.iscsi\.param=node\.session\.timeo\.replacement_timeout=(-?\d{1,10})", word)
+        if options.get("boot_attachment") == "iscsi" and timeout and -2147483648 <= int(timeout[1]) <= 2147483647:
+            result.append(word)
+            continue
         # Replace only the boot transport being migrated. Retain unrelated policy.
         if key == "root" or key.startswith("rd.iscsi.") or key.startswith("iscsi_"):
             continue
@@ -456,7 +463,7 @@ def plan_platform(inspection, options, allow_network=False, oci_config=None, tar
     boot, network, nic = options.get("boot_attachment"), options.get("network_attachment"), options.get("nic_driver")
     if source not in {"vm", "bare_metal"} or target not in {"vm", "bare_metal"} or source == target:
         blockers.append("Select distinct VM and bare-metal source and destination platforms.")
-    if boot not in {"paravirtualized", "iscsi"} or network not in {"paravirtualized", "vfio"}:
+    if boot not in {"paravirtualized", "iscsi"} or network not in {"paravirtualized", "accelerated", "vfio"}:
         blockers.append("Select a supported boot and network attachment profile.")
     if (target == "bare_metal" or network == "vfio") and nic not in NIC_DRIVERS:
         blockers.append("Select the actual target physical/VF NIC driver; hardware cannot be inferred from an imported disk.")
@@ -484,7 +491,10 @@ def plan_platform(inspection, options, allow_network=False, oci_config=None, tar
         blockers.append("A detected boot chain is required; bare-metal preparation needs UEFI. Enable eligible BIOS-to-UEFI migration or import a compatible image.")
     # This profile discovers its boot target from firmware, not an explicit IQN.
     required = set(PV_DRIVERS if boot == "paravirtualized" else {"iscsi_tcp", "iscsi_ibft", "sd_mod"})
-    required.update({"virtio_pci", "virtio_net"} if network == "paravirtualized" else {nic} if nic in NIC_DRIVERS else set())
+    required.update({"virtio_pci", "virtio_net"} if network in {"paravirtualized", "accelerated"} else {nic} if nic in NIC_DRIVERS else set())
+    if network == "accelerated":
+        actions.append("Prepare the audited E6.Ax AcceleratedPV guest-facing VirtIO network drivers (virtio_net and virtio_pci) in every initramfs.")
+        warnings.append("AcceleratedPV is a distinct OCI networking type even though the audited E6.Ax guest uses VirtIO drivers. A compatible shape/image and target launch validation are still required.")
     if target == "bare_metal":
         required.update({"nvme", "nvme_core", "ahci"})
     plan["required_modules"] = sorted(required)
@@ -594,7 +604,7 @@ def plan_platform(inspection, options, allow_network=False, oci_config=None, tar
     if oci_config is not None:
         config = _dict(oci_config)
         expected = {"Storage.BootVolumeType": "ISCSI" if boot == "iscsi" else "PARAVIRTUALIZED",
-                    "Network.AttachmentType": "VFIO" if network == "vfio" else "PARAVIRTUALIZED"}
+                    "Network.AttachmentType": {"vfio": "VFIO", "accelerated": "ACCELERATEDPV"}.get(network, "PARAVIRTUALIZED")}
         if firmware:
             expected["Compute.Firmware"] = firmware
         for key, wanted in expected.items():
@@ -602,7 +612,9 @@ def plan_platform(inspection, options, allow_network=False, oci_config=None, tar
             if descriptor.get("default_value") != wanted or wanted not in (descriptor.get("values") or [descriptor.get("default_value")]):
                 blockers.append(f"OCI {key} must allow and prefer {wanted} to match the platform migration profile.")
         launch = config.get("capabilities", {}).get("Compute.LaunchMode", {}).get("default_value")
-        expected_launch = "NATIVE" if target == "bare_metal" else "PARAVIRTUALIZED" if boot == network == "paravirtualized" else "CUSTOM"
+        expected_launch = ("NATIVE" if target == "bare_metal" else
+                           "ACCELERATEDPV" if network == "accelerated" and boot == "paravirtualized" else
+                           "PARAVIRTUALIZED" if boot == network == "paravirtualized" else "CUSTOM")
         if launch not in {expected_launch, "CUSTOM"}:
             blockers.append(f"OCI Compute.LaunchMode must be {expected_launch} or CUSTOM for this platform profile.")
         shapes = config.get("import_options", {}).get("shape_compatibility") or []

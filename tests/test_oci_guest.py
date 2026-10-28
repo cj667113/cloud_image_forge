@@ -35,6 +35,40 @@ def inspected():
 
 
 class PlanTests(unittest.TestCase):
+    def test_acceleratedpv_uses_audited_guest_virtio_without_inventing_nvme(self):
+        image, profile = inspected(), config()
+        profile["capabilities"]["Network.AttachmentType"] = {"default_value": "ACCELERATEDPV", "values": ["ACCELERATEDPV"]}
+        before = deepcopy(image)
+        plan = plan_guest(image, profile)
+        self.assertFalse(plan["blockers"])
+        self.assertTrue({"virtio_net", "virtio_pci", "virtio_scsi"} <= set(plan["required_modules"]))
+        self.assertNotIn("nvme", plan["required_modules"])
+        self.assertNotIn("mlx5_core", plan["required_modules"])
+        self.assertTrue(any("E6.Ax" in warning for warning in plan["warnings"]))
+        self.assertEqual(image, before, "planning must not mutate or prune the source driver inventory")
+
+    def test_acceleratedpv_requires_modules_and_verified_initramfs_across_kernels(self):
+        image, profile = inspected(), config(prepare=False)
+        profile["capabilities"]["Network.AttachmentType"] = {"default_value": "ACCELERATEDPV", "values": ["ACCELERATEDPV"]}
+        kernel = image["oci_evidence"]["kernels"][VERSION]
+        kernel["initrd_modules"].remove("virtio_net")
+        self.assertTrue(any("virtio_net" in message and "initramfs" in message for message in plan_guest(image, profile)["blockers"]))
+        older = deepcopy(kernel)
+        older["modules"].remove("virtio_net")
+        older["config"]["CONFIG_VIRTIO_NET"] = "m"
+        image["oci_evidence"]["kernels"]["old-kernel"] = older
+        profile["guest"]["prepare"] = True
+        self.assertTrue(any("old-kernel" in message and "virtio_net" in message for message in plan_guest(image, profile)["blockers"]))
+        image["oci_evidence"]["blacklisted_modules"] = ["virtio_pci"]
+        self.assertTrue(any("blacklisted" in message and "virtio_pci" in message for message in plan_guest(image, profile)["blockers"]))
+
+    def test_selected_bm_driver_is_required_instead_of_any_available_vf_driver(self):
+        image, profile = inspected(), config()
+        profile["capabilities"]["Network.AttachmentType"] = {"default_value": "VFIO", "values": ["VFIO"]}
+        image["oci_evidence"]["kernels"][VERSION]["modules"].remove("mlx5_core")
+        self.assertFalse(plan_guest(image, profile)["blockers"], "generic VF profile can still use its other inventoried drivers")
+        self.assertTrue(any("selected physical NIC" in item for item in plan_guest(image, profile, platform_nic_driver="mlx5_core")["blockers"]))
+
     def test_supported_pv_guest_has_real_changes(self):
         plan = plan_guest(inspected(), config())
         self.assertEqual(plan["blockers"], [])
@@ -186,6 +220,21 @@ class FakeGuest:
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_installed_module_evidence_checks_files_and_rejects_stale_or_escaping_paths(self):
+        directory = "/lib/modules/test/"
+        g = FakeGuest({
+            "/boot/config-test": "CONFIG_VIRTIO_PCI=y\nCONFIG_VIRTIO_NET=m\n",
+            directory + "modules.dep": "kernel/net/virtio_net.ko.xz:\nkernel/scsi/virtio_scsi.ko.zst:\n../virtio_blk.ko:\n/absolute/sd_mod.ko:\n",
+            directory + "kernel/scsi/virtio_scsi.ko.zst": "compressed module",
+            directory + "../virtio_blk.ko": "must not count",
+            directory + "modules.builtin": "kernel/virtio/virtio_ring.ko\n",
+        })
+        result = inspect_guest(g, "/dev/sda1", [], ["/boot/vmlinuz-test"])
+        kernel = result["kernels"]["test"]
+        self.assertEqual(kernel["modules"], ["virtio_scsi"])
+        self.assertIn("virtio_pci", kernel["builtin"])
+        self.assertNotIn("virtio_net", kernel["modules"])
+
     def test_nm_bound_interface_is_not_portable_readiness(self):
         path = "/etc/NetworkManager/system-connections/primary.nmconnection"
         content = _network_files("NetworkManager").popitem()[1].replace("type=ethernet", "type=ethernet\ninterface-name=ens192")
@@ -207,6 +256,7 @@ class EvidenceTests(unittest.TestCase):
                                  "architecture": "x86_64", "fallback": True}], "bios_evidence": []}
         g = FakeGuest({"/boot/config-test": "CONFIG_VIRTIO_PCI=y\nCONFIG_SCSI_VIRTIO=m\n",
                        "/lib/modules/test/modules.dep": "kernel/virtio_scsi.ko.xz:\n",
+                       "/lib/modules/test/kernel/virtio_scsi.ko.xz": "compressed module",
                        "/etc/modprobe.d/local.conf": "blacklist virtio_net\ninstall virtio_scsi /bin/false\n",
                        "/etc/udev/rules.d/comment.rules": '# SYMLINK+="oracleoci/fake"\n',
                        "/etc/udev/rules.d/real.rules": 'SUBSYSTEM=="block", SYMLINK+="oracleoci/%k"\n',

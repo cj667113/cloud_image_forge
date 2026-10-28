@@ -85,7 +85,7 @@ class PlatformMigration(StrictModel):
     source: Literal["vm", "bare_metal"] = "vm"
     target: Literal["vm", "bare_metal"] = "bare_metal"
     boot_attachment: Literal["paravirtualized", "iscsi"] = "iscsi"
-    network_attachment: Literal["paravirtualized", "vfio"] = "vfio"
+    network_attachment: Literal["paravirtualized", "accelerated", "vfio"] = "vfio"
     nic_driver: Literal["ixgbe", "ixgbevf", "i40e", "iavf", "mlx4_en", "mlx5_core", "bnxt_en"] | None = None
     install_packages: bool = False
     configure_network: bool = True
