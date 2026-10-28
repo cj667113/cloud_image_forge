@@ -17,6 +17,7 @@ import tarfile
 import tempfile
 from uuid import UUID
 
+from .architecture import SUPPORTED_ARCHES, normalize_arch
 from .boot import EFI_GUID
 
 MIB = 1024 ** 2
@@ -36,6 +37,14 @@ class StorageError(RuntimeError):
 
 def _ceil(value, unit=MIB):
     return ((int(value) + unit - 1) // unit) * unit
+
+
+def _matching_arm_efi(boot, arch):
+    return arch != "aarch64" or (
+        normalize_arch(boot.get("architecture", arch)) == arch
+        and any(normalize_arch(loader.get("architecture")) == arch
+                for loader in boot.get("efi_loaders", []))
+    )
 
 
 def _minimum(used, filesystem):
@@ -240,7 +249,8 @@ def _lvm_errors(lvm, partitions, filesystems):
 def plan_rebuild(inspection: dict, options: dict | None, disk_size_gib=None) -> dict:
     requested = bool(options and options.get("enabled"))
     result = {"requested": requested, "ready": False, "blockers": [], "warnings": [],
-              "changes": [], "layout": {}, "filesystems": [], "estimated_temporary_bytes": 0}
+              "changes": [], "layout": {}, "filesystems": [], "estimated_temporary_bytes": 0,
+              "source_architecture": normalize_arch(inspection.get("os", {}).get("arch"))}
     if not requested:
         return result
     errors, warnings = result["blockers"], result["warnings"]
@@ -255,11 +265,15 @@ def plan_rebuild(inspection: dict, options: dict | None, disk_size_gib=None) -> 
     parts = deepcopy(old.get("partitions", []))
     filesystems = deepcopy(storage.get("filesystems", []))
     result["filesystems"] = filesystems
-    if inspection.get("os", {}).get("arch") != "x86_64":
-        errors.append("Storage rebuild supports x86_64 Linux only")
-    firmware = inspection.get("boot", {}).get("supported_firmware", [])
+    arch = result["source_architecture"]
+    if arch not in SUPPORTED_ARCHES:
+        errors.append("Storage rebuild supports x86_64 and ARM64 (aarch64) Linux only")
+    boot = inspection.get("boot", {})
+    firmware = boot.get("supported_firmware", [])
     if "UEFI_64" not in firmware or "BIOS" in firmware:
         errors.append("Storage rebuild requires UEFI-only boot support; BIOS/dual boot code cannot be safely relocated")
+    if not _matching_arm_efi(boot, arch):
+        errors.append("ARM64 storage rebuild requires a detected matching AArch64 EFI loader; refresh inspection")
     if old.get("partition_table") != "gpt" or old.get("sector_size") != 512 or old.get("hybrid"):
         errors.append("Storage rebuild requires a validated GPT disk with 512-byte sectors and no hybrid MBR")
     if (not parts or [part.get("number") for part in parts] != list(range(1, len(parts) + 1))
@@ -374,6 +388,9 @@ def verify_rebuild(inspection: dict, plan: dict, *, expected_disk_size=None) -> 
         errors.append("There is no successful storage rebuild plan to verify")
         return result
     expected = plan["layout"]
+    arch = normalize_arch(inspection.get("os", {}).get("arch"))
+    if arch not in SUPPORTED_ARCHES or arch != plan.get("source_architecture"):
+        errors.append("Final guest architecture does not match the source storage rebuild plan")
     original_size = expected["disk_size_after"]
     desired_size = original_size if expected_disk_size is None else expected_disk_size
     if (isinstance(desired_size, bool) or not isinstance(desired_size, int)
@@ -392,8 +409,11 @@ def verify_rebuild(inspection: dict, plan: dict, *, expected_disk_size=None) -> 
         errors.append("Final disk geometry does not match the rebuilt disk and permitted provider alignment")
     if actual.get("disk_identity") != expected.get("disk_identity"):
         errors.append("Final disk GPT identity changed after filesystem rebuild")
-    if "UEFI_64" not in inspection.get("boot", {}).get("supported_firmware", []):
-        errors.append("Final rebuilt disk no longer has detected UEFI boot support")
+    boot = inspection.get("boot", {})
+    if "UEFI_64" not in boot.get("supported_firmware", []) or "BIOS" in boot.get("supported_firmware", []):
+        errors.append("Final rebuilt disk no longer has UEFI-only boot support")
+    if not _matching_arm_efi(boot, arch):
+        errors.append("Final ARM64 disk no longer has a matching AArch64 EFI loader")
     partitions = actual.get("partitions", [])
     fields = ("number", "device", "start", "end", "size", "type", "partition_guid", "attributes", "name")
     if len(partitions) != len(expected["partitions"]):
@@ -677,8 +697,11 @@ def rebuild(source_work: Path, destination: Path, inspection: dict, recipe: dict
                 if efi_check.stat().st_size != esp["size"] or _digest(efi_check) != efi_hash:
                     raise StorageError("EFI partition bytes changed during the rebuild")
                 from .boot import detect_boot
-                if "UEFI_64" not in detect_boot(g).get("supported_firmware", []):
-                    raise StorageError("Rebuilt disk lost detectable UEFI boot support")
+                boot = detect_boot(g, architecture=plan["source_architecture"])
+                if ("UEFI_64" not in boot.get("supported_firmware", [])
+                        or "BIOS" in boot.get("supported_firmware", [])
+                        or not _matching_arm_efi(boot, plan["source_architecture"])):
+                    raise StorageError("Rebuilt disk lost matching UEFI-only boot support")
                 points = _mount(g, _roots(g), True)
                 for filesystem in regular:
                     if points.get(filesystem["mountpoint"]) != filesystem["device"]:

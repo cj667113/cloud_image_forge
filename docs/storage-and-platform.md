@@ -1,6 +1,6 @@
 # Storage rebuild and machine preparation
 
-These workflows operate on offline x86_64 Linux disk images. The imported source is preserved, each build uses independent working files, and only a complete validated artifact is published.
+These workflows operate on offline x86_64 and ARM64 Linux disk images. The imported source is preserved, each build uses independent working files, and only a complete validated artifact is published. See [image/worker architecture requirements](image-architectures.md); guest-executing operations require a worker matching the guest.
 
 ## Smaller disks and filesystems
 
@@ -85,7 +85,7 @@ OCI guest preparation must be set to **Validate only** while preserving hardware
 }
 ```
 
-Use `strategy: "reconfigure"` to request adaptation. For the experimental bare-metal profile, use `source: "vm"`, `target: "bare_metal"`, iSCSI boot, hardware/VFIO networking and an explicit supported `nic_driver`. UEFI must be detected or provided by an eligible separately enabled BIOS-to-UEFI migration. These profiles are available for OCI and generic exports; they do not convert x86 images to Arm.
+Use `strategy: "reconfigure"` to request adaptation on a matching-architecture worker. For the experimental x86_64 bare-metal profile, use `source: "vm"`, `target: "bare_metal"`, iSCSI boot, hardware/VFIO networking and an explicit supported `nic_driver`. UEFI must be detected or provided by an eligible separately enabled x86 BIOS-to-UEFI migration. ARM64 supports existing ARM64 UEFI VM profiles with PV boot and PV/AcceleratedPV networking. These profiles are available for OCI and generic exports; they do not convert x86 images to Arm.
 
 Reconfiguration checks installed or built-in drivers for every non-rescue kernel, uses stable UUID mounts, adapts root and boot-transport arguments, and rebuilds generic initramfs with native guest-tool verification. Its broad physical profile includes the selected NIC and NVMe/AHCI support; that bundle is not the minimum needed by an E5 bare-metal iSCSI root. VM PV profiles require VirtIO. Standard GRUB `kernelopts` and `tuned_params` can be resolved from validated, inspected GRUB environment data; unknown or dynamic shell substitutions remain blockers. Existing configuration and unrelated boot arguments are retained or backed up. Networking and serial changes have explicit controls. Required guest packages need both package permission and guest networking; missing kernel drivers are not replaced with guessed packages.
 

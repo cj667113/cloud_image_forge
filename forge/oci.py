@@ -15,6 +15,8 @@ import zipfile
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, model_validator
 
+from .architecture import normalize_arch
+
 
 SOURCES = [
     {"title": "OCI global image capability schema", "url": "https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/configuringimagecapabilities.htm"},
@@ -22,6 +24,7 @@ SOURCES = [
     {"title": "OCI image capability schema creation", "url": "https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/compute/image-capability-schema/create.html"},
     {"title": "OCI networking types and supported shapes", "url": "https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/edit-launch-options.htm"},
     {"title": "OCI launch option API values", "url": "https://docs.oracle.com/en-us/iaas/tools/python/latest/api/core/models/oci.core.models.LaunchOptions.html"},
+    {"title": "OCI shape CPU architectures", "url": "https://docs.oracle.com/en-us/iaas/Content/Compute/References/computeshapes.htm"},
 ]
 CHECKED_ON = "2026-10-28"
 STORAGE_TYPES = ["ISCSI", "SCSI", "IDE", "PARAVIRTUALIZED"]
@@ -33,6 +36,12 @@ SHAPE_NETWORK_TYPES = {
     "VM.Standard.E5.Flex": frozenset({"PARAVIRTUALIZED", "VFIO"}),
     "VM.Standard.E6.Flex": frozenset({"PARAVIRTUALIZED", "VFIO"}),
 }
+ARM_SHAPES = {"VM.Standard.A1.Flex", "VM.Standard.A2.Flex", "VM.Standard.A4.Flex", "VM.Standard.A4.Ax.Flex",
+              "BM.Standard.A1.160", "BM.Standard.A4.48", "BM.Standard.A4.Ax.48"}
+X86_SHAPES = {"VM.Standard3.Flex", "VM.Standard4.Ax.Flex", "VM.Standard.E4.Flex", "VM.Standard.E5.Flex",
+              "VM.Standard.E6.Flex", "VM.Standard.E6.Ax.Flex", "VM.DenseIO.E4.Flex", "VM.DenseIO.E5.Flex",
+              "VM.DenseIO.E6.Ax.Flex", "VM.Optimized3.Flex", "BM.Standard3.64", "BM.Standard4.Ax.120",
+              "BM.Standard.E4.128", "BM.Standard.E5.192", "BM.Standard.E6.256", "BM.Standard.E6.Ax.192"}
 
 
 def descriptor(kind, default, values=None):
@@ -342,9 +351,10 @@ def compatibility_plan(inspection: dict, config: OciConfig, allow_network=False,
     if config.import_options.launch_mode != mode:
         plan["warnings"].append("Import launch mode differs from the preferred image capability. Apply the capability schema after import and verify OCI's resulting launch settings.")
     for shape in config.import_options.shape_compatibility:
-        if (inspection.get("os", {}).get("arch") == "x86_64"
-                and re.match(r"^(?:VM|BM)\.Standard\.A(?:1|2|4)\.", shape.shape)):
-            plan["blockers"].append(f"{shape.shape} is an Arm shape. An x86_64 image cannot be converted to Arm by changing image capabilities.")
+        arch = normalize_arch(inspection.get("os", {}).get("arch"))
+        required_arch = "aarch64" if shape.shape in ARM_SHAPES else "x86_64" if shape.shape in X86_SHAPES else None
+        if required_arch and arch != "unknown" and arch != required_arch:
+            plan["blockers"].append(f"{shape.shape} requires {required_arch}; this {arch} image cannot be converted to another CPU architecture by changing image capabilities.")
         supported_networks = SHAPE_NETWORK_TYPES.get(shape.shape)
         if supported_networks is not None:
             usable_networks = supported_networks.intersection(allowed.get("Network.AttachmentType", []))
@@ -354,10 +364,6 @@ def compatibility_plan(inspection: dict, config: OciConfig, allow_network=False,
             elif network not in supported_networks:
                 usable = " or ".join(sorted(usable_networks))
                 plan["warnings"].append(f"{shape.shape} does not support preferred network attachment {network}. For this destination, set launchOptions.networkType to {usable}, which the image allows, and verify the image's launch capabilities. The generated launch-options file contains the preferred default; shared guest drivers do not make OCI attachment values interchangeable.")
-        if shape.shape in {"VM.Standard.E5.Flex", "VM.Standard.E6.Flex", "VM.Standard.E6.Ax.Flex", "BM.Standard.E5.192"}:
-            arch = inspection.get("os", {}).get("arch")
-            if arch and arch != "x86_64":
-                plan["blockers"].append(f"{shape.shape} requires x86_64; changing image capabilities cannot convert the guest architecture.")
         if shape.shape in {"VM.Standard.E5.Flex", "VM.Standard.E6.Ax.Flex", "BM.Standard.E5.192"}:
             if "UEFI_64" not in allowed.get("Compute.Firmware", []):
                 plan["warnings"].append(f"The reviewed {shape.shape} host uses UEFI. BIOS compatibility has not been established by that host audit.")
@@ -415,7 +421,7 @@ def bundle_files(config: OciConfig, artifact: dict) -> dict[str, str]:
              "schema-data.json": capability_schema(config), "instance-launch-options.json": launch,
              "instance-launch-fragment.json": instance_fragment,
              "forge-oci-profile.json": config.model_dump(),
-             "artifact.json": {k: artifact[k] for k in ("name", "sha256", "virtual_size", "format") if k in artifact}}
+             "artifact.json": {k: artifact[k] for k in ("name", "sha256", "virtual_size", "format", "architecture") if k in artifact}}
     shape_commands = []
     for i, shape in enumerate(options.shape_compatibility, 1):
         entry = {"imageId": image_id, "shapeName": shape.shape}

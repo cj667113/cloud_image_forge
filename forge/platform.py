@@ -16,7 +16,8 @@ import shlex
 from uuid import uuid4
 
 from .oci_guest import MODULE_CONFIG as OCI_MODULE_CONFIG
-from .oci_guest import _glob, _network_files, _read
+from .oci_guest import ARCH_CONFIG, _architecture_errors, _glob, _kernel_architecture, _network_files, _read, _serial_device
+from .architecture import normalize_arch, execution_blocker
 
 
 MODULE_CONFIG = {**OCI_MODULE_CONFIG, "nvme": "CONFIG_BLK_DEV_NVME", "nvme_core": "CONFIG_NVME_CORE",
@@ -345,6 +346,8 @@ def _inspect_platform(g, root, partitions, kernels, oci_evidence=None):
                 if members is not None and "early_cpio" in members:
                     listed = None
         inventory[version] = {"modules": sorted(installed), "builtin": sorted(builtin),
+                              "config": {key: value for key, value in config.items() if key in ARCH_CONFIG},
+                              "architecture": _kernel_architecture(config),
                               "initrd": initrd, "initrd_modules": listed, "initrd_sha256": digest,
                               "initrd_iscsi_userspace": iscsi_userspace,
                               "portability": archive}
@@ -372,6 +375,7 @@ def _inspect_platform(g, root, partitions, kernels, oci_evidence=None):
             "iscsi_userspace_backend": _iscsi_backend(_read(g, "/usr/lib/dracut/modules.d/95iscsi/iscsiroot.sh")),
             "network_backend": base.get("network_backend"), "network_ready": base.get("network_ready", False),
             "network_files": base.get("network_files", []), "serial_console_ready": base.get("serial_console_ready", False),
+            "serial_device": base.get("serial_device"),
             "os_version": base.get("os_version", {}),
             "blacklisted_modules": base.get("blacklisted_modules", []),
             "boot_tested": False}
@@ -430,7 +434,7 @@ def _required_args(plan, options):
     if options.get("boot_attachment") == "iscsi":
         args += ["netroot=iscsi", "rd.iscsi.firmware=1", "rd.iscsi.ibft=1", "rd.neednet=1"]
     if options.get("configure_serial_console", True):
-        args += ["console=tty0", "console=ttyS0,115200n8"]
+        args += ["console=tty0", f"console={plan.get('serial_device', 'ttyS0')},115200n8"]
     return args
 
 
@@ -455,7 +459,7 @@ def _adapt_args(words, plan, options):
         if key == "ip" and word.partition("=")[2] == "ibft":
             continue
         if (options.get("configure_serial_console", True) and key == "console"
-                and word.partition("=")[2].partition(",")[0] in {"tty0", "ttyS0"}):
+                and word.partition("=")[2].partition(",")[0] in {"tty0", plan.get("serial_device", "ttyS0")}):
             continue
         result.append(word)
     for arg in _required_args(plan, options):
@@ -466,6 +470,8 @@ def _adapt_args(words, plan, options):
 
 def _firmware(inspection, options, boot_migration, allow_network):
     available = list(inspection.get("boot", {}).get("supported_firmware", []))
+    if normalize_arch(inspection.get("os", {}).get("arch")) == "aarch64":
+        available = [value for value in available if value == "UEFI_64"]
     planned = []
     if _dict(boot_migration).get("enabled"):
         from .uefi import plan_migration
@@ -493,8 +499,6 @@ def _plan_preserve(inspection, options, plan, oci_config, target_provider, boot_
         blockers.append("The supported bare-metal assessment profile uses firmware iSCSI boot and a selected hardware NIC.")
     if any(options.get(name) for name in ("install_packages", "configure_network", "configure_serial_console")):
         blockers.append("Preserve mode does not install packages or rewrite networking/serial settings. Disable those changes or choose Reconfigure.")
-    if inspection.get("os", {}).get("arch") != "x86_64":
-        blockers.append("Existing hardware validation supports x86_64 Linux images only.")
     if target_provider not in {"oci", "generic"}:
         blockers.append("Hardware preservation validation is available for OCI and generic exports.")
     available, firmware, planned = _firmware(inspection, options, boot_migration, allow_network)
@@ -554,6 +558,11 @@ def plan_platform(inspection, options, allow_network=False, oci_config=None, tar
             "fstab_changes": [], "network_backend": None, "initramfs_backend": None}
     if not requested:
         return plan
+    arch = normalize_arch(inspection.get("os", {}).get("arch"))
+    plan.update(architecture=arch, serial_device=_serial_device(arch))
+    if arch == "aarch64" and (options.get("target") != "vm" or options.get("boot_attachment") != "paravirtualized"
+                               or options.get("network_attachment") not in {"paravirtualized", "accelerated"}):
+        plan["blockers"].append("ARM64 hardware profiles currently support UEFI VMs with paravirtualized boot and PV or Accelerated PV networking; ARM bare-metal, firmware-iSCSI and hardware NIC preparation are not validated.")
     if plan["strategy"] == "preserve":
         return _plan_preserve(inspection, options, plan, oci_config, target_provider, boot_migration, allow_network)
     if plan["strategy"] != "reconfigure":
@@ -574,14 +583,16 @@ def plan_platform(inspection, options, allow_network=False, oci_config=None, tar
         warnings.append("The chosen NIC and NVMe/AHCI controller profile must match the target machine; driver presence does not prove hardware or firmware compatibility.")
     if target_provider not in {"oci", "generic"}:
         blockers.append("This platform migration profile is limited to OCI or generic exports.")
-    if inspection.get("os", {}).get("arch") != "x86_64":
-        blockers.append("Platform migration supports x86_64 Linux images only; it does not convert CPU architecture.")
+    blocker = execution_blocker(arch)
+    if blocker:
+        blockers.append(blocker)
     evidence = inspection.get("platform") or {}
     if evidence.get("version") != 1:
         blockers.append("Platform evidence is missing; refresh inspection before preparing this image.")
     blockers.extend(evidence.get("errors", []))
     blockers.extend(evidence.get("boot_environment_errors", []))
     kernels, tools = evidence.get("kernels", {}), evidence.get("tools", {})
+    blockers.extend(_architecture_errors(inspection, kernels, serial=options.get("configure_serial_console", True)))
     available, firmware, planned = _firmware(inspection, options, boot_migration, allow_network)
     selected_firmware = _dict(oci_config).get("capabilities", {}).get("Compute.Firmware", {}).get("default_value")
     if target == "vm" and selected_firmware in available:
@@ -593,8 +604,8 @@ def plan_platform(inspection, options, allow_network=False, oci_config=None, tar
     required = set(PV_DRIVERS if boot == "paravirtualized" else {"iscsi_tcp", "iscsi_ibft", "sd_mod"})
     required.update({"virtio_pci", "virtio_net"} if network in {"paravirtualized", "accelerated"} else {nic} if nic in NIC_DRIVERS else set())
     if network == "accelerated":
-        actions.append("Prepare the audited E6.Ax AcceleratedPV guest-facing VirtIO network drivers (virtio_net and virtio_pci) in every initramfs.")
-        warnings.append("AcceleratedPV is a distinct OCI networking type even though the audited E6.Ax guest uses VirtIO drivers. A compatible shape/image and target launch validation are still required.")
+        actions.append("Prepare AcceleratedPV guest-facing VirtIO network drivers (virtio_net and virtio_pci) in every initramfs.")
+        warnings.append("AcceleratedPV is a distinct OCI networking type. Existing native-architecture VirtIO coverage is checked; a compatible shape/image and target launch validation are still required.")
     if target == "bare_metal":
         required.update({"nvme", "nvme_core", "ahci"})
     plan["required_modules"] = sorted(required)
@@ -689,7 +700,7 @@ def plan_platform(inspection, options, allow_network=False, oci_config=None, tar
     elif not evidence.get("network_ready") or evidence.get("persistent_network_files"):
         blockers.append("Network changes are disabled and portable DHCP/persistent-name readiness is not verified.")
     if options.get("configure_serial_console", True):
-        actions.append("Enable ttyS0 at 115200 baud and serial-getty while preserving unrelated console and boot settings.")
+        actions.append(f"Enable {plan['serial_device']} at 115200 baud and serial-getty while preserving unrelated console and boot settings.")
     try:
         records = _boot_records(evidence)
         if not records:
@@ -929,7 +940,8 @@ def verify_platform(inspection, options, *, oci_config=None, target_provider="oc
             blockers.append(f"Kernel {version}: resulting initramfs iSCSI boot userspace is unverified.")
     if not evidence.get("network_ready") or evidence.get("persistent_network_files"):
         blockers.append("Resulting portable DHCP configuration or persistent NIC naming is not verified.")
-    if options.get("configure_serial_console", True) and not evidence.get("serial_console_ready"):
+    if options.get("configure_serial_console", True) and (not evidence.get("serial_console_ready")
+            or plan.get("architecture") == "aarch64" and evidence.get("serial_device") != "ttyAMA0"):
         blockers.append("Resulting serial-console configuration/service is not verified.")
     try:
         records = _boot_records(evidence)
@@ -1034,7 +1046,7 @@ def prepare_platform(work: Path, inspection, options, allow_network, log, *, oci
                 if plan["network_backend"] == "netplan":
                     commands.append("netplan generate")
             if options.get("configure_serial_console", True):
-                commands.append("systemctl --root=/ enable serial-getty@ttyS0.service")
+                commands.append(f"systemctl --root=/ enable serial-getty@{plan['serial_device']}.service")
             commands.append(_initramfs_script(inspection, plan, options))
             commands.append("update-grub" if evidence["tools"].get("update-grub") else "grub2-mkconfig -o /boot/grub2/grub.cfg")
             _write(g, PROFILE, json.dumps({"options": options, "required_modules": plan["required_modules"],

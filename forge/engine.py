@@ -23,6 +23,10 @@ import tempfile
 from typing import Callable
 from uuid import uuid4
 
+from . import architecture as architecture_policy
+from .architecture import (SUPPORTED_ARCHES, customization_requires_execution, execution_blocker,
+                           execution_capability, normalize_arch, recipe_execution_blocker)
+
 
 MIB = 1024 * 1024
 GIB = 1024 * MIB
@@ -181,8 +185,8 @@ def _roots(handle) -> str:
         raise EngineError("Exactly one Linux operating system on one standalone disk is required.")
     if handle.inspect_get_type(roots[0]) != "linux":
         raise EngineError("Only Linux guest operating systems are supported.")
-    if handle.inspect_get_arch(roots[0]) != "x86_64":
-        raise EngineError("This deployment supports x86_64 Linux guests only; use an amd64 Linux host or Docker VM.")
+    if normalize_arch(handle.inspect_get_arch(roots[0])) not in SUPPORTED_ARCHES:
+        raise EngineError("Supported guest architectures are x86_64 and ARM64 (aarch64) Linux; 32-bit images are unsupported.")
     return roots[0]
 
 
@@ -261,7 +265,41 @@ def _grub_assignment(content: str, name: str, value: str) -> str:
     return content.rstrip("\n") + "\n" + line + "\n"
 
 
+def _relabel_edited_files(g, paths):
+    """Use appliance setfiles for foreign-ISA file edits, never guest programs."""
+    config = "/etc/selinux/config"
+    if not paths or not g.is_file(config):
+        return
+    if g.filesize(config) > 65536:
+        raise EngineError("SELinux configuration exceeds the inspection limit.")
+    value = g.read_file(config)
+    text = value.decode("utf-8") if isinstance(value, bytes) else value
+    settings = {}
+    for key in ("SELINUX", "SELINUXTYPE"):
+        matches = re.findall(r"^\s*" + key + r"\s*=\s*['\"]?([A-Za-z0-9_-]+)['\"]?\s*(?:#.*)?$", text, re.M)
+        if len(set(matches)) > 1:
+            raise EngineError("Ambiguous SELinux configuration; use a matching-architecture worker for relabeling.")
+        settings[key] = matches[-1] if matches else None
+    if settings["SELINUX"] == "disabled":
+        return
+    if settings["SELINUX"] not in {"enforcing", "permissive"} or not settings["SELINUXTYPE"]:
+        raise EngineError("SELinux policy cannot be resolved safely; use a matching-architecture worker for relabeling.")
+    contexts = "/etc/selinux/" + settings["SELINUXTYPE"] + "/contexts/files/file_contexts"
+    if not g.is_file(contexts):
+        raise EngineError("SELinux file contexts are missing; guest file edits cannot be relabeled safely.")
+    try:
+        for path in paths:
+            g.selinux_relabel(contexts, path, force=True)
+    except RuntimeError as exc:
+        raise EngineError("Appliance SELinux relabeling failed; use a matching-architecture worker.") from exc
+
+
 def _validate_recipe(recipe: dict, inspection: dict) -> None:
+    if normalize_arch(inspection.get("os", {}).get("arch")) not in SUPPORTED_ARCHES:
+        raise EngineError("A detected x86_64 or ARM64 (aarch64) guest architecture is required; refresh inspection.")
+    execution_error = recipe_execution_blocker(inspection, recipe)
+    if execution_error:
+        raise EngineError(execution_error)
     platform = recipe.get("platform_migration") or {}
     if platform.get("enabled") and platform.get("strategy", "reconfigure") == "preserve":
         if any(platform.get(name, False) for name in ("install_packages", "configure_network", "configure_serial_console")):
@@ -327,7 +365,10 @@ class ImageEngine:
         missing = [name for name in TOOLS if not shutil.which(name)]
         if importlib.util.find_spec("guestfs") is None:
             missing.append("python3-guestfs")
+        worker = architecture_policy.worker_arch()
         return {"available": not missing, "missing": missing,
+                "worker_arch": worker, "guest_architectures": list(SUPPORTED_ARCHES),
+                "guest_execution_architectures": [worker] if worker in SUPPORTED_ARCHES else [],
                 "input_formats": ["qcow2", "raw", "vhd"],
                 "output_formats": ["qcow2", "raw", "vhd", "gcp"],
                 "kvm": os.access("/dev/kvm", os.R_OK | os.W_OK),
@@ -343,9 +384,10 @@ class ImageEngine:
         with _guest(path, fmt) as g:
             from .boot import detect_boot
             from .uefi import inspect_layout, inspect_prerequisites
-            boot = detect_boot(g)
-            migration_layout = inspect_layout(g)
             root = _roots(g)
+            architecture = normalize_arch(g.inspect_get_arch(root))
+            boot = detect_boot(g, architecture=architecture)
+            migration_layout = inspect_layout(g)
             filesystems = g.list_filesystems()
             points = _mount(g, root, True)
             partitions = []
@@ -384,7 +426,7 @@ class ImageEngine:
             from .systemd import inspect_systemd
             systemd = inspect_systemd(g)
             os_info = {"name": g.inspect_get_product_name(root), "distro": g.inspect_get_distro(root),
-                       "arch": g.inspect_get_arch(root), "root": root}
+                       "arch": architecture, "root": root}
             kernels = sorted(g.glob_expand("/boot/vmlinuz-*"))
             from .oci_guest import inspect_guest
             oci_evidence = inspect_guest(g, root, partitions, kernels, boot=boot)
@@ -398,7 +440,7 @@ class ImageEngine:
             platform = inspect_platform(g, root, partitions, kernels, oci_evidence=oci_evidence)
         return {"format": fmt, "virtual_size": info["virtual-size"],
                 "actual_size": path.stat().st_size, "allocated_size": info.get("actual-size"),
-                "os": os_info, "partitions": partitions, "files": files,
+                "os": os_info, "execution": execution_capability(architecture), "partitions": partitions, "files": files,
                 "services": sorted(services), "systemd": systemd, "kernels": kernels, "oci_evidence": oci_evidence, "boot": boot,
                 "uefi_migration": {"version": 1, "layout": migration_layout, "guest": migration_guest},
                 "storage": storage, "platform": platform,
@@ -448,6 +490,9 @@ class ImageEngine:
         return resized
 
     def _customize(self, work: Path, inspection: dict, recipe: dict, log) -> None:
+        foreign = execution_blocker(inspection.get("os", {}).get("arch"))
+        if foreign and customization_requires_execution(recipe):
+            raise EngineError(foreign)
         files = recipe.get("files", [])
         args = recipe.get("kernel_args")
         if files or args is not None:
@@ -460,6 +505,12 @@ class ImageEngine:
                     value = g.read_file("/etc/default/grub") if g.is_file("/etc/default/grub") else b""
                     content = value.decode() if isinstance(value, bytes) else value
                     _write_guest(g, "/etc/default/grub", _grub_assignment(content, "GRUB_CMDLINE_LINUX", args))
+                if foreign:
+                    _relabel_edited_files(g, [item["path"] for item in files])
+        if foreign:
+            # File writes and labeling use appliance-native tools. Never ask
+            # virt-customize to execute a foreign /bin/sh or labeling fallback.
+            return
         command = ["virt-customize", "--format", "qcow2", "-a", str(work),
                    "--network" if recipe.get("allow_network") else "--no-network"]
         changed = bool(files or args is not None)
@@ -573,6 +624,8 @@ class ImageEngine:
         # it is not a complete fstab validator or a substitute for a boot test.
         log("Inspecting the customized guest")
         result_inspection = self.inspect(work)
+        if normalize_arch(result_inspection.get("os", {}).get("arch")) != normalize_arch(inspection["os"]["arch"]):
+            raise EngineError("Export changed or lost the guest CPU architecture; architecture conversion is unsupported.")
         if inspection.get("kernels") and not result_inspection.get("kernels"):
             raise EngineError("Customization removed every detected kernel; at least one boot kernel must remain.")
         virtual_size = result_inspection["virtual_size"]
@@ -584,6 +637,8 @@ class ImageEngine:
                                 {"disk_size_gib": rounded / GIB}, log)
             virtual_size = rounded
             result_inspection = self.inspect(work)
+            if normalize_arch(result_inspection.get("os", {}).get("arch")) != normalize_arch(inspection["os"]["arch"]):
+                raise EngineError("Aligned export changed or lost the guest CPU architecture.")
             if result_inspection["virtual_size"] != rounded:
                 raise EngineError("Aligned working image has unexpected virtual capacity.")
         if migration_plan["requested"]:
@@ -651,6 +706,7 @@ class ImageEngine:
                 digest.update(chunk)
         work.unlink()
         return {"artifact_path": str(output), "filename": output.name, "format": final_format,
+                "architecture": normalize_arch(result_inspection["os"]["arch"]),
                 "virtual_size": virtual_size, "sha256": digest.hexdigest(), "warnings": warnings,
                 "boot": result_inspection.get("boot"),
                 "storage_rebuild": storage_result,

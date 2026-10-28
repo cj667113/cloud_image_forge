@@ -7,10 +7,14 @@ if [ "$#" -ne 2 ]; then
     exit 2
 fi
 
-if [ "$(uname -s)" != Linux ] || [ "$(uname -m)" != x86_64 ]; then
-    echo "Run this smoke check on Linux x86_64 or inside the supplied container." >&2
+if [ "$(uname -s)" != Linux ]; then
+    echo "Run this smoke check on Linux x86_64/ARM64 or inside the supplied container." >&2
     exit 2
 fi
+case "$(uname -m)" in
+    x86_64|aarch64|arm64) ;;
+    *) echo "The smoke worker must use x86_64 or ARM64." >&2; exit 2 ;;
+esac
 
 for tool in qemu-img virt-customize virt-resize virt-sparsify; do
     command -v "$tool" >/dev/null || { echo "Missing tool: $tool" >&2; exit 2; }
@@ -25,6 +29,7 @@ from pathlib import Path
 import sys
 
 from forge.engine import ImageEngine
+from forge.architecture import normalize_arch
 
 source = Path(sys.argv[1]).resolve(strict=True)
 destination = Path(sys.argv[2]).resolve()
@@ -97,6 +102,8 @@ try:
     roots = g.inspect_os()
     if len(roots) != 1:
         raise RuntimeError("Expected one inspectable operating system")
+    if normalize_arch(g.inspect_get_arch(roots[0])) != normalize_arch(inspection["os"]["arch"]):
+        raise RuntimeError("Export did not retain the source CPU architecture")
     mounts = g.inspect_get_mountpoints(roots[0])
     for mountpoint, device in sorted(mounts.items(), key=lambda item: len(item[0])):
         g.mount_ro(device, mountpoint)

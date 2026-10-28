@@ -97,6 +97,23 @@ def test_failed_build_never_publishes_partial_artifact(client, tmp_path):
     assert list((tmp_path / "builds").iterdir()) == []
 
 
+def test_foreign_architecture_guest_commands_are_rejected_before_queueing(client):
+    image_id = imported(client)
+    store = client.app.state.store
+    image = store.get("image", image_id)
+    image["inspection"]["os"]["arch"] = "aarch64"
+    image["inspection"]["execution"] = {"guest_commands": True, "worker_arch": "aarch64"}
+    store.update("image", image_id, inspection=image["inspection"])
+    before = client.get("/api/jobs").json()
+    response = client.post(f"/api/images/{image_id}/build", json={"rebuild_initramfs": True})
+    assert response.status_code == 422
+    assert "aarch64 Linux worker" in response.json()["detail"]
+    assert client.get("/api/jobs").json() == before
+    response = client.post(f"/api/images/{image_id}/build", json={"files": [{"path": "/etc/cron.d/test", "content": "# data-only\n"}]})
+    assert response.status_code == 202
+    assert finished(client, response.json()["job_id"])["status"] == "succeeded"
+
+
 def test_refresh_inspection_updates_boot_evidence_and_preserves_source(client, tmp_path, monkeypatch):
     image_id = imported(client)
     previous = client.get(f"/api/images/{image_id}").json()

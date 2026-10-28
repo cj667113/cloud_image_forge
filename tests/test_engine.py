@@ -24,7 +24,7 @@ def qcow_header(*, backing=False, external=False, encrypted=False):
 
 
 def inspection():
-    return {"format": "qcow2", "virtual_size": 10 * GIB,
+    return {"format": "qcow2", "virtual_size": 10 * GIB, "os": {"arch": "x86_64"},
             "partitions": [{"device": "/dev/sda1", "filesystem": "ext4", "size": 9 * GIB},
                            {"device": "/dev/sda2", "filesystem": "xfs", "size": GIB},
                            {"device": "/dev/vg/root", "filesystem": "xfs", "size": GIB, "logical_volume": True}],
@@ -87,13 +87,16 @@ class HeaderTests(unittest.TestCase):
                     ImageEngine().inspect(path)
                 guest.assert_not_called()
 
-    def test_non_x86_guest_is_rejected(self):
+    def test_both_64_bit_architectures_are_accepted_and_32_bit_is_rejected(self):
         from unittest.mock import Mock
         guest = Mock()
         guest.inspect_os.return_value = ["/dev/sda1"]
         guest.inspect_get_type.return_value = "linux"
-        guest.inspect_get_arch.return_value = "aarch64"
-        with self.assertRaisesRegex(EngineError, "x86_64 Linux"):
+        for arch in ("aarch64", "arm64", "x86_64", "amd64"):
+            guest.inspect_get_arch.return_value = arch
+            self.assertEqual(_roots(guest), "/dev/sda1")
+        guest.inspect_get_arch.return_value = "arm"
+        with self.assertRaisesRegex(EngineError, "32-bit"):
             _roots(guest)
 
 
@@ -121,8 +124,9 @@ class InspectionTests(unittest.TestCase):
                 self.assertNotEqual(kwargs.get("readonly"), False)
                 yield g
 
-            def detect(handle):
+            def detect(handle, architecture):
                 self.assertIs(handle, g)
+                self.assertEqual(architecture, "x86_64")
                 events.append("boot")
                 return boot
 
@@ -303,7 +307,8 @@ class BuildTests(unittest.TestCase):
                 self.assertEqual(len(conversions), 2 if final_ready else 1)
                 self.assertEqual(source.read_bytes(), original)
 
-    def run_build(self, *, output_format="qcow2", compare_failure=False, virtual_size=10 * GIB):
+    def run_build(self, *, output_format="qcow2", compare_failure=False, virtual_size=10 * GIB,
+                  guest_arch="x86_64", architecture_change=False):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         directory = Path(temp.name)
@@ -313,6 +318,8 @@ class BuildTests(unittest.TestCase):
         commands = []
         info = inspection()
         info["virtual_size"] = virtual_size
+        info["os"]["arch"] = guest_arch
+        final_info = {**info, "os": {"arch": "aarch64" if guest_arch == "x86_64" else "x86_64"}} if architecture_change else info
         engine = ImageEngine()
 
         def run(command, log=None):
@@ -327,10 +334,10 @@ class BuildTests(unittest.TestCase):
 
         with patch("forge.engine._run", side_effect=run), \
                 patch.object(engine, "capabilities", return_value={"available": True}), \
-                patch.object(engine, "inspect", return_value=info), \
+                patch.object(engine, "inspect", return_value=final_info), \
                 patch.object(engine, "_customize"):
-            if compare_failure:
-                with self.assertRaisesRegex(EngineError, "bytes differ"):
+            if compare_failure or architecture_change:
+                with self.assertRaisesRegex(EngineError, "guest CPU architecture" if architecture_change else "bytes differ"):
                     engine.build(source, directory / "build", info,
                                  {"output_format": output_format, "sparsify": False}, lambda _: None)
                 result = None
@@ -339,6 +346,13 @@ class BuildTests(unittest.TestCase):
                                       {"output_format": output_format, "sparsify": False}, lambda _: None)
         self.assertEqual(source.read_bytes(), baseline)
         return result, commands
+
+    def test_arm_export_retains_architecture_and_changes_block_publication(self):
+        result, _ = self.run_build(guest_arch="aarch64")
+        self.assertEqual(result["architecture"], "aarch64")
+        result, commands = self.run_build(guest_arch="aarch64", architecture_change=True)
+        self.assertIsNone(result)
+        self.assertEqual(sum(command[:2] == ["qemu-img", "convert"] for command in commands), 1)
 
     def test_qcow_export_compares_content_and_uses_oci_compatible_compression(self):
         result, commands = self.run_build()

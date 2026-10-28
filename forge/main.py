@@ -295,6 +295,10 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
                 raise HTTPException(409, "Wait for a successful image inspection before building")
             if recipe.disk_size_gib and recipe.disk_size_gib > settings.max_virtual_gib:
                 raise HTTPException(422, "Requested virtual size exceeds FORGE_MAX_VIRTUAL_GIB")
+            from .architecture import recipe_execution_blocker
+            execution_error = recipe_execution_blocker(image["inspection"], recipe.model_dump())
+            if execution_error:
+                raise HTTPException(422, execution_error)
             migration = recipe.boot_migration.model_dump() if recipe.boot_migration else None
             if recipe.storage_rebuild and recipe.storage_rebuild.enabled:
                 from .storage import plan_rebuild

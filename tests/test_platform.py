@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 import fnmatch
 import hashlib
+import json
 import os
 from pathlib import Path
 import shlex
@@ -178,13 +179,15 @@ class InspectionTests(unittest.TestCase):
                    module_dir + "/modules.dep": "kernel/drivers/net/virtio_net.ko.xz:\nkernel/drivers/nvme/host/nvme.ko.zst:\n",
                    module_dir + "/kernel/drivers/nvme/host/nvme.ko.zst": "module",
                    module_dir + "/modules.builtin": "kernel/drivers/ata/ahci.ko\n",
-                   f"/boot/config-{KERNEL}": "CONFIG_VIRTIO_PCI=y\nCONFIG_VIRTIO_NET=m\nCONFIG_ISCSI_IBFT=y\n",
+                   f"/boot/config-{KERNEL}": "CONFIG_X86_64=y\nCONFIG_VIRTIO_PCI=y\nCONFIG_VIRTIO_NET=m\nCONFIG_ISCSI_IBFT=y\n",
                    f"/boot/initramfs-{KERNEL}.img": "archive"})
         g.members = ["usr/lib/modules/test/kernel/nvme.ko.zst", "usr/sbin/iscsistart"]
         base = {"tools": {}, "kernels": {KERNEL: {"initrd": f"/boot/initramfs-{KERNEL}.img"}}}
         result = inspect_platform(g, "/dev/sda1", image()["partitions"], ["/boot/vmlinuz-" + KERNEL], base)
         kernel = result["kernels"][KERNEL]
         self.assertEqual(kernel["modules"], ["nvme"])
+        self.assertEqual(kernel["architecture"], "x86_64")
+        self.assertEqual(kernel["config"]["CONFIG_X86_64"], "y")
         self.assertIn("virtio_pci", kernel["builtin"])
         self.assertIn("ahci", kernel["builtin"])
         self.assertIn("iscsi_ibft", kernel["builtin"])
@@ -221,6 +224,35 @@ class InspectionTests(unittest.TestCase):
 
 
 class PlanTests(unittest.TestCase):
+    def test_arm_reconfiguration_requires_native_worker_and_uses_arm_console(self):
+        source = json.loads(json.dumps(image()).replace(KERNEL, "6.12.0-test.aarch64"))
+        source["os"]["arch"] = "aarch64"
+        source["boot"]["architecture"] = "aarch64"
+        source["boot"]["efi_loaders"] = [{"architecture": "aarch64", "path": "/EFI/BOOT/BOOTAA64.EFI"}]
+        kernel = next(iter(source["platform"]["kernels"].values()))
+        kernel["config"] = {key: "y" for key in ("CONFIG_ARM64", "CONFIG_EFI", "CONFIG_EFI_STUB",
+                                                  "CONFIG_SERIAL_AMBA_PL011", "CONFIG_SERIAL_AMBA_PL011_CONSOLE")}
+        profile = options(configure_serial_console=True)
+        foreign = plan_platform(source, profile)
+        self.assertTrue(any("worker cannot run" in error for error in foreign["blockers"]))
+        with patch("forge.engine._guest") as guest, patch("forge.engine._run") as run:
+            with self.assertRaisesRegex(EngineError, "worker cannot run"):
+                prepare_platform(Path("/tmp/arm.qcow2"), source, profile, False, lambda _: None)
+        guest.assert_not_called()
+        run.assert_not_called()
+        with patch("forge.architecture.worker_arch", return_value="aarch64"):
+            native = plan_platform(source, profile)
+        self.assertTrue(native["ready"], native["blockers"])
+        self.assertEqual(native["serial_device"], "ttyAMA0")
+        arguments = _adapt_args(["console=ttyAMA0,9600", "quiet"], native, profile)
+        self.assertIn("console=ttyAMA0,115200n8", arguments)
+        self.assertNotIn("console=ttyS0,115200n8", arguments)
+        self.assertNotIn("console=ttyAMA0,9600", arguments)
+        self.assertIn("quiet", arguments)
+        with patch("forge.architecture.worker_arch", return_value="aarch64"):
+            kernel["config"].pop("CONFIG_SERIAL_AMBA_PL011_CONSOLE")
+            self.assertTrue(any("PL011" in error for error in plan_platform(source, profile)["blockers"]))
+
     def test_accelerated_vm_profile_requires_virtio_network_and_distinct_oci_mode(self):
         profile = options(network_attachment="accelerated")
         oci = {"capabilities": {"Storage.BootVolumeType": {"default_value": "PARAVIRTUALIZED"},

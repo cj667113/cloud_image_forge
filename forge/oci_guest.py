@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shlex
 
+from .architecture import normalize_arch as _architecture
 
 MODULE_CONFIG = {
     "virtio_pci": "CONFIG_VIRTIO_PCI", "virtio_blk": "CONFIG_VIRTIO_BLK",
@@ -23,7 +24,10 @@ MODULE_CONFIG = {
     "iavf": "CONFIG_IAVF", "mlx5_core": "CONFIG_MLX5_CORE", "ipv6": "CONFIG_IPV6",
     "ixgbe": "CONFIG_IXGBE", "i40e": "CONFIG_I40E", "mlx4_en": "CONFIG_MLX4_EN",
     "bnxt_en": "CONFIG_BNXT",
+    "amba_pl011": "CONFIG_SERIAL_AMBA_PL011",
 }
+ARCH_CONFIG = {"CONFIG_ARM64", "CONFIG_X86_64", "CONFIG_EFI", "CONFIG_EFI_STUB",
+               "CONFIG_SERIAL_AMBA_PL011", "CONFIG_SERIAL_AMBA_PL011_CONSOLE"}
 STORAGE_DRIVERS = {"PARAVIRTUALIZED": {"virtio_pci", "virtio_blk", "virtio_scsi", "sd_mod"},
                    "SCSI": {"sym53c8xx", "sd_mod"}, "IDE": {"ata_piix", "sd_mod"},
                    "ISCSI": {"iscsi_tcp", "sd_mod"}}
@@ -37,6 +41,44 @@ NETWORK_PATTERNS = {"NetworkManager": ("/etc/NetworkManager/system-connections/*
 BACKUP_ROOT = "/var/lib/cloud-image-forge/oci-backups"
 PROFILE = "/var/lib/cloud-image-forge/oci-preparation.json"
 SYSCTL_DISABLE = re.compile(r"^(\s*net\.ipv6\.conf\.[A-Za-z0-9_-]+\.disable_ipv6\s*=\s*)1\b", re.M)
+
+
+def _kernel_architecture(config):
+    selected = [arch for key, arch in (("CONFIG_ARM64", "aarch64"), ("CONFIG_X86_64", "x86_64"))
+                if config.get(key) == "y"]
+    return selected[0] if len(selected) == 1 else "conflicting" if selected else None
+
+
+def _architecture_errors(inspection, kernels, *, serial=False):
+    """ARM admission requires fresh architecture/UEFI proof, never filename guesses."""
+    arch = _architecture(inspection.get("os", {}).get("arch"))
+    errors = []
+    if arch not in {"x86_64", "aarch64"}:
+        return ["Guest preparation supports x86_64 and ARM64 Linux images; it does not convert CPU architecture."]
+    if arch == "aarch64":
+        boot = inspection.get("boot") or {}
+        if (_architecture(boot.get("architecture")) != arch or "UEFI_64" not in boot.get("supported_firmware", []) or
+                not any(_architecture(loader.get("architecture")) == arch for loader in boot.get("efi_loaders", []))):
+            errors.append("ARM64 requires existing ARM64 UEFI loader evidence. Refresh inspection; BIOS conversion is not supported for ARM64.")
+        if not kernels:
+            errors.append("ARM64 kernel architecture and EFI support are unverified; refresh inspection.")
+    for version, kernel in kernels.items():
+        config = kernel.get("config", {})
+        actual = _kernel_architecture(config)
+        if actual and actual != arch:
+            errors.append(f"Kernel {version} targets {actual}, but the guest architecture is {arch}; architecture conversion is not supported.")
+        elif arch == "aarch64" and actual != arch:
+            errors.append(f"Kernel {version}: CONFIG_ARM64=y evidence is missing; refresh inspection or supply an ARM64 kernel.")
+        if arch == "aarch64":
+            if any(config.get(key) != "y" for key in ("CONFIG_EFI", "CONFIG_EFI_STUB")):
+                errors.append(f"Kernel {version}: ARM64 UEFI requires CONFIG_EFI=y and CONFIG_EFI_STUB=y.")
+            if serial and any(config.get(key) != "y" for key in ("CONFIG_SERIAL_AMBA_PL011", "CONFIG_SERIAL_AMBA_PL011_CONSOLE")):
+                errors.append(f"Kernel {version}: ttyAMA0 console preparation requires built-in PL011 serial and console support.")
+    return errors
+
+
+def _serial_device(architecture):
+    return "ttyAMA0" if _architecture(architecture) == "aarch64" else "ttyS0"
 
 
 def _read(g, path, limit=4 * 1024 * 1024):
@@ -121,9 +163,17 @@ def _network_evidence(g, tools):
     return backend, ready, list(texts)
 
 
-def inspect_guest(g, root: str, partitions: list, kernels: list, boot: dict | None = None) -> dict:
+def inspect_guest(g, root: str, partitions: list, kernels: list, boot: dict | None = None,
+                  architecture: str | None = None) -> dict:
     """Collect guest evidence, reusing boot detection from the unmounted phase."""
     boot = boot or {}
+    if architecture is None:
+        try:
+            architecture = g.inspect_get_arch(root)
+        except (RuntimeError, AttributeError):
+            architecture = None
+    architecture = _architecture(architecture)
+    serial = _serial_device(architecture)
     firmware = {"UEFI_64": "UEFI_64" in boot.get("supported_firmware", []),
                 "BIOS": "BIOS" in boot.get("supported_firmware", []),
                 "efi_loaders": boot.get("efi_loaders", []),
@@ -137,7 +187,7 @@ def inspect_guest(g, root: str, partitions: list, kernels: list, boot: dict | No
         if version.startswith("0-rescue-") or not re.fullmatch(r"[A-Za-z0-9_.+~-]+", version):
             continue
         config = dict(re.findall(r"^(CONFIG_[A-Z0-9_]+)=([ym])$", _read(g, f"/boot/config-{version}"), re.M))
-        config = {key: value for key, value in config.items() if key in {*MODULE_CONFIG.values(), "CONFIG_AMD_MEM_ENCRYPT", "CONFIG_IPV6"}}
+        config = {key: value for key, value in config.items() if key in {*MODULE_CONFIG.values(), *ARCH_CONFIG, "CONFIG_AMD_MEM_ENCRYPT", "CONFIG_IPV6"}}
         modules = _module_names(_read(g, f"/lib/modules/{version}/modules.dep", 16 * 1024 * 1024).splitlines(), g, version)
         builtin = set(_module_names(_read(g, f"/lib/modules/{version}/modules.builtin").splitlines()))
         builtin.update(name for name, key in MODULE_CONFIG.items() if config.get(key) == "y")
@@ -150,6 +200,7 @@ def inspect_guest(g, root: str, partitions: list, kernels: list, boot: dict | No
                 # Older libguestfs cannot inspect every concatenated/compressed initrd.
                 pass
         support[version] = {"modules": modules, "builtin": sorted(builtin), "config": config,
+                            "architecture": _kernel_architecture(config),
                             "initrd": initrd, "initrd_modules": initrd_modules}
     boot_text = _read(g, "/etc/default/grub") + "\n" + "\n".join(_read(g, path) for path in _glob(g, "/boot/loader/entries/*.conf"))
     boot_text = "\n".join(line for line in boot_text.splitlines() if not line.lstrip().startswith("#"))
@@ -170,14 +221,15 @@ def inspect_guest(g, root: str, partitions: list, kernels: list, boot: dict | No
     cloud_ready = tools.get("cloud-init") and datasource and bool(re.search(r"datasource_list:\s*\[\s*Oracle\b", cloud_text)) and not g.is_file("/etc/cloud/cloud-init.disabled") and "cloud-init=disabled" not in boot_text
     backend, network_ready, network_files = _network_evidence(g, tools)
     ipv6_files = [path for path in ["/etc/sysctl.conf"] + _glob(g, "/etc/sysctl.d/*.conf") if SYSCTL_DISABLE.search(_read(g, path))]
-    return {"version": 1, "firmware": firmware, "kernels": support, "tools": tools,
+    return {"version": 1, "architecture": architecture, "firmware": firmware, "kernels": support, "tools": tools,
             "network_backend": backend, "network_ready": bool(network_ready), "network_files": network_files,
             "oracle_datasource": bool(datasource), "cloud_init_ready": bool(cloud_ready),
             "consistent_naming_rules": sorted(set(naming)), "blacklisted_modules": sorted(blacklisted),
             "iscsi_boot_configured": any(arg in boot_text for arg in ("rd.iscsi.firmware=1", "rd.iscsi.ibft=1", "ip=ibft")) and g.is_dir("/usr/lib/dracut/modules.d/95iscsi"),
             "os_version": {"major": g.inspect_get_major_version(root), "minor": g.inspect_get_minor_version(root)},
             "ipv6_disable_files": ipv6_files, "boot_arguments": boot_text[:65536],
-            "serial_console_ready": "console=ttyS0" in boot_text and _enabled(g, "serial-getty@ttyS0.service"),
+            "serial_device": serial,
+            "serial_console_ready": bool(re.search(r"\bconsole=" + re.escape(serial) + r"(?:,|[\s\"']|$)", boot_text)) and _enabled(g, f"serial-getty@{serial}.service"),
             "multipath_configured": bool(_read(g, "/etc/multipath.conf") or _glob(g, "/etc/multipath/conf.d/*.conf")) and _enabled(g, "multipathd.service")}
 
 
@@ -215,6 +267,20 @@ def plan_guest(inspection: dict, config: dict, allow_network=False, planned_firm
         not prepare and bootstrap_ready and not _flag(config, "Network.IPv6Only"))
     tools = evidence.get("tools", {})
     kernels = evidence.get("kernels", {})
+    arch = _architecture(inspection.get("os", {}).get("arch"))
+    serial = _serial_device(arch)
+    blockers.extend(_architecture_errors(inspection, kernels, serial=guest.get("configure_serial_console", True)))
+    if prepare:
+        from .architecture import execution_blocker
+        blocker = execution_blocker(arch)
+        if blocker:
+            blockers.append(blocker)
+    if arch == "aarch64":
+        if set(_values(config, "Compute.Firmware")) != {"UEFI_64"}:
+            blockers.append("ARM64 OCI guests require UEFI_64; BIOS capability and BIOS migration are not supported.")
+        if (set(_values(config, "Storage.BootVolumeType")) != {"PARAVIRTUALIZED"}
+                or not set(_values(config, "Network.AttachmentType")) <= {"PARAVIRTUALIZED", "ACCELERATEDPV"}):
+            blockers.append("ARM64 OCI guest preparation currently supports VM paravirtualized boot with PV or Accelerated PV networking; ARM firmware-iSCSI and hardware NIC profiles are not validated.")
     distro = inspection.get("os", {}).get("distro", "")
     rpm = distro in {"oraclelinux", "rhel", "centos", "rocky", "almalinux", "fedora"}
     deb = distro in {"ubuntu", "debian"}
@@ -237,7 +303,7 @@ def plan_guest(inspection: dict, config: dict, allow_network=False, planned_firm
         if kind in {"PARAVIRTUALIZED", "ACCELERATEDPV"}:
             required.update({"virtio_pci", "virtio_net"})
             if kind == "ACCELERATEDPV":
-                warnings.append("The audited VM.Standard.E6.Ax.Flex AcceleratedPV guest uses virtio_net with virtio_pci. These guest drivers do not by themselves prove shape/image compatibility; validate a launch on the selected shape.")
+                warnings.append("ARM64 AcceleratedPV checks require existing VirtIO drivers, matching ARM64 firmware and compatible OCI shape/image capabilities; no ARM target launch has been verified by this offline check." if arch == "aarch64" else "The audited VM.Standard.E6.Ax.Flex AcceleratedPV guest uses virtio_net with virtio_pci. These guest drivers do not by themselves prove shape/image compatibility; validate a launch on the selected shape.")
         elif kind == "E1000":
             required.add("e1000")
         elif kind == "VFIO":
@@ -291,6 +357,8 @@ def plan_guest(inspection: dict, config: dict, allow_network=False, planned_firm
     if conflicts:
         blockers.append("Required OCI drivers are blacklisted or overridden: " + ", ".join(conflicts) + ". Remove the conflicting module/boot configuration.")
     if _flag(config, "Compute.AMD_SecureEncryptedVirtualization"):
+        if arch != "x86_64":
+            blockers.append("AMD SEV is an x86 AMD capability and cannot be enabled for ARM64 guests.")
         if not kernels or not all(kernel.get("config", {}).get("CONFIG_AMD_MEM_ENCRYPT") == "y" for kernel in kernels.values()):
             blockers.append("AMD SEV requires CONFIG_AMD_MEM_ENCRYPT=y in every selected kernel; a capability flag cannot add kernel support.")
         if "mem_encrypt=off" in evidence.get("boot_arguments", ""):
@@ -363,8 +431,8 @@ def plan_guest(inspection: dict, config: dict, allow_network=False, planned_firm
         if prepare:
             if not (tools.get("update-grub") or tools.get("grub2-mkconfig")):
                 blockers.append("Serial-console preparation requires update-grub or grub2-mkconfig.")
-            changes.append("Add ttyS0 serial console parameters, regenerate GRUB and enable serial-getty@ttyS0.service.")
-        elif not evidence.get("serial_console_ready"):
+            changes.append(f"Add {serial} serial console parameters, regenerate GRUB and enable serial-getty@{serial}.service.")
+        elif not evidence.get("serial_console_ready") or arch == "aarch64" and evidence.get("serial_device") != serial:
             blockers.append("Serial-console boot parameters/service are not ready; enable preparation or disable this optional step.")
     if packages:
         changes.insert(0, "Install guest repository packages: " + ", ".join(sorted(packages)))
@@ -373,7 +441,8 @@ def plan_guest(inspection: dict, config: dict, allow_network=False, planned_firm
         warnings.append("Guest preparation is disabled. Read-only evidence checks apply; no image files will be adapted for OCI.")
     return {"changes": changes, "blockers": list(dict.fromkeys(blockers)), "warnings": list(dict.fromkeys(warnings)),
             "required_modules": sorted(required), "packages": sorted(packages), "network_backend": backend,
-            "initramfs_backend": initramfs, "iscsi_boot": iscsi_boot, "multipath": multipath}
+            "initramfs_backend": initramfs, "iscsi_boot": iscsi_boot, "multipath": multipath,
+            "architecture": arch, "serial_device": serial}
 
 
 def _backup(g, path):
@@ -514,6 +583,7 @@ def prepare_guest(work: Path, inspection: dict, config: dict, allow_network: boo
             _write(g, "/etc/multipath/conf.d/90-cloud-image-forge-oci.conf", "defaults {\n    find_multipaths yes\n    user_friendly_names no\n}\n")
             commands += ["multipath -t >/dev/null", "systemctl --root=/ enable multipathd.service"]
         if guest.get("configure_serial_console", True):
+            serial = plan["serial_device"]
             path = "/etc/default/grub"
             text = _read(g, path)
             match = re.search(r"^GRUB_CMDLINE_LINUX=(.*)$", text, re.M)
@@ -521,11 +591,12 @@ def prepare_guest(work: Path, inspection: dict, config: dict, allow_network: boo
             args = parsed[0] if parsed else ""
             if "$" in args or "`" in args:
                 raise EngineError("GRUB_CMDLINE_LINUX uses shell expansion; configure serial arguments manually before OCI preparation.")
-            args = args.strip() + " console=tty0 console=ttyS0,115200n8"
+            serial_args = f"console=tty0 console={serial},115200n8"
+            args = args.strip() + " " + serial_args
             _write(g, path, _grub_assignment(text, "GRUB_CMDLINE_LINUX", args.strip()))
             if evidence["tools"].get("grubby"):
-                commands += ["grubby --update-kernel=ALL --args='console=tty0 console=ttyS0,115200n8'"]
-            commands += ["update-grub" if evidence["tools"].get("update-grub") else "grub2-mkconfig -o /boot/grub2/grub.cfg", "systemctl --root=/ enable serial-getty@ttyS0.service"]
+                commands += ["grubby --update-kernel=ALL --args=" + shlex.quote(serial_args)]
+            commands += ["update-grub" if evidence["tools"].get("update-grub") else "grub2-mkconfig -o /boot/grub2/grub.cfg", f"systemctl --root=/ enable serial-getty@{serial}.service"]
         _write(g, PROFILE, json.dumps({"capabilities": config["capabilities"], "required_modules": plan["required_modules"], "kernel_versions": list(evidence["kernels"])}, indent=2) + "\n")
     commands.append(_initramfs_script(inspection, plan))
     command = ["virt-customize", "--format", "qcow2", "-a", str(work), "--no-network"]

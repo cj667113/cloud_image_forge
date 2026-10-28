@@ -2,6 +2,7 @@
 from contextlib import contextmanager
 from copy import deepcopy
 import fnmatch
+import json
 from pathlib import Path
 import unittest
 from unittest.mock import Mock, patch
@@ -34,7 +35,59 @@ def inspected():
                              "ipv6_disable_files": [], "boot_arguments": "", "os_version": {"major": 9, "minor": 8}}}
 
 
+def arm_inspected():
+    image = json.loads(json.dumps(inspected()).replace(VERSION, "6.12.0-test.aarch64"))
+    image["os"]["arch"] = "aarch64"
+    image["boot"] = {"architecture": "aarch64", "supported_firmware": ["UEFI_64"], "efi_loaders": [
+        {"path": "/EFI/BOOT/BOOTAA64.EFI", "architecture": "aarch64", "fallback": True}]}
+    image["oci_evidence"].update(serial_device="ttyAMA0")
+    kernel = next(iter(image["oci_evidence"]["kernels"].values()))
+    kernel["config"].update({key: "y" for key in ("CONFIG_ARM64", "CONFIG_EFI", "CONFIG_EFI_STUB",
+                                                 "CONFIG_SERIAL_AMBA_PL011", "CONFIG_SERIAL_AMBA_PL011_CONSOLE")})
+    return image
+
+
 class PlanTests(unittest.TestCase):
+    def test_arm_validate_only_is_readonly_and_preparation_requires_native_worker(self):
+        image = arm_inspected()
+        with patch("forge.engine._guest") as guest, patch("forge.engine._run") as run:
+            readonly = prepare_guest(Path("/tmp/arm.qcow2"), image, config(prepare=False), False, lambda _: None)
+            self.assertEqual(readonly["blockers"], [])
+            with self.assertRaisesRegex(EngineError, "worker cannot run"):
+                prepare_guest(Path("/tmp/arm.qcow2"), image, config(), False, lambda _: None)
+        guest.assert_not_called()
+        run.assert_not_called()
+        with patch("forge.architecture.worker_arch", return_value="aarch64"):
+            plan = plan_guest(image, config())
+        self.assertEqual(plan["blockers"], [])
+        self.assertEqual(plan["serial_device"], "ttyAMA0")
+        self.assertTrue(any("ttyAMA0" in change for change in plan["changes"]))
+
+    def test_arm_requires_actual_kernel_and_firmware_evidence(self):
+        image = arm_inspected()
+        profile = config(prepare=False)
+        kernel = next(iter(image["oci_evidence"]["kernels"].values()))
+        kernel["config"].pop("CONFIG_ARM64")
+        self.assertTrue(any("CONFIG_ARM64" in error for error in plan_guest(image, profile)["blockers"]))
+        kernel["config"]["CONFIG_X86_64"] = "y"
+        self.assertTrue(any("targets x86_64" in error for error in plan_guest(image, profile)["blockers"]))
+        image = arm_inspected()
+        image["boot"]["efi_loaders"][0]["architecture"] = "x86_64"
+        self.assertTrue(any("ARM64 UEFI" in error for error in plan_guest(image, profile)["blockers"]))
+        image = arm_inspected()
+        image["oci_evidence"]["serial_device"] = "ttyS0"
+        self.assertTrue(any("Serial-console" in error for error in plan_guest(image, profile)["blockers"]))
+
+    def test_arm_does_not_advertise_bios_sev_or_unvalidated_hardware_profiles(self):
+        for key, selected, expected in (("Compute.Firmware", "BIOS", "BIOS"),
+                                        ("Compute.AMD_SecureEncryptedVirtualization", True, "AMD SEV"),
+                                        ("Storage.BootVolumeType", "ISCSI", "ARM64 OCI"),
+                                        ("Network.AttachmentType", "VFIO", "ARM64 OCI")):
+            with self.subTest(key=key):
+                profile = config(prepare=False)
+                profile["capabilities"][key] = {"default_value": selected}
+                self.assertTrue(any(expected in error for error in plan_guest(arm_inspected(), profile)["blockers"]))
+
     def test_validate_only_reuses_verified_bounded_archive_for_the_same_initrd(self):
         image, profile = inspected(), config(prepare=False)
         kernel = image["oci_evidence"]["kernels"][VERSION]
@@ -248,6 +301,24 @@ class FakeGuest:
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_arm_inspection_retains_kernel_architecture_and_serial_evidence(self):
+        boot = {"supported_firmware": ["UEFI_64"], "efi_loaders": [
+            {"path": "/EFI/BOOT/BOOTAA64.EFI", "architecture": "aarch64"}]}
+        g = FakeGuest({"/boot/config-test": "CONFIG_ARM64=y\nCONFIG_EFI=y\nCONFIG_EFI_STUB=y\n"
+                      "CONFIG_SERIAL_AMBA_PL011=y\nCONFIG_SERIAL_AMBA_PL011_CONSOLE=y\n",
+                      "/etc/default/grub": 'GRUB_CMDLINE_LINUX="console=ttyAMA0,115200n8"\n',
+                      "/etc/systemd/system/getty.target.wants/serial-getty@ttyAMA0.service": ""})
+        result = inspect_guest(g, "/dev/sda2", [], ["/boot/vmlinuz-test"], boot=boot, architecture="arm64")
+        self.assertEqual(result["architecture"], "aarch64")
+        self.assertEqual(result["kernels"]["test"]["architecture"], "aarch64")
+        self.assertEqual(result["kernels"]["test"]["config"]["CONFIG_EFI_STUB"], "y")
+        self.assertIn("amba_pl011", result["kernels"]["test"]["builtin"])
+        self.assertEqual(result["serial_device"], "ttyAMA0")
+        self.assertTrue(result["serial_console_ready"])
+        g.files["/etc/default/grub"] = 'GRUB_CMDLINE_LINUX="console=ttyS0,115200n8"\n'
+        self.assertFalse(inspect_guest(g, "/dev/sda2", [], ["/boot/vmlinuz-test"], boot=boot,
+                                      architecture="aarch64")["serial_console_ready"])
+
     def test_installed_module_evidence_checks_files_and_rejects_stale_or_escaping_paths(self):
         directory = "/lib/modules/test/"
         g = FakeGuest({
@@ -304,6 +375,25 @@ class EvidenceTests(unittest.TestCase):
 
 
 class PreparationTests(unittest.TestCase):
+    def test_arm_serial_commands_use_pl011_and_never_x86_console(self):
+        image = arm_inspected()
+        profile = config(configure_network=False, configure_cloud_init=False)
+        g = Mock()
+        g.is_symlink.return_value = False
+        g.is_file.return_value = False
+        @contextmanager
+        def guest(*args, **kwargs):
+            yield g
+        with patch("forge.architecture.worker_arch", return_value="aarch64"), patch("forge.engine._guest", guest), \
+                patch("forge.engine._mount"), patch("forge.engine._roots", return_value="/dev/sda1"), \
+                patch("forge.engine._run") as run, patch("forge.engine.ImageEngine.inspect", return_value=deepcopy(image)):
+            result = prepare_guest(Path("/tmp/arm.qcow2"), image, profile, False, lambda _: None)
+        commands = " ".join(run.call_args.args[0])
+        self.assertIn("console=ttyAMA0,115200n8", commands)
+        self.assertIn("serial-getty@ttyAMA0.service", commands)
+        self.assertNotIn("ttyS0", commands)
+        self.assertEqual(result["architecture"], "aarch64")
+
     def test_oci_rebuild_preserves_physical_driver_and_returns_hash_bound_receipt(self):
         image = inspected()
         image["oci_evidence"]["kernels"][VERSION]["modules"].remove("ixgbe")

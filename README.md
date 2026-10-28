@@ -6,7 +6,7 @@ The application includes a FastAPI service, a dependency-free browser interface,
 
 ## Start with Docker
 
-Use a **Linux x86_64 host** with Docker Engine and Docker Compose. Budget several gigabytes of RAM and enough storage for the source, working copies, and output. RAW and fixed VHD exports can approach the full virtual disk size, regardless of how small the input QCOW2 file is.
+Use a **Linux x86_64 or ARM64 host** with Docker Engine and Docker Compose. Both can inspect, edit configuration files, resize supported filesystems and export x86_64 or ARM64 Linux images. Operations that execute guest programs need a worker matching the guest architecture. Budget several gigabytes of RAM and enough storage for the source, working copies, and output. RAW and fixed VHD exports can approach the full virtual disk size, regardless of how small the input QCOW2 file is.
 
 ```sh
 cp .env.example .env
@@ -17,7 +17,7 @@ Open **http://localhost:8080**. The default configuration binds only to loopback
 
 For faster filesystem rebuilds on a host with usable KVM, set `FORGE_KVM_GID` in `.env` to the output of `stat -c '%g' /dev/kvm`, then start with `docker compose -f compose.yaml -f compose.kvm.yaml up --build -d`. This supplies only the KVM device and its group; the service still runs without Linux capabilities or privileged mode. A host without working KVM should use the standard Compose file.
 
-The Docker image targets `linux/amd64`. Docker Desktop on macOS or Windows adds a Linux VM, and ARM hosts add another architecture emulation layer. Real image operations on those configurations have not been validated; use a Linux x86_64 worker for image builds. The API and browser UI can be developed on macOS without the image tools, but image operations will report the missing engine dependencies.
+The Dockerfile supports native `linux/amd64` and `linux/arm64` builds, selecting the appropriate appliance kernel and QEMU packages. Compose uses the host's native platform. Package installation, service actions, initramfs/GRUB regeneration and guest preparation require a matching architecture worker; the API rejects a mismatch before queueing a build. File-only edits and supported disk operations remain available across architectures. See [architecture support and deployment choices](docs/image-architectures.md). Docker Desktop adds a Linux VM; its image engine configurations have not been validated. The API and UI can be developed on macOS without the image tools.
 
 The named `forge-data` volume stores imported images, jobs, build outputs, and metadata. `docker compose down` preserves it. Do not use `docker compose down -v` if you need to retain your images. Run **one API process and one replica per data directory**; an exclusive workspace lock rejects a second process using the same directory.
 
@@ -40,7 +40,7 @@ VMDK, VHDX, general OVA/tar archives, backing-file chains, encrypted disks, mult
 
 ### Boot detection
 
-**Inspect** and **Boot & kernel** show **UEFI**, **legacy BIOS**, **dual**, or **unknown**, with the disk and loader evidence behind the result. Inspection checks EFI system partitions even when they are absent from `fstab`, validates recognized x86_64 EFI applications, and checks installed GRUB BIOS structures. GPT, an empty EFI partition, or a boot-sector signature alone does not establish a boot mode. Unknown means the supported checks could not establish a mode; it does not prove the image cannot boot.
+**Inspect** and **Boot & kernel** show **UEFI**, **legacy BIOS**, **dual**, or **unknown**, with the disk and loader evidence behind the result. Inspection checks EFI system partitions even when they are absent from `fstab`, validates EFI applications matching the x86_64 or ARM64 guest, and checks installed x86 GRUB BIOS structures. ARM64 requires an existing ARM64 UEFI boot chain. GPT, an empty EFI partition, or a boot-sector signature alone does not establish a boot mode. Unknown means the supported checks could not establish a mode; it does not prove the image cannot boot.
 
 One detected firmware mode initializes the OCI firmware choice when the selected schema permits it. Dual-mode images require an explicit choice, and OCI preparation checks the selected modes against the detected support. This is offline evidence, not the VM's last firmware setting or a successful boot test. Firmware NVRAM is outside the disk image; vendor-only EFI paths may require a destination boot entry. See [detection and validation limits](docs/architecture.md#boot-mode-evidence).
 
@@ -147,7 +147,7 @@ Jobs are serialized because each appliance and disk conversion consumes substant
 
 ### Optional KVM acceleration
 
-On a Linux x86_64 host with hardware virtualization and an accessible `/dev/kvm`, use the included `compose.kvm.yaml`. Set `FORGE_KVM_GID` in `.env` to the host device's group ID (`stat -c '%g' /dev/kvm`), then start:
+On a Linux x86_64 or ARM64 host with matching hardware virtualization and an accessible `/dev/kvm`, use the included `compose.kvm.yaml`. Set `FORGE_KVM_GID` in `.env` to the host device's group ID (`stat -c '%g' /dev/kvm`), then start:
 
 ```sh
 docker compose -f compose.yaml -f compose.kvm.yaml up -d
@@ -180,7 +180,7 @@ These tests use mocked image tooling to verify application behavior without a VM
 ./scripts/smoke-image.sh /path/to/source.qcow2 /path/to/new-output-directory
 ```
 
-Run that script in the project Python environment on Linux x86_64 or inside the supplied container with a read-only source mount and a writable output location. The output directory must not already exist. This smoke check is separate from a guest boot test and a provider import/launch test.
+Run that script in the project Python environment on Linux x86_64/ARM64 or inside the supplied container with a read-only source mount and a writable output location. The output directory must not already exist. This smoke check is separate from a guest boot test and a provider import/launch test.
 
 For a fixture whose boot arrangement you already know, set `FORGE_EXPECT_BOOT_MODE=uefi`, `bios`, `dual`, or `unknown` when running the script. It checks the detected result against that explicit expectation and verifies the source checksum immediately after inspection. This assertion still does not boot the guest.
 
@@ -189,6 +189,8 @@ Set `FORGE_SMOKE_UEFI_MIGRATION=1` to exercise migration on a BIOS-only fixture 
 Unit tests use mocked image tooling. Container startup and a real Debian import/edit/export round trip have also been exercised on a Linux x86_64 Docker host. An Oracle Linux 9.8 UEFI/XFS/LVM fixture was rebuilt from a 12 GiB test disk to exactly 10 GB, reducing its root filesystem from 8 GiB to 7.5 GiB. File contents and archived metadata, filesystem identities, source preservation and export byte comparison passed. The rebuilt image reached a serial login prompt under KVM/OVMF with no network device and temporary disk writes; its checksum remained unchanged.
 
 The same Oracle fixture completed VM-to-bare-metal preparation and a reverse conversion to a VirtIO VM profile without guest network access or package installation. Both outputs passed driver, initramfs and generated boot-configuration verification, and the input hashes remained unchanged.
+
+A real Debian 12 ARM64 image also passed import, ARM64 UEFI detection, a file edit, direct ext4 disk/root growth and export on the x86 worker. Guest-command requests correctly failed before queueing. Native ARM worker execution and an ARM cloud boot have not been tested here; see the [architecture validation record](docs/image-architectures.md#validation-record).
 
 Storage rebuilds and machine preparation still require an appropriate firmware boot and destination launch test for each image and target; these checks do not certify cloud support or physical hardware compatibility.
 

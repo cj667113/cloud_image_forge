@@ -262,6 +262,8 @@ def inspect_portability(g, partitions, evidence, base):
 
 def assess_portability(inspection, options, target_provider="oci"):
     from .platform import NIC_DRIVERS, PV_DRIVERS, _boot_args, _boot_records
+    from .oci_guest import _architecture_errors
+    from .architecture import normalize_arch
     evidence = inspection.get("platform") or {}
     facts = evidence.get("portability") or {}
     result = {"version": VERSION, "status": "unknown", "ready": False, "scope": "offline_boot_prerequisites",
@@ -272,6 +274,14 @@ def assess_portability(inspection, options, target_provider="oci"):
         result["checks"].append({"id": name, "label": label, "status": status, "evidence": details})
         if status != "ready":
             result["blockers"].extend(details or [label + " is not verified."])
+    arch = normalize_arch(inspection.get("os", {}).get("arch"))
+    architecture_errors = _architecture_errors(inspection, evidence.get("kernels", {}))
+    if arch == "aarch64" and (options.get("target") != "vm" or options.get("boot_attachment") != "paravirtualized"
+                               or options.get("network_attachment") not in {"paravirtualized", "accelerated"}):
+        architecture_errors.append("ARM64 preservation currently validates UEFI VM PV/Accelerated PV profiles, not ARM bare-metal or firmware-iSCSI targets.")
+    check("architecture", "Native guest architecture", "blocked" if architecture_errors else "ready",
+          architecture_errors or [f"Existing {arch} kernels are retained; no CPU architecture conversion is performed."])
+    result["architecture"] = arch
     if facts.get("version") != VERSION:
         check("inspection", "Current preservation evidence", "unknown", ["Preservation evidence is missing. Refresh inspection to read the existing initramfs and boot configuration."])
         return result
@@ -424,7 +434,7 @@ def assess_portability(inspection, options, target_provider="oci"):
     network_ready = (facts.get("network_direct_ready") or bootstrap_ready) and not facts.get("network_blockers")
     check("network", "Existing network initialization", "ready" if network_ready else "unknown",
           ["Existing unbound DHCP configuration is retained."] if network_ready and facts.get("network_direct_ready") else bootstrap.get("evidence", []) if network_ready else ["Neither portable DHCP nor an enabled, verified destination network initialization path could be established."] + facts.get("network_blockers", []) + bootstrap.get("blockers", []) + (["Oracle datasource bootstrapping requires OCI metadata; it does not establish generic-target networking."] if bootstrap.get("ready") and target_provider != "oci" else []))
-    if nic in NIC_DRIVERS and result["kernels"]:
+    if arch == "x86_64" and nic in NIC_DRIVERS and result["kernels"]:
         dual_required = PV_DRIVERS | {"virtio_net", nic, "iscsi_tcp", "iscsi_ibft"}
         dual = all(dual_required <= (set(kernel.get("modules", [])) | set(kernel.get("builtin", [])))
                    and dual_required <= (set(kernel.get("initrd_modules") or []) | set(kernel.get("builtin", [])))

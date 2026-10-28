@@ -4,12 +4,16 @@ ARG DEBIAN_FRONTEND=noninteractive
 
 # The appliance uses its own Linux kernel; it never mounts guest disks on the host.
 # Keep the distro Python ABI so python3-guestfs is available inside the venv.
-RUN test "$(dpkg --print-architecture)" = amd64 \
+RUN case "$(dpkg --print-architecture)" in \
+        amd64) set -- qemu-system-x86 linux-image-amd64 ;; \
+        arm64) set -- qemu-system-arm linux-image-arm64 ;; \
+        *) echo "Forge requires an amd64 or arm64 Linux container" >&2; exit 1 ;; \
+    esac \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates curl python3 python3-venv python3-guestfs \
         libguestfs-tools libguestfs-xfs guestfs-tools \
-        qemu-utils qemu-system-x86 linux-image-amd64 supermin \
+        qemu-utils "$@" supermin \
         lvm2 xfsprogs e2fsprogs dosfstools gdisk \
     && chmod a+r /boot/vmlinuz-* \
     && rm -rf /var/lib/apt/lists/*

@@ -264,7 +264,7 @@ function wizardRenderReview() {
   const unchangedOpen = $('[data-disclosure="review-unchanged"]',panel)?.open ?? state.editorDrafts[state.selected]?.disclosures?.['review-unchanged'];
   const cards = [], unchanged = [];
   const add = (title, step, lines, changed=true) => (changed ? cards : unchanged).push(`<article class="wizard-review-card"><div class="wizard-review-heading"><h3>${esc(title)}</h3><button type="button" class="button ghost small" data-wizard-step="${step}">Edit</button></div><ul>${lines.map(line => `<li>${esc(line)}</li>`).join('')}</ul></article>`);
-  add('Source','source',[wizardImage()?.name || 'Selected source',`Detected boot: ${bootModeLabel(wizardImage()?.inspection?.boot)}`]);
+  add('Source','source',[wizardImage()?.name || 'Selected source',`Architecture: ${architectureName(wizardImage()?.inspection?.os?.arch)}`,`Detected boot: ${bootModeLabel(wizardImage()?.inspection?.boot)}`]);
   add('Storage','storage',[
     recipe.disk_size_gib ? `Disk: ${bytes(recipe.disk_size_gib*GiB)} (${Math.round(recipe.disk_size_gib*GiB).toLocaleString()} bytes)` : 'Keep current disk capacity',
     ...(recipe.storage_rebuild ? ['Rebuild filesystems on a separate disk',...recipe.storage_rebuild.sizes.map(item=>`${item.device}: ${item.size_mib.toLocaleString()} MiB`)] : []),

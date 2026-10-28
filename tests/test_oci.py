@@ -192,7 +192,24 @@ def test_allowed_modes_require_all_device_models(ready_guest_plan):
 def test_arm_shapes_rejected_for_x86_images(ready_guest_plan):
     config = OciConfig(import_options={"shape_compatibility": [{"shape": "VM.Standard.A4.Flex"}]})
     plan = compatibility_plan({"os": {"arch": "x86_64"}}, config)
-    assert any("cannot be converted to Arm" in message for message in plan["blockers"])
+    assert any("requires aarch64" in message for message in plan["blockers"])
+
+
+@pytest.mark.parametrize("arch", ["aarch64", "arm64"])
+@pytest.mark.parametrize("shape", ["VM.Standard.A1.Flex", "VM.Standard.A2.Flex", "VM.Standard.A4.Flex", "VM.Standard.A4.Ax.Flex"])
+def test_arm_images_match_arm_shapes_and_retain_architecture_in_bundle(ready_guest_plan, arch, shape):
+    network = "ACCELERATEDPV" if ".Ax." in shape else "PARAVIRTUALIZED"
+    config = OciConfig(capabilities={"Network.AttachmentType": setting(network), "Compute.LaunchMode": setting(network)},
+                       import_options={"shape_compatibility": [{"shape": shape}]})
+    assert compatibility_plan({"os": {"arch": arch}}, config)["ready_to_build"]
+    bundle = bundle_files(config, {"architecture": "aarch64"})
+    assert json.loads(bundle["artifact.json"])["architecture"] == "aarch64"
+
+
+@pytest.mark.parametrize("shape", ["VM.Standard3.Flex", "VM.Standard.E4.Flex", "VM.DenseIO.E6.Ax.Flex"])
+def test_arm_images_cannot_advertise_known_x86_shapes(ready_guest_plan, shape):
+    plan = compatibility_plan({"os": {"arch": "arm64"}}, OciConfig(import_options={"shape_compatibility": [{"shape": shape}]}))
+    assert any("requires x86_64" in item for item in plan["blockers"])
 
 
 def test_new_tenancy_key_does_not_claim_guest_adaptation(ready_guest_plan):

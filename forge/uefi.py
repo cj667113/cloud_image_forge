@@ -249,13 +249,28 @@ def plan_migration(inspection: dict, options: dict | None, allow_network=False) 
     if isinstance(size_mib, bool) or not isinstance(size_mib, int) or not 512 <= size_mib <= 2048:
         blockers.append("New ESP size must be an integer from 512 through 2048 MiB")
         return result
-    if inspection.get("os", {}).get("arch") != "x86_64":
-        blockers.append("UEFI migration supports x86_64 Linux only; it does not convert CPU architectures")
+    from .architecture import normalize_arch, execution_blocker
+    arch = normalize_arch(inspection.get("os", {}).get("arch"))
     supported = (inspection.get("boot") or {}).get("supported_firmware", [])
+    if arch == "aarch64":
+        matching = (normalize_arch(inspection.get("boot", {}).get("architecture")) == arch
+                    and any(normalize_arch(loader.get("architecture")) == arch
+                            for loader in inspection.get("boot", {}).get("efi_loaders", [])))
+        if "UEFI_64" in supported and matching:
+            result.update(ready_to_migrate=True, layout={"action": "already_uefi", "preserve_bios": False})
+            changes.append("The image already has verified ARM64 UEFI support; no firmware migration is needed")
+        else:
+            blockers.append("ARM64 requires an existing matching ARM64 UEFI bootloader. Automated BIOS-to-UEFI migration is supported only for x86_64, not ARM64.")
+        return result
+    if arch != "x86_64":
+        blockers.append("UEFI migration supports x86_64 Linux only; it does not convert CPU architectures")
     if "UEFI_64" in supported and not blockers:
         result.update(ready_to_migrate=True, layout={"action": "already_uefi", "preserve_bios": "BIOS" in supported})
         changes.append("The image already has verified UEFI support; no firmware migration is needed")
         return result
+    blocker = execution_blocker(arch)
+    if blocker:
+        blockers.append(blocker)
     if "BIOS" not in supported:
         blockers.append("Migration requires verified installed BIOS boot support; refresh inspection or repair the source boot chain")
     evidence = inspection.get("uefi_migration") or {}

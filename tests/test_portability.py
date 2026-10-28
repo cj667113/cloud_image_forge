@@ -1,6 +1,7 @@
 """Preservation accepts proven existing arrangements without normalizing them."""
 from copy import deepcopy
 import hashlib
+import json
 from pathlib import Path
 import tempfile
 from unittest.mock import patch
@@ -81,6 +82,64 @@ def test_preserve_allows_same_machine_type_and_reconfigure_retains_old_rule():
     result = plan_platform(image(), options(strategy="reconfigure", source="vm"))
     assert not result["ready"]
     assert any("distinct" in error for error in result["blockers"])
+
+
+def arm_image():
+    source = json.loads(json.dumps(image("root=/dev/mapper/ocivolume-root ro")).replace(KERNEL, "6.12.0-test.aarch64"))
+    source["os"]["arch"] = "aarch64"
+    source["boot"]["architecture"] = "aarch64"
+    source["boot"]["efi_loaders"] = [{"path": "/EFI/BOOT/BOOTAA64.EFI", "architecture": "aarch64", "fallback": True}]
+    for kernel in source["platform"]["kernels"].values():
+        kernel["config"] = {"CONFIG_ARM64": "y", "CONFIG_EFI": "y", "CONFIG_EFI_STUB": "y"}
+    return source
+
+
+@pytest.mark.parametrize("arch", ["aarch64", "arm64"])
+@pytest.mark.parametrize("network", ["paravirtualized", "accelerated"])
+def test_arm_preservation_validates_existing_uefi_and_virtio_on_foreign_worker(arch, network):
+    source = arm_image()
+    source["os"]["arch"] = arch
+    original = deepcopy(source)
+    profile = options(source="vm", network_attachment=network)
+    result = plan_platform(source, profile)
+    assert result["ready"], result["blockers"]
+    assert result["architecture"] == "aarch64" and result["effective_firmware"] == "UEFI_64"
+    assert result["portability"]["dual_environment"]["status"] == "unknown"
+    assert "virtio_net" in result["required_modules"]
+    assert source == original
+    with patch("forge.engine.ImageEngine.inspect", return_value=source), patch("forge.engine._guest") as guest, patch("forge.engine._run") as run:
+        preserved = prepare_platform(Path("/tmp/arm.qcow2"), source, profile, False, lambda _: None)
+    guest.assert_not_called()
+    run.assert_not_called()
+    assert verify_platform(source, profile, receipt=preserved)["ready"]
+
+
+@pytest.mark.parametrize("mutation,expected", [
+    (lambda source: source["boot"].pop("architecture"), "ARM64 UEFI"),
+    (lambda source: source["boot"].update(efi_loaders=[]), "ARM64 UEFI"),
+    (lambda source: source["boot"].update(efi_loaders=[{"architecture": "x86_64"}]), "ARM64 UEFI"),
+    (lambda source: source["boot"].update(supported_firmware=["BIOS"]), "ARM64 UEFI"),
+    (lambda source: next(iter(source["platform"]["kernels"].values())).update(config={}), "CONFIG_ARM64"),
+    (lambda source: next(iter(source["platform"]["kernels"].values()))["config"].update(CONFIG_EFI_STUB="m"), "CONFIG_EFI_STUB"),
+    (lambda source: next(iter(source["platform"]["kernels"].values()))["initrd_modules"].remove("virtio_net"), "virtio_net"),
+])
+def test_arm_preservation_missing_or_conflicting_evidence_fails_closed(mutation, expected):
+    source = arm_image()
+    mutation(source)
+    result = assess_portability(source, options(source="vm"))
+    assert not result["ready"]
+    assert any(expected in error for error in result["blockers"])
+
+
+def test_arm_preservation_blocks_foreign_kernel_and_unvalidated_hardware_target():
+    source = arm_image()
+    foreign = deepcopy(next(iter(source["platform"]["kernels"].values())))
+    foreign["config"] = {"CONFIG_X86_64": "y"}
+    source["platform"]["kernels"]["foreign"] = foreign
+    assert any("targets x86_64" in error for error in plan_platform(source, options())["blockers"])
+    result = plan_platform(arm_image(), options(target="bare_metal", boot_attachment="iscsi", network_attachment="vfio"))
+    assert not result["ready"]
+    assert any("ARM bare-metal" in error for error in result["blockers"])
 
 
 @pytest.mark.parametrize("network,mode,shape", [

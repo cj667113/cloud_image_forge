@@ -41,6 +41,26 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(plan["layout"]["action"], "already_uefi")
         self.assertEqual(plan["growth_bytes"], 0)
 
+    def test_arm_matching_uefi_is_a_noop_even_on_x86_worker(self):
+        image = {"os": {"arch": "arm64"}, "boot": {"architecture": "aarch64", "supported_firmware": ["UEFI_64"],
+                 "efi_loaders": [{"architecture": "aarch64", "path": "/EFI/BOOT/BOOTAA64.EFI"}]}}
+        plan = plan_migration(image, OPTIONS)
+        self.assertTrue(plan["ready_to_migrate"], plan["blockers"])
+        self.assertEqual(plan["layout"], {"action": "already_uefi", "preserve_bios": False})
+        with patch("forge.engine._guest") as guest, patch("forge.engine._run") as run:
+            result = migrate(Path("/tmp/arm.qcow2"), image, OPTIONS, False, lambda _: None)
+        self.assertEqual(result["inspection"], image)
+        guest.assert_not_called()
+        run.assert_not_called()
+        image["boot"]["efi_loaders"][0]["architecture"] = "x86_64"
+        self.assertFalse(plan_migration(image, OPTIONS)["ready_to_migrate"])
+
+    def test_actual_x86_migration_requires_matching_worker_before_writes(self):
+        with patch("forge.architecture.worker_arch", return_value="aarch64"), patch("forge.engine._guest") as guest:
+            with self.assertRaisesRegex(EngineError, "worker cannot run"):
+                migrate(Path("/tmp/x86.qcow2"), inspected(), OPTIONS, False, lambda _: None)
+        guest.assert_not_called()
+
     def test_simple_mbr_appends_beyond_original_end_without_moving_partition(self):
         image = inspected()
         plan = plan_migration(image, OPTIONS)

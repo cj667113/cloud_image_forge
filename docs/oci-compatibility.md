@@ -4,6 +4,8 @@ Reviewed against Oracle's public documentation and running source/clone hosts on
 
 OCI image compatibility has three parts: the software and boot layout inside the disk, the image's cloud capability schema, and the hardware/network/storage selected when an instance is launched. A QCOW2 conversion only changes the disk container. Declaring a capability does not install a driver or prove that an instance boots.
 
+Forge accepts x86_64 and ARM64 Linux sources and checks known OCI shape architectures in both directions. ARM64 requires an existing matching UEFI boot chain; its initial hardware support covers PV-boot VM profiles with PV/AcceleratedPV networking. Running guest programs requires a worker of the same architecture, while inspection and data-only operations can use either worker. See [architecture support](image-architectures.md).
+
 This document covers the 13-key global image capability schema shown in Oracle's current overview, plus the corresponding image-import and instance-launch fields. Forge's reference catalog additionally exposes `ACCELERATEDPV` from the current launch API; it is not a downloaded regional schema. Account resources such as compartments, subnets, shapes, encryption keys, and IAM policies remain cloud configuration. Cloud Image Forge generates an image and configuration handoff; it does not create those resources.
 
 ## Cloud Image Forge workflow

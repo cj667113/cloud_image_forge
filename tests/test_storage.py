@@ -82,6 +82,26 @@ class PlanTests(unittest.TestCase):
         self.assertTrue(plan["ready"], plan["blockers"])
         self.assertEqual(plan["layout"]["lvs"], [])
 
+    def test_arm64_admission_retains_architecture_and_requires_matching_efi(self):
+        for spelling in ("aarch64", "arm64"):
+            image = inspected()
+            image["os"]["arch"] = spelling
+            image["boot"]["efi_loaders"] = [{"architecture": "aarch64", "path": "/EFI/BOOT/BOOTAA64.EFI"}]
+            original = deepcopy(image)
+            plan = plan_rebuild(image, OPTIONS, 10)
+            self.assertTrue(plan["ready"], plan["blockers"])
+            self.assertEqual(plan["source_architecture"], "aarch64")
+            self.assertEqual(image, original)
+            for loaders in ([], [{"architecture": "x86_64", "path": "/EFI/BOOT/BOOTX64.EFI"}]):
+                image["boot"]["efi_loaders"] = loaders
+                blocked = plan_rebuild(image, OPTIONS, 10)
+                self.assertFalse(blocked["ready"])
+                self.assertIn("matching AArch64 EFI", " ".join(blocked["blockers"]))
+        image["boot"].update(supported_firmware=["UEFI_64", "BIOS"], efi_loaders=[{"architecture": "aarch64"}])
+        self.assertFalse(plan_rebuild(image, OPTIONS, 10)["ready"])
+        image["os"]["arch"] = "arm"
+        self.assertFalse(plan_rebuild(image, OPTIONS, 10)["ready"])
+
     def test_unknown_data_boot_modes_table_and_missing_measurements_are_blockers(self):
         mutations = [
             lambda i: i["boot"].update(supported_firmware=["BIOS"]),
@@ -182,8 +202,11 @@ class ArchiveTests(unittest.TestCase):
 
 
 class FinalVerificationTests(unittest.TestCase):
-    def final(self):
+    def final(self, arch="x86_64"):
         original = inspected()
+        original["os"]["arch"] = arch
+        if arch in {"aarch64", "arm64"}:
+            original["boot"]["efi_loaders"] = [{"architecture": "aarch64"}]
         plan = plan_rebuild(original, OPTIONS, 10_000_000_000 / GIB)
         final = deepcopy(original)
         final["virtual_size"] = plan["layout"]["disk_size_after"]
@@ -194,6 +217,22 @@ class FinalVerificationTests(unittest.TestCase):
         for lv in final["storage"]["lvm"]["lvs"]:
             lv["lv_size"] = next(item["size"] for item in plan["layout"]["lvs"] if item["device"] == lv["device"])
         return final, plan
+
+    def test_final_arm_architecture_and_loader_cannot_change(self):
+        final, plan = self.final("arm64")
+        final["os"]["arch"] = "aarch64"
+        self.assertTrue(verify_rebuild(final, plan)["verified"])
+        for mutation in (
+            lambda i: i["os"].update(arch="x86_64"),
+            lambda i: i["os"].update(arch="unknown"),
+            lambda i: i["boot"].update(efi_loaders=[{"architecture": "x86_64"}]),
+            lambda i: i["boot"].update(architecture="x86_64"),
+            lambda i: i["boot"].update(efi_loaders=[]),
+            lambda i: i["boot"].update(supported_firmware=["UEFI_64", "BIOS"]),
+        ):
+            altered = deepcopy(final)
+            mutation(altered)
+            self.assertFalse(verify_rebuild(altered, plan)["verified"])
 
     def test_valid_final_structure_and_explicit_provider_alignment(self):
         final, plan = self.final()
@@ -350,9 +389,12 @@ class InspectionTests(unittest.TestCase):
 
 
 class ExecutorTests(unittest.TestCase):
-    def run_rebuild(self, root, corrupt=False, fail_restore=False):
+    def run_rebuild(self, root, corrupt=False, fail_restore=False, arch="x86_64"):
         root = root.resolve()
         image = inspected()
+        image["os"]["arch"] = arch
+        if arch == "aarch64":
+            image["boot"]["efi_loaders"] = [{"architecture": arch}]
         # Keep the raw-copy fixture small while exercising the same exact-length
         # copy and checksum path; no real filesystem tool is invoked by mocks.
         image["storage"]["filesystems"][0]["size"] = 512
@@ -396,7 +438,7 @@ class ExecutorTests(unittest.TestCase):
                          "disk_identity": plan["layout"]["disk_identity"], "partitions": plan["layout"]["partitions"]}
         with patch("forge.engine.ImageEngine.inspect", return_value=image), patch("forge.engine._guest", side_effect=appliance), \
              patch("forge.engine._run", return_value=""), patch("forge.uefi.inspect_layout", return_value=actual_layout), \
-             patch("forge.boot.detect_boot", return_value={"supported_firmware": ["UEFI_64"]}), \
+             patch("forge.boot.detect_boot", return_value=image["boot"]) as detect_boot, \
              patch("forge.engine._roots", return_value="/dev/ocivolume/root"), \
              patch("forge.engine._mount", return_value={item["mountpoint"]: item["device"] for item in image["storage"]["filesystems"]}), \
              patch("forge.storage.shutil.disk_usage", return_value=Mock(free=100 * GIB)):
@@ -407,6 +449,10 @@ class ExecutorTests(unittest.TestCase):
             else:
                 self.assertEqual(rebuild(source, destination, image, {"storage_rebuild": OPTIONS, "disk_size_gib": 10}, lambda _: None), destination)
                 self.assertTrue(destination.is_file())
+                detect_boot.assert_called_once_with(guests[-1], architecture=arch)
+                for guest in guests:
+                    guest.command.assert_not_called()
+                    guest.sh.assert_not_called()
         self.assertEqual(source.read_bytes(), b"immutable source")
         self.assertTrue(all(readonly for path, readonly in accesses if path == source))
         self.assertEqual(list(root.glob("storage-rebuild-*")), [])
@@ -423,6 +469,10 @@ class ExecutorTests(unittest.TestCase):
     def test_success_verifies_copy_keeps_source_and_never_formats_efi(self):
         with tempfile.TemporaryDirectory() as folder:
             self.run_rebuild(Path(folder))
+
+    def test_arm_rebuild_uses_matching_boot_detection_without_guest_commands(self):
+        with tempfile.TemporaryDirectory() as folder:
+            self.run_rebuild(Path(folder), arch="aarch64")
 
     def test_corrupt_restore_and_command_failure_remove_only_owned_destination(self):
         for failure in ({"corrupt": True}, {"fail_restore": True}):

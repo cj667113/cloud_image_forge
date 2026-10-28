@@ -14,6 +14,8 @@ from pathlib import PurePosixPath
 import re
 import struct
 
+from .architecture import normalize_arch
+
 
 EFI_GUID = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
 BIOS_GUID = "21686148-6449-6e6f-744e-656564454649"
@@ -53,7 +55,7 @@ def _pe_application(g, path: str) -> dict:
     optional = read(optional_size, pe_offset + 24)
     magic = struct.unpack_from("<H", optional)[0]
     minimum = 112 if magic == 0x20B else 96 if magic == 0x10B else 0
-    if not minimum or optional_size < minimum or (machine == 0x8664 and magic != 0x20B):
+    if not minimum or optional_size < minimum or (machine in {0x8664, 0xAA64} and magic != 0x20B):
         raise ValueError("invalid PE optional header")
     if struct.unpack_from("<H", optional, 68)[0] != 10:
         raise ValueError("PE image is not an EFI application (drivers are excluded)")
@@ -121,15 +123,16 @@ def _probe_esp(g, device, result, declared=True):
                 pe = _pe_application(g, path)
                 if not recognized and not pe["uki"]:
                     continue
-                fallback = path.lower() == "/efi/boot/bootx64.efi" and pe["architecture"] == "x86_64"
+                fallback_path = {"x86_64": "/efi/boot/bootx64.efi", "aarch64": "/efi/boot/bootaa64.efi"}.get(pe["architecture"])
+                fallback = path.lower() == fallback_path
                 loader = {"device": device, "path": path, "architecture": pe["architecture"], "fallback": fallback}
                 result["efi_loaders"].append(loader)
-                if declared and pe["architecture"] == "x86_64":
-                    result["evidence"].append(f"{device}: valid x86_64 EFI application {path}")
+                if declared and pe["architecture"] == result["architecture"]:
+                    result["evidence"].append(f"{device}: valid {pe['architecture']} EFI application {path}")
                 elif not declared:
                     result["warnings"].append(f"{device}: {path} exists on FAT without an EFI system partition type; firmware discovery is unverified.")
                 else:
-                    result["warnings"].append(f"{device}: {path} targets {pe['architecture']}, not UEFI x86_64.")
+                    result["warnings"].append(f"{device}: {path} targets {pe['architecture']}, not the {result['architecture']} guest.")
             except (RuntimeError, ValueError) as exc:
                 result["warnings"].append(f"{device} {path}: {exc}")
     except (RuntimeError, ValueError) as exc:
@@ -227,11 +230,12 @@ def _syslinux_bios(g, disk, mbr, partitions, warnings):
     return []
 
 
-def detect_boot(g, disk="/dev/sda") -> dict:
+def detect_boot(g, disk="/dev/sda", architecture="x86_64") -> dict:
     """Inspect an unmounted libguestfs appliance without executing guest code."""
     result = {"mode": "unknown", "label": "Unknown", "supported_firmware": [],
               "recommended_firmware": None, "partition_table": "unknown", "evidence": [],
-              "warnings": [], "efi_loaders": [], "bios_evidence": [], "boot_tested": False}
+              "warnings": [], "efi_loaders": [], "bios_evidence": [], "boot_tested": False,
+              "architecture": normalize_arch(architecture)}
     warnings = result["warnings"]
     if g.mountpoints():
         warnings.append("Boot detection requires an unmounted appliance; existing guest mounts were left untouched.")
@@ -281,7 +285,10 @@ def detect_boot(g, disk="/dev/sda") -> dict:
         mbr = _bytes(g.pread_device(disk, 512, 0))
         if len(mbr) != 512:
             raise ValueError("short read of MBR")
-        if g.blockdev_getss(disk) == 512:
+        if result["architecture"] != "x86_64":
+            if b"GRUB" in mbr[:446]:
+                warnings.append("Legacy x86 BIOS boot code does not establish an ARM64 boot chain.")
+        elif g.blockdev_getss(disk) == 512:
             result["bios_evidence"] = _grub_bios(g, disk, mbr, regions, warnings)
             if not result["bios_evidence"] and result["partition_table"] == "msdos":
                 result["bios_evidence"] = _syslinux_bios(g, disk, mbr, partitions, warnings)
@@ -291,10 +298,11 @@ def detect_boot(g, disk="/dev/sda") -> dict:
             warnings.append("LILO-like boot code was found; its boot chain could not be verified.")
     except (RuntimeError, ValueError) as exc:
         warnings.append(f"Cannot verify BIOS boot code: {exc}")
-    x64 = [loader for loader in result["efi_loaders"] if loader["architecture"] == "x86_64" and loader["device"] in declared_esp]
-    if x64:
+    matching = [loader for loader in result["efi_loaders"] if loader["architecture"] == result["architecture"]
+                and loader["architecture"] in {"x86_64", "aarch64"} and loader["device"] in declared_esp]
+    if matching:
         result["supported_firmware"].append("UEFI_64")
-        if not any(loader["fallback"] for loader in x64):
+        if not any(loader["fallback"] for loader in matching):
             warnings.append("EFI loaders exist only at vendor paths; the destination firmware needs a matching boot entry. Firmware NVRAM is not included in the disk image.")
     if result["bios_evidence"]:
         result["supported_firmware"].append("BIOS")

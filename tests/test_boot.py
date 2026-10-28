@@ -123,6 +123,29 @@ class DiskGuest:
 
 
 class BootTests(unittest.TestCase):
+    def test_arm64_requires_matching_efi_and_recognizes_aa64_fallback(self):
+        guest = DiskGuest()
+        guest.add_partition(1, EFI_GUID, fs="vfat", files={
+            "/EFI/BOOT/BOOTAA64.EFI": pe_application(machine=0xAA64)})
+        result = detect_boot(guest, architecture="arm64")
+        self.assertEqual(result["architecture"], "aarch64")
+        self.assertEqual(result["supported_firmware"], ["UEFI_64"])
+        self.assertTrue(result["efi_loaders"][0]["fallback"])
+        self.assertEqual(detect_boot(guest, architecture="x86_64")["supported_firmware"], [])
+
+    def test_arm64_does_not_accept_x86_loader_or_legacy_bios(self):
+        guest = DiskGuest("msdos")
+        self.esp(guest)
+        guest.install_grub()
+        self.assertEqual(detect_boot(guest, architecture="aarch64")["supported_firmware"], [])
+
+    def test_arm64_efi_requires_pe32_plus(self):
+        data = bytearray(pe_application(machine=0xAA64))
+        struct.pack_into("<H", data, 152, 0x10B)
+        guest = DiskGuest()
+        guest.add_partition(1, EFI_GUID, fs="vfat", files={"/EFI/BOOT/BOOTAA64.EFI": bytes(data)})
+        self.assertEqual(detect_boot(guest, architecture="aarch64")["mode"], "unknown")
+
     def esp(self, guest, number=1, **kwargs):
         return guest.add_partition(number, EFI_GUID if guest.table == "gpt" else 0xEF,
                                    files={"/EFI/BOOT/BOOTX64.EFI": pe_application(**kwargs)}, fs="vfat")
