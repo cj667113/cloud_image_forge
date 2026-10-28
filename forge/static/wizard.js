@@ -37,16 +37,16 @@ function wizardChrome() {
   return '<div id="wizard-chrome"><nav aria-label="Image build steps"><ol class="wizard-stepper"></ol></nav><div class="wizard-context"><div><span id="wizard-step-count" class="eyebrow"></span><h2 id="wizard-heading" tabindex="-1"></h2><p id="wizard-description"></p></div><progress class="wizard-progress" id="wizard-progress" max="100" value="0" aria-label="Wizard progress"></progress></div></div>';
 }
 function wizardFooter() {
-  return `<div id="wizard-error" class="notice error" role="alert" hidden></div><div class="wizard-footer"><div class="wizard-footer-copy"><strong id="build-summary">Original source preserved</strong><p id="wizard-footer-help">Changes are kept as you move between steps.</p></div><div class="wizard-footer-actions"><button type="button" id="wizard-back" class="button secondary" data-wizard-action="back"><span class="wizard-back-arrow">${icon('arrow')}</span>Back</button><button type="button" id="wizard-next" class="button primary" data-wizard-action="next">Next${icon('arrow')}</button><button type="submit" id="build-button" class="button primary" hidden>${icon('stack')}Build image</button></div></div>`;
+  return `<div id="wizard-error" class="notice error" role="alert" hidden></div><div class="wizard-footer"><div class="wizard-footer-copy"><strong id="build-summary">Image export</strong><span id="wizard-footer-help" hidden></span></div><div class="wizard-footer-actions"><button type="button" id="wizard-back" class="button secondary" data-wizard-action="back"><span class="wizard-back-arrow">${icon('arrow')}</span>Back</button><button type="button" id="wizard-next" class="button primary" data-wizard-action="next">Next${icon('arrow')}</button><button type="submit" id="build-button" class="button primary" hidden>${icon('stack')}Build image</button></div></div>`;
 }
 function wizardSource() {
   const image = wizardImage();
-  return `<h3>Choose your source image</h3><p class="panel-intro">Your original stays untouched.</p><div class="wizard-source-card"><span class="large-icon">${icon('upload')}</span><div><h4>Import a new image</h4><p>Local file · S3 · HTTPS</p><button type="button" class="button primary" data-action="open-import">${icon('plus')}Import image</button></div></div>${state.images.length ? `<div class="wizard-source-card"><span class="large-icon">${icon('image')}</span><div><label class="field">Use an imported source<select id="image-select">${state.images.map(item => `<option value="${esc(item.id)}"${item.id === state.selected ? ' selected' : ''}>${esc(item.name)} · ${esc(item.status)}</option>`).join('')}</select></label><p>${image?.status === 'ready' ? 'This source is ready. Select Next to review its inspection.' : 'Wait for inspection to finish before customizing this source.'}</p></div></div>` : ''}<div class="notice info">Every build creates a separate image.</div>`;
+  return `<div class="wizard-source-card"><span class="large-icon">${icon('upload')}</span><div><h3>Import a source</h3><p>Local file · S3 · HTTPS</p><button type="button" class="button primary" data-action="open-import">${icon('plus')}Import image</button></div></div>${state.images.length ? `<div class="wizard-source-card"><span class="large-icon">${icon('image')}</span><div><label class="field">Or choose an imported image<select id="image-select">${state.images.map(item => `<option value="${esc(item.id)}"${item.id === state.selected ? ' selected' : ''}>${esc(item.name)} · ${esc(item.status)}</option>`).join('')}</select></label>${image?.status === 'ready' ? '' : '<p>Inspection is in progress.</p>'}</div></div>` : ''}`;
 }
 function wizardPendingInspection(image) {
   if (!image) return '<p class="muted">Import an image in the Source step to begin inspection.</p>';
   const job = state.jobs.find(item => item.image_id === image.id && item.kind === 'import');
-  return `<h3>Inspecting ${esc(image.name)}</h3>${image.status === 'failed' ? `<div class="notice error">${esc(image.error || 'Import failed. Return to Source and import a new image.')}</div>` : `<div class="loading-surface"><div class="spinner" aria-hidden="true"></div>Import and inspection are in progress. You can continue when the source is ready.</div>`}${job ? `<details><summary>Import activity</summary><pre class="job-log">${esc((job.logs || []).join('\n') || 'Waiting for the image engine…')}</pre></details>` : ''}`;
+  return `<h3>Inspecting ${esc(image.name)}</h3>${image.status === 'failed' ? `<div class="notice error">${esc(image.error || 'Import failed. Return to Source and import a new image.')}</div>` : `<div class="loading-surface"><div class="spinner" aria-hidden="true"></div>Importing and inspecting…</div>`}${job ? `<details><summary>Import activity</summary><pre class="job-log">${esc((job.logs || []).join('\n') || 'Waiting for the image engine…')}</pre></details>` : ''}`;
 }
 function renderWizardEmpty(image = null) {
   if (image && state.selected !== image.id) state.selected = image.id;
@@ -119,17 +119,22 @@ function wizardUpdate() {
   build.hidden = session.step !== 'review';
   build.disabled = busy || wizardInspectionPending() || wizardBuildPending();
   const target = $('input[name="target"]:checked')?.value || 'oci';
-  $('#build-summary').textContent = `${profiles[target].label} export · Original source preserved`;
-  $('#wizard-footer-help').textContent = session.step === 'review' ? (wizardBuildPending() ? 'A build is already in progress. Follow it in Build & export.' : 'Build image starts the job with the settings shown above.') : session.step === 'result' ? 'Download your result or send it to S3 when the build finishes.' : 'Changes are kept as you move between steps.';
+  $('#build-summary').textContent = `${profiles[target].label} · ${($('input[name="target"]:checked')?.value === 'generic' ? $('#output-format').value : profiles[target].format).toUpperCase()}`;
+  $('#wizard-footer-help').textContent = wizardBuildPending() ? 'Build in progress' : '';
   const selector = $('#image-select'); if (selector) selector.disabled = busy;
   if (session.step === 'review') wizardRenderReview();
   if (session.step === 'result') wizardRenderResult();
+  updateDisclosureSummaries();
   compactStudioHelp($('#recipe-form')||document);
 }
 function wizardSetBusy(value) { wizardState.busy = Boolean(value); wizardUpdate(); }
 function wizardError(message, node) {
   notice('#wizard-error',message);
-  if (node) { node.focus(); node.reportValidity?.(); }
+  if (node) {
+    const panel = node.closest('.editor-panel');
+    if (panel?.hidden) wizardShowStep(panel.id.replace('panel-',''),{focus:false});
+    revealEditorField(node); node.reportValidity?.();
+  }
 }
 function wizardCheckFields(panel) {
   for (const node of $$('input,select,textarea',panel)) {
@@ -171,18 +176,18 @@ async function wizardValidateStep(id, remote = false) {
       if (name && !/^[A-Za-z0-9_][A-Za-z0-9_@.:-]*\.(service|timer|socket|target)$/.test(name)) throw new Error('Use a valid systemd unit name, such as sshd.service.');
     }
     const path = $('#custom-file-path').value.trim(), content = $('#custom-file-content').value;
-    if (Boolean(path) !== Boolean(content)) throw new Error('Enter both a path and contents for the custom startup file, or leave both empty.');
-    if (path && (path.includes('..') || !/^\/etc\/(cron\.d\/[A-Za-z0-9_-]+|systemd\/system\/[A-Za-z0-9_@.-]+\.service)$/.test(path))) throw new Error('Use a custom .service file under /etc/systemd/system/ or a file under /etc/cron.d/.');
-    if (path && $$('[data-file]').some(node => node.dataset.file === path && node.value !== node.defaultValue)) throw new Error('This startup file is already edited above. Keep one edit for that path.');
+    if (Boolean(path) !== Boolean(content)) throw editorError('Enter both a path and contents for the custom startup file, or leave both empty.',path?'#custom-file-content':'#custom-file-path');
+    if (path && (path.includes('..') || !/^\/etc\/(cron\.d\/[A-Za-z0-9_-]+|systemd\/system\/[A-Za-z0-9_@.-]+\.service)$/.test(path))) throw editorError('Use a custom .service file under /etc/systemd/system/ or a file under /etc/cron.d/.','#custom-file-path');
+    if (path && $$('[data-file]').some(node => node.dataset.file === path && node.value !== node.defaultValue)) throw editorError('This startup file is already edited above. Keep one edit for that path.','#custom-file-path');
   }
   if (id === 'boot') {
     const install = $('#packages-install').value.trim().split(/[\s,]+/).filter(Boolean);
     const remove = $('#packages-remove').value.trim().split(/[\s,]+/).filter(Boolean);
-    if (install.length && !$('#allow-network').checked) throw new Error('Enable guest networking to install packages.');
-    if ([...install,...remove].some(name => !/^[A-Za-z0-9][A-Za-z0-9.+_:~=-]{0,159}$/.test(name))) throw new Error('Use package names or versions, without paths, wildcards, or command options.');
-    if (install.some(name => remove.includes(name))) throw new Error('A package cannot be installed and removed in the same build.');
+    if (install.length && !$('#allow-network').checked) throw editorError('Enable guest networking to install packages.','#allow-network');
+    if ([...install,...remove].some(name => !/^[A-Za-z0-9][A-Za-z0-9.+_:~=-]{0,159}$/.test(name))) throw editorError('Use package names or versions, without paths, wildcards, or command options.','#packages-install');
+    if (install.some(name => remove.includes(name))) throw editorError('A package cannot be installed and removed in the same build.','#packages-install');
     const grub = $('[data-file="/etc/default/grub"]');
-    if (grub.value !== grub.defaultValue && !$('#regenerate-grub').checked) throw new Error('Enable GRUB regeneration to apply your changed GRUB defaults.');
+    if (grub.value !== grub.defaultValue && !$('#regenerate-grub').checked) throw editorError('Enable GRUB regeneration to apply your changed GRUB defaults.','#regenerate-grub');
     const migration = getBootMigrationConfig();
     if (remote && migration) await previewBootMigration(migration,true,$('#allow-network').checked);
   }
@@ -255,20 +260,21 @@ function wizardRenderReview() {
   const signature = JSON.stringify([state.selected,recipe,wizardImage()?.inspection?.boot]);
   if (panel.dataset.signature === signature) return;
   panel.dataset.signature = signature;
-  const cards = [];
-  const add = (title, step, lines) => cards.push(`<article class="wizard-review-card"><div class="wizard-review-heading"><h3>${esc(title)}</h3><button type="button" class="button ghost small" data-wizard-step="${step}">Edit</button></div><ul>${lines.map(line => `<li>${esc(line)}</li>`).join('')}</ul></article>`);
+  const unchangedOpen = $('[data-disclosure="review-unchanged"]',panel)?.open ?? state.editorDrafts[state.selected]?.disclosures?.['review-unchanged'];
+  const cards = [], unchanged = [];
+  const add = (title, step, lines, changed=true) => (changed ? cards : unchanged).push(`<article class="wizard-review-card"><div class="wizard-review-heading"><h3>${esc(title)}</h3><button type="button" class="button ghost small" data-wizard-step="${step}">Edit</button></div><ul>${lines.map(line => `<li>${esc(line)}</li>`).join('')}</ul></article>`);
   add('Source','source',[wizardImage()?.name || 'Selected source',`Detected boot: ${bootModeLabel(wizardImage()?.inspection?.boot)}`]);
   add('Storage','storage',[
-    recipe.disk_size_gib ? `Disk capacity: ${recipe.disk_size_gib} GiB before migration and export alignment` : 'Keep current disk capacity',
+    recipe.disk_size_gib ? `Disk: ${bytes(recipe.disk_size_gib*GiB)} (${Math.round(recipe.disk_size_gib*GiB).toLocaleString()} bytes)` : 'Keep current disk capacity',
     ...(recipe.storage_rebuild ? ['Rebuild filesystems on a separate disk',...recipe.storage_rebuild.sizes.map(item=>`${item.device}: ${item.size_mib.toLocaleString()} MiB`)] : []),
     ...recipe.partition_changes.map(part => `${part.device}: resize to ${part.size_mib} MiB`),
     ...(recipe.expand_partition ? [`Expand ${recipe.expand_partition}`] : []),
     ...(recipe.expand_lv ? [`Expand logical volume ${recipe.expand_lv}`] : [])
-  ]);
+  ],Boolean(recipe.disk_size_gib || recipe.storage_rebuild || recipe.partition_changes.length || recipe.expand_partition || recipe.expand_lv));
   const startup = recipe.services.map(item => `${item.action} ${item.name}`);
   startup.push(...recipe.files.filter(file => /\/cron|\/systemd\//.test(file.path)).map(file => `Edit ${file.path}`));
-  add('Startup','startup',startup.length ? startup : ['Keep existing services and scheduled jobs']);
-  add('Mounts','mounts',[recipe.files.some(file => file.path === '/etc/fstab') ? 'Update /etc/fstab' : 'Keep filesystem mounts']);
+  add('Startup','startup',startup.length ? startup : ['Unchanged'],Boolean(startup.length));
+  add('Mounts','mounts',[recipe.files.some(file => file.path === '/etc/fstab') ? 'Update /etc/fstab' : 'Unchanged'],recipe.files.some(file => file.path === '/etc/fstab'));
   const boot = [recipe.boot_migration ? `Migrate BIOS to UEFI; requested ESP ${recipe.boot_migration.esp_size_mib} MiB` : 'Keep existing firmware arrangement'];
   if (recipe.kernel_default) boot.push(`Default kernel: ${recipe.kernel_default}`);
   if (recipe.kernel_args) boot.push(`Kernel arguments: ${recipe.kernel_args}`);
@@ -278,14 +284,14 @@ function wizardRenderReview() {
   if (recipe.regenerate_grub) boot.push('Regenerate GRUB configuration');
   boot.push(...recipe.files.filter(file => /\/modules-load\.d\/|\/modprobe\.d\//.test(file.path)).map(file => `Edit ${file.path}`));
   boot.push(recipe.allow_network ? 'Guest networking enabled during customization' : 'Guest networking disabled during customization');
-  add('Boot and kernel','boot',boot);
+  add('Boot and kernel','boot',boot,Boolean(recipe.boot_migration || recipe.kernel_default || recipe.kernel_args || recipe.packages_install.length || recipe.packages_remove.length || recipe.rebuild_initramfs || recipe.regenerate_grub || recipe.allow_network || recipe.files.some(file => /\/modules-load\.d\/|\/modprobe\.d\//.test(file.path))));
   add('Destination','export',[profiles[recipe.target].label,`Output: ${recipe.output_format.toUpperCase()}`,recipe.sparsify ? 'Reclaim unused space' : 'Keep unused blocks',...(recipe.output_format === 'qcow2' ? [recipe.compress ? 'Compress QCOW2 output' : 'Uncompressed QCOW2 output'] : [])]);
   if(recipe.platform_migration) { const platform=recipe.platform_migration;add('Platform preparation','export',[`${platform.source==='vm'?'Virtual machine':'Bare metal'} → ${platform.target==='vm'?'Virtual machine':'Bare metal'}`,`Boot: ${platform.boot_attachment}; network: ${platform.network_attachment}`,...(platform.nic_driver?[`NIC driver: ${platform.nic_driver}`]:[]),...(platform.target==='bare_metal'?['Experimental · OCI bare-metal BYOI is unsupported']:[])]); }
   if (recipe.target === 'oci') {
     const firmware = recipe.oci?.capabilities?.['Compute.Firmware'];
-    add('OCI compatibility','oci',recipe.oci ? [`Apply ${Object.keys(recipe.oci.capabilities).length} capability settings`,...(firmware ? [`Preferred firmware: ${firmware.default_value}; allowed: ${(firmware.values || [firmware.default_value]).join(', ')}`] : []),recipe.oci.guest.prepare ? 'Prepare the guest for selected capabilities' : 'Validate existing guest preparation'] : ['OCI guest preparation and capability configuration are disabled']);
+    add('OCI compatibility','oci',recipe.oci ? [`Apply ${Object.keys(recipe.oci.capabilities).length} capability settings`,...(firmware ? [`Preferred firmware: ${firmware.default_value}; allowed: ${(firmware.values || [firmware.default_value]).join(', ')}`] : []),recipe.oci.guest.prepare ? 'Prepare the guest for selected capabilities' : 'Validate existing guest preparation'] : ['Disabled'],Boolean(recipe.oci));
   }
-  panel.innerHTML = `<h3>Review your image build</h3><p class="panel-intro">Your source stays unchanged.</p><div class="wizard-review-grid">${cards.join('')}</div>${recipe.files.length ? `<details class="wizard-file-review"><summary>Review ${recipe.files.length} changed configuration file${recipe.files.length === 1 ? '' : 's'}</summary>${recipe.files.map(file => `<h4><code>${esc(file.path)}</code></h4><pre class="wizard-file-content">${esc(file.content)}</pre>`).join('')}</details>` : ''}<div class="notice info">Plans are checked again before building. Download or upload the result in the final step.</div>`;
+  panel.innerHTML = `<div class="wizard-review-grid">${cards.join('')}</div>${unchanged.length ? `<details class="editor-disclosure" data-disclosure="review-unchanged"${unchangedOpen?' open':''}><summary>Unchanged settings <span class="disclosure-meta">${unchanged.length} sections</span></summary><div class="details-content wizard-review-grid">${unchanged.join('')}</div></details>` : ''}${recipe.files.length ? `<details class="wizard-file-review"><summary>Review ${recipe.files.length} changed configuration file${recipe.files.length === 1 ? '' : 's'}</summary>${recipe.files.map(file => `<h4><code>${esc(file.path)}</code></h4><pre class="wizard-file-content">${esc(file.content)}</pre>`).join('')}</details>` : ''}<p class="validation-note">Build checks the plans again and creates a new image.</p>`;
 }
 function wizardRenderResult() {
   const panel = $('#panel-result'); if (!panel) return;
@@ -295,13 +301,14 @@ function wizardRenderResult() {
   const signature = JSON.stringify([state.selected,session.jobId,job,artifact,session.uploadId,upload]);
   if (panel.dataset.signature === signature) return;
   panel.dataset.signature = signature;
-  const logOpen = $('.wizard-job-details',panel)?.open;
+  const logOpen = $('.wizard-job-details',panel)?.open, exportOpen = $('.wizard-export-details',panel)?.open;
   const logScroll = $('.job-log',panel)?.scrollTop || 0;
   const status = job?.status || 'queued';
   const title = status === 'succeeded' ? 'Your image is ready' : status === 'failed' ? 'The build needs attention' : status === 'running' ? 'Building your image' : 'Build queued';
-  panel.innerHTML = `<div class="wizard-result"><div class="wizard-result-heading"><span class="large-icon">${icon(status === 'succeeded' ? 'check' : status === 'failed' ? 'info' : 'activity')}</span><div><h3>${title}</h3><p>${esc(wizardImage()?.name || 'Source image')}</p></div>${badge(status)}</div>${status === 'failed' ? `<div class="notice error" role="alert">${esc(job?.error || 'The build failed. Review the log and update your settings before trying again.')}</div>` : status === 'succeeded' ? '<p>Your source is unchanged. Choose how to save the completed image.</p>' : '<div class="wizard-result-progress" role="status"><progress aria-label="Image build in progress"></progress><p>Progress depends on the image size and selected changes. You can leave this step and return while the job runs.</p></div>'}${artifact ? `<div class="wizard-result-actions"><a class="button primary" href="/api/artifacts/${encodeURIComponent(artifact.id)}/download" download>${icon('download')}Download image</a><button type="button" class="button secondary" data-s3="${esc(artifact.id)}" data-wizard-s3="${esc(state.selected)}">${icon('upload')}Upload to S3</button><a class="button secondary" href="/api/artifacts/${encodeURIComponent(artifact.id)}/manifest" download>Download manifest</a>${artifact.oci_config ? `<a class="button secondary" href="/api/artifacts/${encodeURIComponent(artifact.id)}/oci-bundle" download>OCI configuration</a>` : ''}</div><dl class="detail-list"><div><dt>Output format</dt><dd>${esc(artifact.format?.toUpperCase())}</dd></div><div><dt>File size</dt><dd>${bytes(artifact.size)}</dd></div><div><dt>SHA-256</dt><dd><code>${esc(artifact.sha256)}</code></dd></div></dl>` : status === 'succeeded' ? '<p class="muted">Loading export details…</p>' : ''}${upload ? `<div class="wizard-upload-status" role="status"><h4>S3 upload ${esc(upload.status)}</h4>${upload.error ? `<p class="notice error">${esc(upload.error)}</p>` : `<p>${upload.status === 'succeeded' ? 'Upload completed successfully.' : 'The server is transferring the exported image to your selected object storage destination.'}</p>`}</div>` : ''}<details class="wizard-job-details"><summary>Build log</summary><pre class="job-log">${esc((job?.logs || []).join('\n') || 'Waiting for the image engine…')}</pre></details><div class="wizard-result-actions"><button type="button" class="button secondary" data-wizard-action="review">${status === 'failed' ? 'Back to review and retry' : 'Back to review'}</button><button type="button" class="button ghost" data-view="jobs">View all activity</button></div></div>`;
+  panel.innerHTML = `<div class="wizard-result"><div class="wizard-result-heading"><span class="large-icon">${icon(status === 'succeeded' ? 'check' : status === 'failed' ? 'info' : 'activity')}</span><div><h3>${title}</h3><p>${esc(wizardImage()?.name || 'Source image')}</p></div>${badge(status)}</div>${status === 'failed' ? `<div class="notice error" role="alert">${esc(job?.error || 'The build failed. Review the log and update your settings before trying again.')}</div>` : status === 'succeeded' ? '' : '<div class="wizard-result-progress" role="status"><progress aria-label="Image build in progress"></progress><p>Processing in the background. You can return to this step anytime.</p></div>'}${artifact ? `<div class="wizard-result-actions"><a class="button primary" href="/api/artifacts/${encodeURIComponent(artifact.id)}/download" download>${icon('download')}Download image</a><button type="button" class="button secondary" data-s3="${esc(artifact.id)}" data-wizard-s3="${esc(state.selected)}">${icon('upload')}Upload to S3</button>${artifact.oci_config ? `<a class="button secondary" href="/api/artifacts/${encodeURIComponent(artifact.id)}/oci-bundle" download>OCI configuration</a>` : ''}</div><details class="editor-disclosure wizard-export-details"><summary>Export details <span class="disclosure-meta">${esc(artifact.format?.toUpperCase())} · ${bytes(artifact.size)}</span></summary><div class="details-content"><dl class="detail-list"><div><dt>Output format</dt><dd>${esc(artifact.format?.toUpperCase())}</dd></div><div><dt>File size</dt><dd>${bytes(artifact.size)}</dd></div><div><dt>SHA-256</dt><dd><code>${esc(artifact.sha256)}</code></dd></div></dl><a class="button secondary small" href="/api/artifacts/${encodeURIComponent(artifact.id)}/manifest" download>Download manifest</a></div></details>` : status === 'succeeded' ? '<p class="muted">Loading export details…</p>' : ''}${upload ? `<div class="wizard-upload-status" role="status"><h4>S3 upload ${esc(upload.status)}</h4>${upload.error ? `<p class="notice error">${esc(upload.error)}</p>` : `<p>${upload.status === 'succeeded' ? 'Upload completed successfully.' : 'Transferring to S3…'}</p>`}</div>` : ''}<details class="wizard-job-details"><summary>Build log</summary><pre class="job-log">${esc((job?.logs || []).join('\n') || 'Waiting for the image engine…')}</pre></details><div class="wizard-result-actions"><button type="button" class="button secondary" data-wizard-action="review">${status === 'failed' ? 'Review & retry' : 'Back to review'}</button><button type="button" class="button ghost" data-view="jobs">All activity</button></div></div>`;
   $('.wizard-result',panel).dataset.status = status;
   $('.wizard-job-details',panel).open = Boolean(logOpen);
+  if ($('.wizard-export-details',panel)) $('.wizard-export-details',panel).open = Boolean(exportOpen);
   $('.job-log',panel).scrollTop = logScroll;
 }
 function wizardBuildQueued(imageId,jobId) {
