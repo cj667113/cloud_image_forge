@@ -56,9 +56,11 @@ def _settings(text):
             if not re.fullmatch(r"\[\s*[A-Za-z]+(?:\s*,\s*[A-Za-z]+)*\s*\]", value):
                 raise ValueError("unsupported datasource list syntax")
             result[key] = re.findall(r"[A-Za-z]+", value)
-        elif key in {"manual_cache_clean", "disable_network_activation", "disable_fallback_netcfg"}:
+        elif key in {"manual_cache_clean", "disable_network_activation", "disable_fallback_netcfg", "ssh_pwauth"}:
             if value not in {"true", "false"}:
                 raise ValueError("unsupported boolean setting")
+            # SSH password policy does not alter the audited DHCP/bootstrap path.
+            # Retain it so duplicate declarations still fail closed.
             result[key] = value == "true"
         elif key == "network":
             if value == "{config: disabled}":

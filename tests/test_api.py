@@ -1,3 +1,4 @@
+import base64
 import hashlib
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import io
@@ -112,6 +113,55 @@ def test_foreign_architecture_guest_commands_are_rejected_before_queueing(client
     response = client.post(f"/api/images/{image_id}/build", json={"files": [{"path": "/etc/cron.d/test", "content": "# data-only\n"}]})
     assert response.status_code == 202
     assert finished(client, response.json()["job_id"])["status"] == "succeeded"
+
+
+SSH_TEST_KEY = "ssh-ed25519 " + base64.b64encode(
+    b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20" + bytes(range(32))).decode() + " api-test"
+
+
+@pytest.mark.parametrize("worker,guest", [("x86_64", "aarch64"), ("aarch64", "x86_64")])
+@pytest.mark.parametrize("options", [
+    {"disable_password_auth": True},
+    {"users": [{"username": "operator", "authorized_keys": [SSH_TEST_KEY]}]},
+    {"users": [{"username": "operator", "create": True, "authorized_keys": [SSH_TEST_KEY]}]},
+])
+def test_ssh_guest_commands_need_matching_worker_before_queueing(client, monkeypatch, worker, guest, options):
+    image_id = imported(client)
+    inspection = client.app.state.store.get("image", image_id)["inspection"]
+    inspection["os"]["arch"] = guest
+    inspection["execution"] = {"guest_commands": True, "worker_arch": guest}
+    client.app.state.store.update("image", image_id, inspection=inspection)
+    monkeypatch.setattr("forge.architecture.worker_arch", lambda: worker)
+    before = client.get("/api/jobs").json()
+    response = client.post(f"/api/images/{image_id}/build", json={"ssh_access": options})
+    assert response.status_code == 422, response.text
+    assert "SSH access" in response.json()["detail"]
+    assert client.get("/api/jobs").json() == before
+
+
+def test_ssh_recipe_reaches_worker_and_export_manifest(client):
+    image_id = imported(client)
+    options = {"disable_password_auth": True, "users": [
+        {"username": "operator", "create": True, "authorized_keys": [SSH_TEST_KEY]}]}
+    response = client.post(f"/api/images/{image_id}/build", json={"ssh_access": options})
+    assert response.status_code == 202, response.text
+    job = finished(client, response.json()["job_id"])
+    assert job["status"] == "succeeded", job
+    manifest = client.get(f"/api/artifacts/{job['result']['artifact_id']}/manifest").json()
+    assert manifest["recipe"]["ssh_access"] == options
+
+
+@pytest.mark.parametrize("payload", [
+    {"users": [{"username": "operator", "authorized_keys": ["-----BEGIN OPENSSH PRIVATE KEY-----\nPRIVATE-SENTINEL\n-----END OPENSSH PRIVATE KEY-----"]}]},
+    {"users": [{"username": "operator", "authorized_keys": [], "password": "PRIVATE-SENTINEL"}]},
+    "PRIVATE-SENTINEL",
+])
+def test_rejected_ssh_input_is_not_echoed_or_queued(client, payload):
+    response = client.post("/api/images/nonexistent/build", json={"ssh_access": payload})
+    assert response.status_code == 422
+    assert "PRIVATE-SENTINEL" not in response.text
+    assert all(set(error) <= {"type", "loc", "msg"} for error in response.json()["detail"])
+    assert client.get("/api/jobs").json() == []
 
 
 def test_refresh_inspection_updates_boot_evidence_and_preserves_source(client, tmp_path, monkeypatch):

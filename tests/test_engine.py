@@ -250,6 +250,52 @@ class RecipeTests(unittest.TestCase):
 
 
 class BuildTests(unittest.TestCase):
+    def test_ssh_applies_after_provider_preparation_and_verifies_before_conversion(self):
+        from forge.oci import OciConfig
+        for ready in (True, False):
+            with self.subTest(ready=ready), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                source = directory / "source.qcow2"
+                source.write_bytes(qcow_header())
+                baseline = source.read_bytes()
+                info, events, conversions = inspection(), [], []
+                engine = ImageEngine()
+                def run(command, log=None):
+                    if command[:2] == ["qemu-img", "convert"]:
+                        conversions.append(command)
+                        Path(command[-1]).write_bytes(qcow_header())
+                    return ""
+                def provider(*args, **kwargs):
+                    events.append("provider")
+                    return {"warnings": []}
+                def ssh(*args, **kwargs):
+                    self.assertEqual(events, ["explicit", "provider"])
+                    events.append("ssh")
+                    return {"warnings": [], "verified": True}
+                def verify(work, receipt):
+                    self.assertEqual(events, ["explicit", "provider", "ssh"])
+                    self.assertEqual(len(conversions), 1)
+                    return {"ready": ready, "blockers": [] if ready else ["SSH file changed"], "verified": ready}
+                with patch("forge.engine._run", side_effect=run), \
+                        patch("forge.engine._image_info", return_value={"virtual-size": info["virtual_size"]}), \
+                        patch.object(engine, "capabilities", return_value={"available": True}), \
+                        patch.object(engine, "inspect", return_value=info), \
+                        patch.object(engine, "_customize", side_effect=lambda *args: events.append("explicit")), \
+                        patch("forge.oci.compatibility_plan", return_value={"blockers": []}), \
+                        patch("forge.oci_guest.prepare_guest", side_effect=provider), \
+                        patch("forge.ssh_access.apply_access", side_effect=ssh), \
+                        patch("forge.ssh_access.verify_access", side_effect=verify):
+                    recipe = {"target": "oci", "oci": OciConfig().model_dump(), "sparsify": False,
+                              "ssh_access": {"disable_password_auth": True, "users": []}}
+                    if ready:
+                        result = engine.build(source, directory / "build", info, recipe, lambda _: None)
+                        self.assertTrue(result["ssh_access"]["verified"])
+                    else:
+                        with self.assertRaisesRegex(EngineError, "Final SSH access.*SSH file changed"):
+                            engine.build(source, directory / "build", info, recipe, lambda _: None)
+                self.assertEqual(len(conversions), 2 if ready else 1)
+                self.assertEqual(source.read_bytes(), baseline)
+
     def test_preservation_validates_after_explicit_edits_and_before_publication(self):
         for final_ready in (True, False):
             with self.subTest(final_ready=final_ready), tempfile.TemporaryDirectory() as directory:

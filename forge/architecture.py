@@ -22,7 +22,7 @@ def execution_blocker(arch):
         return "Guest command execution requires a detected x86_64 or ARM64 (aarch64) image; refresh inspection."
     if worker != guest:
         return (f"This {worker} worker cannot run {guest} guest programs. Use a {guest} Linux worker for "
-                "packages, service actions, kernel/GRUB regeneration or guest preparation. "
+                "packages, service actions, SSH access, kernel/GRUB regeneration or guest preparation. "
                 "Inspection, configuration-file edits, supported resizing, preservation and export remain available.")
     return None
 
@@ -34,8 +34,10 @@ def execution_capability(arch):
 
 
 def customization_requires_execution(recipe):
+    ssh_access = recipe.get("ssh_access") or {}
     return bool(any(recipe.get(key) for key in (
         "packages_install", "packages_remove", "services", "kernel_default", "rebuild_initramfs", "regenerate_grub"))
+        or ssh_access.get("disable_password_auth") or ssh_access.get("users")
         or recipe.get("kernel_args") is not None
         or any(item.get("path") == "/etc/default/grub" for item in recipe.get("files", [])))
 

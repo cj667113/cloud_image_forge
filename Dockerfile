@@ -18,6 +18,15 @@ RUN case "$(dpkg --print-architecture)" in \
     && chmod a+r /boot/vmlinuz-* \
     && rm -rf /var/lib/apt/lists/*
 
+# Debian's minimal appliance omits SELinux tools unless requested explicitly.
+# Install them in the worker and include them when supermin builds its appliance.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends policycoreutils selinux-utils \
+    && set -- /usr/lib/*/guestfs/supermin.d/packages \
+    && test "$#" -eq 1 && test -f "$1" \
+    && printf 'policycoreutils\nselinux-utils\n' > "${1%/*}/zz-forge-selinux-packages" \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin forge \
     && mkdir -p /app /data/tmp /var/tmp/forge \
     && chown forge:forge /data /data/tmp /var/tmp/forge \

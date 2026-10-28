@@ -31,6 +31,8 @@ def test_live_worker_decides_execution_not_cached_inspection(monkeypatch, worker
     {"services": [{"name": "sshd.service", "action": "enable"}]}, {"kernel_args": ""},
     {"kernel_default": "/boot/vmlinuz-test"}, {"rebuild_initramfs": True}, {"regenerate_grub": True},
     {"files": [{"path": "/etc/default/grub", "content": "# changed\n"}]},
+    {"ssh_access": {"disable_password_auth": True}},
+    {"ssh_access": {"users": [{"username": "operator", "create": True, "authorized_keys": []}]}},
     {"oci": {}}, {"platform_migration": {"enabled": True}}, {"boot_migration": {"enabled": True}},
 ])
 def test_foreign_guest_programs_reject_before_writes(recipe):
@@ -40,6 +42,18 @@ def test_foreign_guest_programs_reject_before_writes(recipe):
             _validate_recipe(recipe, info)
         guest.assert_not_called()
         run.assert_not_called()
+
+
+@pytest.mark.parametrize("worker,guest", [("x86_64", "aarch64"), ("aarch64", "x86_64")])
+def test_ssh_access_uses_current_worker_and_empty_options_remain_portable(monkeypatch, worker, guest):
+    monkeypatch.setattr("forge.architecture.worker_arch", lambda: worker)
+    info = {"os": {"arch": guest}, "execution": {"guest_commands": True}}
+    for options in (None, {}, {"disable_password_auth": False, "users": []}):
+        assert recipe_execution_blocker(info, {"ssh_access": options}) is None
+    for options in ({"disable_password_auth": True}, {"users": [{"username": "operator"}]}):
+        assert "SSH access" in recipe_execution_blocker(info, {"ssh_access": options})
+    monkeypatch.setattr("forge.architecture.worker_arch", lambda: guest)
+    assert recipe_execution_blocker(info, {"ssh_access": {"disable_password_auth": True}}) is None
 
 
 def test_foreign_file_edit_uses_appliance_labeling_without_guest_execution():

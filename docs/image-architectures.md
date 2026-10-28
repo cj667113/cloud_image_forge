@@ -12,6 +12,7 @@ Forge supports single-disk **x86_64** and **ARM64 (`aarch64`) Linux images**. It
 | Preserve & validate; OCI validate-only | Either; actual guest prerequisites must pass |
 | Sparsify, convert, compare and export | Either |
 | Install/remove packages; enable/disable/mask/unmask services | Same architecture as the guest |
+| Disable SSH password login; add authorized keys; create users with keys | Same architecture as the guest; verifies guest OpenSSH configuration |
 | Select default kernel; change kernel arguments or `/etc/default/grub`; regenerate GRUB/initramfs | Same architecture as the guest |
 | Reconfigure hardware or prepare the OCI guest | Same architecture as the guest |
 | BIOS-to-UEFI conversion | Eligible x86_64 guest on an x86_64 worker only |

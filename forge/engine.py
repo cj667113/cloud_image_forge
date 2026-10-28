@@ -300,6 +300,13 @@ def _validate_recipe(recipe: dict, inspection: dict) -> None:
     execution_error = recipe_execution_blocker(inspection, recipe)
     if execution_error:
         raise EngineError(execution_error)
+    if recipe.get("ssh_access") is not None:
+        from .models import SSHAccess
+        try:
+            SSHAccess.model_validate(recipe["ssh_access"])
+        except ValueError as exc:
+            # Do not include rejected input (possibly pasted private material).
+            raise EngineError("Invalid SSH access options; use supported usernames and public keys.") from exc
     platform = recipe.get("platform_migration") or {}
     if platform.get("enabled") and platform.get("strategy", "reconfigure") == "preserve":
         if any(platform.get(name, False) for name in ("install_packages", "configure_network", "configure_serial_console")):
@@ -438,12 +445,14 @@ class ImageEngine:
             from .platform import inspect_platform
             storage = inspect_storage(g, root, partitions, migration_layout)
             platform = inspect_platform(g, root, partitions, kernels, oci_evidence=oci_evidence)
+            from .ssh_access import inspect_access
+            ssh_access = inspect_access(g)
         return {"format": fmt, "virtual_size": info["virtual-size"],
                 "actual_size": path.stat().st_size, "allocated_size": info.get("actual-size"),
                 "os": os_info, "execution": execution_capability(architecture), "partitions": partitions, "files": files,
                 "services": sorted(services), "systemd": systemd, "kernels": kernels, "oci_evidence": oci_evidence, "boot": boot,
                 "uefi_migration": {"version": 1, "layout": migration_layout, "guest": migration_guest},
-                "storage": storage, "platform": platform,
+                "storage": storage, "platform": platform, "ssh_access": ssh_access,
                 "warnings": ["Bootability and cloud-agent compatibility require a test launch after export."]}
 
     def _resize(self, work: Path, destination: Path, inspection: dict, recipe: dict, log) -> Path:
@@ -616,6 +625,20 @@ class ImageEngine:
             warnings.extend(preparation["warnings"])
             if platform_plan["requested"] and preparation.get("verified_initrds"):
                 platform_receipt = preparation
+        ssh_receipt = None
+        from .ssh_access import meaningful as ssh_requested, apply_access, verify_access
+        if ssh_requested(recipe.get("ssh_access")):
+            # Authentication settings are explicit user edits and must follow
+            # cloud/provider preparation, which can rewrite cloud-init policy.
+            customized = self.inspect(work)
+            ssh_receipt = apply_access(work, customized, recipe["ssh_access"], log)
+            warnings.extend(ssh_receipt["warnings"])
+            if platform_plan["requested"] and (platform_options or {}).get("strategy") == "preserve":
+                # Re-establish the hardware preservation baseline after these
+                # explicitly requested auth edits, then enforce it at export.
+                customized = self.inspect(work)
+                platform_receipt = prepare_platform(work, customized, platform_options, recipe.get("allow_network", False), log,
+                                                    oci_config=recipe.get("oci"), target_provider=target)
         if recipe.get("sparsify", True):
             log("Discarding unused guest filesystem blocks")
             _run(["virt-sparsify", "--in-place", "--format", "qcow2", str(work)], log)
@@ -673,6 +696,9 @@ class ImageEngine:
                                               target_provider=target, receipt=platform_receipt)
             if not platform_result["ready"]:
                 raise EngineError("Final hardware compatibility verification failed: " + " ".join(platform_result["blockers"]))
+        ssh_result = verify_access(work, ssh_receipt)
+        if ssh_result is not None and not ssh_result["ready"]:
+            raise EngineError("Final SSH access verification failed: " + " ".join(ssh_result["blockers"]))
         filenames = {"qcow2": "image.qcow2", "raw": "image.raw", "vhd": "image.vhd", "gcp": "image.tar.gz"}
         output = destination_dir / filenames[final_format]
         conversion = destination_dir / "disk.raw" if final_format == "gcp" else output
@@ -710,4 +736,4 @@ class ImageEngine:
                 "virtual_size": virtual_size, "sha256": digest.hexdigest(), "warnings": warnings,
                 "boot": result_inspection.get("boot"),
                 "storage_rebuild": storage_result,
-                "platform_migration": platform_result}
+                "platform_migration": platform_result, "ssh_access": ssh_result}

@@ -17,7 +17,7 @@ Open **http://localhost:8080**. The default configuration binds only to loopback
 
 For faster filesystem rebuilds on a host with usable KVM, set `FORGE_KVM_GID` in `.env` to the output of `stat -c '%g' /dev/kvm`, then start with `docker compose -f compose.yaml -f compose.kvm.yaml up --build -d`. This supplies only the KVM device and its group; the service still runs without Linux capabilities or privileged mode. A host without working KVM should use the standard Compose file.
 
-The Dockerfile supports native `linux/amd64` and `linux/arm64` builds, selecting the appropriate appliance kernel and QEMU packages. Compose uses the host's native platform. Package installation, service actions, initramfs/GRUB regeneration and guest preparation require a matching architecture worker; the API rejects a mismatch before queueing a build. File-only edits and supported disk operations remain available across architectures. See [architecture support and deployment choices](docs/image-architectures.md). Docker Desktop adds a Linux VM; its image engine configurations have not been validated. The API and UI can be developed on macOS without the image tools.
+The Dockerfile supports native `linux/amd64` and `linux/arm64` builds, selecting the appropriate appliance kernel and QEMU packages. Compose uses the host's native platform. Package installation, service actions, SSH access changes, initramfs/GRUB regeneration and guest preparation require a matching architecture worker; the API rejects a mismatch before queueing a build. File-only edits and supported disk operations remain available across architectures. See [architecture support and deployment choices](docs/image-architectures.md). Docker Desktop adds a Linux VM; its image engine configurations have not been validated. The API and UI can be developed on macOS without the image tools.
 
 The named `forge-data` volume stores imported images, jobs, build outputs, and metadata. `docker compose down` preserves it. Do not use `docker compose down -v` if you need to retain your images. Run **one API process and one replica per data directory**; an exclusive workspace lock rejects a second process using the same directory.
 
@@ -25,7 +25,7 @@ The named `forge-data` volume stores imported images, jobs, build outputs, and m
 
 1. Start at **Source**. Import an offline local file, enter an `s3://bucket/path/image.qcow2` or public/presigned HTTPS URL, or select a previously imported image. Custom S3 endpoints and regions are supported; credentials come from the server's AWS SDK configuration.
 2. Continue to **Inspect** when import finishes. Review the operating system, disk capacity, partitions, filesystems, detected boot support, and warnings.
-3. Use **Next** through **Storage**, **Startup**, **Mounts**, and **Boot & kernel**. Set the changes you need or keep the existing settings. **Back** and the available step buttons let you revisit choices without clearing them.
+3. Use **Next** through **Storage**, **Startup**, **Access**, **Mounts**, and **Boot & kernel**. Set the changes you need or keep the existing settings. **Back** and the available step buttons let you revisit choices without clearing them.
 4. Choose the provider and output format in **Destination**, with optional VM/bare-metal preparation. Oracle Cloud adds an **OCI compatibility** step for capability settings and guest preparation.
 5. Check the changes and edited configuration files in **Review**. Use each card's **Edit** action to revise them, then select **Build image**.
 6. Stay in **Build & export** to follow progress and logs. Download the completed image and manifest, or upload it to S3 using an optional custom endpoint. OCI configuration is available when included in the build. **Exports** and **Activity** also provide access to completed files and job history.
@@ -65,6 +65,7 @@ Boot the result with **Secure Boot disabled** and test both desired firmware mod
 | Storage | Grow partitions and LVM; shrink direct ext2/3/4 partitions; rebuild supported GPT/UEFI XFS/ext filesystems and simple LVM into a smaller disk |
 | Startup | Explore systemd dependencies and start ordering; enable, disable, mask, or unmask units; edit custom `.service` units |
 | Scheduling | Edit `/etc/crontab` and files in `/etc/cron.d/` |
+| SSH access | Disable password and keyboard-interactive login; append public keys to existing users or create a user with keys |
 | Mounts | Edit `/etc/fstab` using the inspected contents as a starting point |
 | Boot | Edit `/etc/default/grub`, change kernel arguments, regenerate GRUB configuration; add UEFI support to eligible BIOS images |
 | Kernel | Install/remove packages, choose a supported installed default kernel, rebuild initramfs |
@@ -72,6 +73,8 @@ Boot the result with **Secure Boot disabled** and test both desired firmware mod
 | Output | Optional sparsification, QCOW2 compression, conversion, comparison, SHA-256 hashing |
 
 Guest package operations require explicitly enabling network access in the recipe. Package repositories and package names belong to the guest distribution. A new kernel must be compatible with the guest's bootloader, filesystem, and destination hypervisor; selecting a provider preset does not install or configure that provider's agent automatically. Default-kernel selection currently requires the guest's `grubby` command. Initramfs rebuilding uses `dracut` or `update-initramfs`; GRUB regeneration uses `update-grub` or `grub2-mkconfig`. Unsupported guest tooling produces an explicit job error.
+
+In **Access**, choose **Disable SSH password login** to disable password and keyboard-interactive authentication. **Add user keys** accepts pasted OpenSSH public keys or `.pub` uploads for an existing account; choose **Create this user** for a new account with a home directory, no usable password and no added administrator privileges. Existing keys are preserved and duplicates are skipped. Keep a working key or provider key provisioning available before disabling password login. SSH changes require a matching architecture worker and supported guest OpenSSH tools. See [SSH access behavior and limits](docs/ssh-access.md).
 
 In **Startup**, find a unit such as `sshd.service` in **Service chain** to see a connected tree of its configured start order or dependencies. Small chains expand automatically; **Expand all** exposes the full reachable inventory, with shared references and cycles marked separately. The unit count shows how much of the chain is visible. Click a row to inspect its details without losing your place, or choose **Trace from here** to make it the root. Targets, sockets, and other connecting unit types remain in the tree. **Service changes** holds enable, disable, mask, and unmask actions separately from browsing.
 

@@ -9,6 +9,7 @@ import time
 from urllib.parse import urlsplit, unquote
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -103,6 +104,14 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
     app.add_middleware(BodyLimitMiddleware, max_upload_bytes=settings.max_upload_bytes)
     hosts = ["*"] if settings.api_token else ["localhost", "127.0.0.1", "[::1]", "testserver"]
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=hosts)
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error(request, exc):
+        # A pasted private key must fail validation without being echoed into
+        # browser errors. Field locations and messages are sufficient to fix it.
+        errors = [{key: error[key] for key in ("type", "loc", "msg") if key in error}
+                  for error in exc.errors()]
+        return JSONResponse({"detail": errors}, 422)
 
     @app.middleware("http")
     async def boundaries(request: Request, call_next):

@@ -102,6 +102,39 @@ def test_later_simple_override_can_restore_default_cache_check(reviewed):
     assert bootstrap.inspect_bootstrap(g, base)["ready"]
 
 
+@pytest.mark.parametrize("value", ["false", "true"])
+def test_literal_ssh_password_policy_does_not_change_network_bootstrap(reviewed, value):
+    g, base = reviewed
+    path = "/etc/cloud/cloud.cfg.d/zz-cloud-image-forge-ssh.cfg"
+    g.files[path] = "# Cloud Image Forge: retain SSH key authentication.\nssh_pwauth: " + value + "\n"
+    result = bootstrap.inspect_bootstrap(g, base)
+    assert result["ready"] and result["mechanism"] == "oracle_cloud_init"
+    assert path in result["files"]
+
+
+@pytest.mark.parametrize("text", [
+    "ssh_pwauth: false\nssh_pwauth: true\n",
+    "ssh_pwauth: false\nssh_pwauth: false\n",
+    'ssh_pwauth: "false"\n', "ssh_pwauth: False\n", "ssh_pwauth: no\n",
+    "ssh_pwauth: !!bool false\n", "ssh_pwauth: *policy\n",
+    "ssh_pwauth: false\nwrite_files: []\n",
+])
+def test_ssh_policy_does_not_admit_unsupported_or_duplicate_yaml(reviewed, text):
+    g, base = reviewed
+    g.files["/etc/cloud/cloud.cfg.d/zz-cloud-image-forge-ssh.cfg"] = text
+    result = bootstrap.inspect_bootstrap(g, base)
+    assert result["status"] == "unknown" and not result["ready"]
+
+
+def test_ssh_policy_does_not_override_network_bootstrap_blocker(reviewed):
+    g, base = reviewed
+    g.files["/etc/cloud/cloud.cfg.d/zz-cloud-image-forge-ssh.cfg"] = (
+        "#cloud-config\nssh_pwauth: false\ndisable_network_activation: true\n"
+    )
+    result = bootstrap.inspect_bootstrap(g, base)
+    assert result["status"] == "blocked" and not result["ready"]
+
+
 @pytest.mark.parametrize("text", [
     "network:\n  version: 2\n  ethernets: {}\n", "network: *alias\n", "<<: *defaults\n",
     "manual_cache_clean: !!bool false\n", "manual_cache_clean: false\nmanual_cache_clean: true\n",

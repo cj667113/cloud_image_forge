@@ -2,7 +2,7 @@
 import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
 from .oci import OciConfig
 
@@ -106,6 +106,44 @@ class PlatformMigration(StrictModel):
         return self
 
 
+class SSHUser(StrictModel):
+    username: str = Field(min_length=1, max_length=32, pattern=r"^[a-z_][a-z0-9_-]{0,31}$")
+    create: StrictBool = False
+    authorized_keys: list[str] = Field(min_length=1, max_length=32)
+
+    @field_validator("username")
+    @classmethod
+    def exact_username(cls, value: str) -> str:
+        from .ssh_access import USERNAME
+        if not USERNAME.fullmatch(value):
+            raise ValueError("Use a Linux username of 1–32 lowercase letters, digits, underscores or hyphens")
+        return value
+
+    @field_validator("authorized_keys")
+    @classmethod
+    def public_keys(cls, values: list[str]) -> list[str]:
+        from .ssh_access import validate_public_key
+        return [validate_public_key(value) for value in values]
+
+    @model_validator(mode="after")
+    def non_admin_creation(self):
+        if self.create and self.username == "root":
+            raise ValueError("Creating root is unsupported; choose an existing account")
+        return self
+
+
+class SSHAccess(StrictModel):
+    disable_password_auth: StrictBool = False
+    users: list[SSHUser] = Field(default_factory=list, max_length=16)
+
+    @model_validator(mode="after")
+    def unique_users(self):
+        usernames = [user.username for user in self.users]
+        if len(usernames) != len(set(usernames)):
+            raise ValueError("Configure each SSH username once")
+        return self
+
+
 class Recipe(StrictModel):
     target: Literal["oci", "aws", "azure", "gcp", "generic"] = "oci"
     output_format: Literal["qcow2", "raw", "vhd", "gcp"] = "qcow2"
@@ -127,6 +165,7 @@ class Recipe(StrictModel):
     boot_migration: BootMigration | None = None
     storage_rebuild: StorageRebuild | None = None
     platform_migration: PlatformMigration | None = None
+    ssh_access: SSHAccess | None = None
     oci: OciConfig | None = None
 
     @field_validator("packages_install", "packages_remove")

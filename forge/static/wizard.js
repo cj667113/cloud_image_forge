@@ -8,6 +8,7 @@ const wizardStepCatalog = [
   {id:'overview',label:'Inspect',description:'Review the source and detected boot mode.'},
   {id:'storage',label:'Storage',description:'Preview and resize disk space.'},
   {id:'startup',label:'Startup',description:'Services and scheduled jobs.'},
+  {id:'access',label:'Access',description:'SSH login and authorized public keys.'},
   {id:'mounts',label:'Mounts',description:'Persistent filesystem mounts.'},
   {id:'boot',label:'Boot & kernel',description:'Firmware, kernels and drivers.'},
   {id:'export',label:'Destination',description:'Output format and target hardware.'},
@@ -171,6 +172,7 @@ async function wizardValidateStep(id, remote = false) {
     if (lv && !/^\/dev\/[A-Za-z0-9_+.-]+\/[A-Za-z0-9_+.-]+$/.test(lv)) throw new Error('Enter a logical-volume path such as /dev/volume-group/root.');
   }
   if (id === 'export') { const platform=getPlatformMigrationConfig(); if(remote&&platform)await previewPlatform(platform,true); }
+  if (id === 'access') getSshAccessConfig();
   if (id === 'startup') {
     for (const row of $$('.rule-row')) {
       const name = $('.service-name',row).value.trim();
@@ -275,6 +277,7 @@ function wizardRenderReview() {
   const startup = recipe.services.map(item => `${item.action} ${item.name}`);
   startup.push(...recipe.files.filter(file => /\/cron|\/systemd\//.test(file.path)).map(file => `Edit ${file.path}`));
   add('Startup','startup',startup.length ? startup : ['Unchanged'],Boolean(startup.length));
+  add('SSH access','access',sshAccessReview(recipe.ssh_access),Boolean(recipe.ssh_access));
   add('Mounts','mounts',[recipe.files.some(file => file.path === '/etc/fstab') ? 'Update /etc/fstab' : 'Unchanged'],recipe.files.some(file => file.path === '/etc/fstab'));
   const boot = [recipe.boot_migration ? `Migrate BIOS to UEFI; requested ESP ${recipe.boot_migration.esp_size_mib} MiB` : 'Keep existing firmware arrangement'];
   if (recipe.kernel_default) boot.push(`Default kernel: ${recipe.kernel_default}`);
