@@ -28,6 +28,16 @@ The same Dockerfile builds natively on Linux `amd64` or `arm64`: x86 uses `qemu-
 
 Use separate deployments and separate data volumes if you need both worker architectures. There is no automatic remote-worker routing or shared distributed queue. Transfer a source through local download/upload or the configured object store when moving it to another worker. Never run two workers against the same writable data directory. KVM accelerates the worker's appliance when the host supports it; it does not make foreign guest binaries executable.
 
+For a remote ARM VM without `/dev/kvm`, keep the default `force_tcg` setting and start Compose without the KVM override. The container and appliance still run ARM64; software emulation makes image operations slower. Check `/api/health` for `worker_arch: "aarch64"`, then run `docker compose exec forge libguestfs-test-tool` to verify that the appliance actually launches. API health alone checks tool availability.
+
+To use the loopback-bound UI over SSH, forward a separate local port for each worker:
+
+```sh
+ssh -i /path/to/private-key -N -L 127.0.0.1:18081:127.0.0.1:8080 opc@arm-worker
+```
+
+Open `http://127.0.0.1:18081` and enter that deployment's `API_TOKEN`. If another worker uses `localhost`, using `127.0.0.1` here also separates their browser session cookies, which are not isolated by port. Keep the SSH connection open. Set a different random token on each deployment, keep its `.env` private, and allow storage for uploaded sources, working disks and exports. A large cloud boot volume can still have a small root filesystem; inspect filesystem free space before importing large images.
+
 ## Boot and hardware validation
 
 EFI detection validates the PE machine type and matches it to the inspected guest. x86 fallback is `EFI/BOOT/BOOTX64.EFI`; ARM64 fallback is `EFI/BOOT/BOOTAA64.EFI`. A valid loader for the wrong architecture does not establish a boot chain. ARM64 plans require current architecture-aware UEFI evidence and kernel configuration proving `CONFIG_ARM64`, `CONFIG_EFI` and `CONFIG_EFI_STUB`. Old imports need refreshed inspection. The unchanged EFI partition and source architecture are checked after a filesystem rebuild.
@@ -46,4 +56,6 @@ The Oracle cloud-init bootstrap preservation profile remains deliberately narrow
 
 On 2026-10-28, an official Debian 12 genericcloud ARM64 QCOW2, verified against Debian's published SHA-512 checksum, passed 27 runtime checks in an isolated x86_64 Docker worker. The API imported it and detected ARM64 UEFI, rejected guest-command requests without queueing jobs, edited an inert cron file, grew the ext4 root/disk from 3 GiB to 4 GiB, and exported QCOW2. Independent reinspection, file readback and download hashing passed; original and imported source fingerprints were unchanged. The fixture's nonconsecutive partition numbering remained outside the existing filesystem-rebuild profile, so the runtime resize used direct growth.
 
-Native ARM64 worker execution and an ARM cloud boot were not exercised in that environment. The native Docker package selection and ARM command construction are implemented, with architecture-specific regression tests; deployment on an ARM64 host still needs its own appliance/guest-command and destination boot validation. `scripts/smoke-image.sh` accepts either supported Linux worker and verifies that exported images retain the source architecture.
+A separate native ARM64 deployment on Oracle Linux 9.8 passed 46 runtime checks the same day with the default direct/TCG backend and no `/dev/kvm`. The unprivileged container launched an ARM64 libguestfs appliance using `qemu-system-aarch64`. Through the API, it imported a checksum-verified Debian 12 ARM64 image, enabled a harmless custom service using the guest's `systemctl`, rebuilt its initramfs, and exported QCOW2. Independent inspection confirmed the enabled service and new configuration marker inside the rebuilt initramfs; the kernel binary and entire EFI partition retained their SHA-256 hashes. The downloaded artifact matched its manifest checksum, and both original fixtures and imported sources were unchanged. A Debian x86_64 image could be imported and inspected, while service and initramfs requests were rejected before queueing. Browser checks covered login, ARM detection, wizard navigation, ARM shape settings and responsive layout.
+
+These tests exercise offline image operations. An ARM firmware boot and destination cloud launch were not performed. `scripts/smoke-image.sh` accepts either supported Linux worker and verifies that exported images retain the source architecture.

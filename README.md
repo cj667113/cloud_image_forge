@@ -190,7 +190,7 @@ Unit tests use mocked image tooling. Container startup and a real Debian import/
 
 The same Oracle fixture completed VM-to-bare-metal preparation and a reverse conversion to a VirtIO VM profile without guest network access or package installation. Both outputs passed driver, initramfs and generated boot-configuration verification, and the input hashes remained unchanged.
 
-A real Debian 12 ARM64 image also passed import, ARM64 UEFI detection, a file edit, direct ext4 disk/root growth and export on the x86 worker. Guest-command requests correctly failed before queueing. Native ARM worker execution and an ARM cloud boot have not been tested here; see the [architecture validation record](docs/image-architectures.md#validation-record).
+A real Debian 12 ARM64 image also passed import, ARM64 UEFI detection, a file edit, direct ext4 disk/root growth and export on the x86 worker. Guest-command requests correctly failed before queueing. A native ARM64 Docker deployment subsequently passed appliance startup, import, guest service enablement, initramfs regeneration and export with UEFI/kernel preservation and download checksum verification. ARM firmware boot and cloud launch remain separate tests; see the [architecture validation record](docs/image-architectures.md#validation-record).
 
 Storage rebuilds and machine preparation still require an appropriate firmware boot and destination launch test for each image and target; these checks do not certify cloud support or physical hardware compatibility.
 
