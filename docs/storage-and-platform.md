@@ -6,9 +6,13 @@ These workflows operate on offline x86_64 Linux disk images. The imported source
 
 The Storage step separates **virtual disk capacity**, **filesystem capacity**, **used data**, and the imported **file length**. A smaller virtual disk does not predict the size of compressed QCOW2 output or the boot volume a cloud provider will provision. Filesystem reduction does not reduce the outer disk unless a smaller target disk is also selected.
 
-Target disk capacity accepts binary GiB or decimal GB. Filesystem inputs and sliders use MiB. Arbitrary target capacities round upward to a 512-byte boundary; the preview displays the actual byte count. For example, 10 GB is exactly 10,000,000,000 bytes, or 9.313225746154785 GiB.
+In **Storage**, turn on **Resize** under **Partition sizes**, then adjust each editable filesystem using its slider or numeric field. Numeric fields accept GiB or MiB; GiB values round upward to whole MiB, and ordinary LVM sizes round upward to 4 MiB extents. Fixed EFI partitions retain their original capacity. The bars show used space, planned capacity, and hatched space removed from the original allocation.
 
-Direct resizing retains the existing growth and offline ext2/3/4 shrink path. To shrink XFS or an ordinary LVM filesystem, enable **filesystem rebuild**. Its preview is available through `POST /api/images/{image_id}/storage/plan`:
+Under **Disk capacity**, choose **Fit disk to partitions** to calculate the minimum outer disk for the selected filesystem sizes, including layout metadata, rounded upward to two decimal places in your selected unit. This uses the server's planner and checks the resulting target again. It does not choose smaller filesystem sizes for you. You can also enter a custom capacity or leave it blank to keep the original disk. **Check sizes** and **Next** validate the current plan; estimates do not guarantee that every archive will fit.
+
+Target disk capacity accepts binary GiB or decimal GB. Arbitrary target capacities round upward to a 512-byte boundary; **Disk layout** shows the actual byte count. For example, 10 GB is exactly 10,000,000,000 bytes, or 9.313225746154785 GiB.
+
+**Advanced resizing** retains the direct growth and offline ext2/3/4 shrink path. The **Resize** option uses filesystem rebuild to shrink XFS or an ordinary LVM filesystem. Its preview is available through `POST /api/images/{image_id}/storage/plan`:
 
 ```json
 {

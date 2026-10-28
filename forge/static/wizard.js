@@ -88,7 +88,7 @@ function wizardUpdate() {
   if (!steps.some(step => step.id === session.step)) session.step = 'export';
   if (!$('#recipe-form') && !['source','overview'].includes(session.step)) session.step = image ? 'overview' : 'source';
   const index = Math.max(0,steps.findIndex(step => step.id === session.step));
-  const busy = wizardState.busy || wizardState.navigating;
+  const busy = wizardState.busy || wizardState.navigating || Boolean(studioState.plans[state.selected]?.storageFitPending);
   const navigation = steps.map((step,i) => {
     const visited = session.visited.includes(step.id), current = i === index;
     const unavailable = (!image && i > 0) || (image?.status !== 'ready' && i > 1) || (step.id === 'result' && !session.jobId);
@@ -164,6 +164,7 @@ async function wizardValidateStep(id, remote = false) {
     if (size && size > (state.health?.limits?.max_virtual_gib || 2048)) throw new Error('The requested disk capacity exceeds the server limit.');
     const rebuild = getStorageRebuildConfig();
     if (rebuild) { if(remote)await previewStorage(rebuild,true); return; }
+    if(size && getDiskCapacityBytes()<image?.inspection?.virtual_size && !$$('[data-partition]').some(node=>node.value)) throw editorError('Choose partition sizes before reducing the disk. Turn on Resize or use Advanced resizing.','#storage-rebuild-enabled');
     if ($$('[data-partition]').some(node => node.value && node.dataset.partition === $('#expand-partition').value)) throw new Error('Choose either an explicit size or automatic expansion for the same partition.');
     for(const field of $$('[data-partition]')) { const part=image?.inspection?.partitions?.find(item=>item.device===field.dataset.partition);if(field.value&&Number(field.value)*MiB<part?.size&&['xfs','LVM2_member'].includes(part.filesystem))throw new Error('Shrinking XFS or an LVM container requires filesystem rebuild mode.'); }
     const lv = $('#expand-lv').value.trim();
@@ -218,7 +219,7 @@ async function wizardValidateAll() {
   getRecipe();
 }
 async function wizardGo(id) {
-  if (wizardState.busy || wizardState.navigating) return;
+  if (wizardState.busy || wizardState.navigating || studioState.plans[state.selected]?.storageFitPending) return;
   const imageId = state.selected, steps = wizardSteps(), session = wizardSession();
   const oldIndex = steps.findIndex(step => step.id === session.step), nextIndex = steps.findIndex(step => step.id === id);
   if (nextIndex < 0 || nextIndex === oldIndex) return;

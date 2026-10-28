@@ -375,6 +375,8 @@ class ImageEngine:
             for directory in ("/usr/lib/systemd/system", "/lib/systemd/system", "/etc/systemd/system"):
                 if g.is_dir(directory):
                     services.update(name for name in g.ls(directory) if SERVICE.fullmatch(name))
+            from .systemd import inspect_systemd
+            systemd = inspect_systemd(g)
             os_info = {"name": g.inspect_get_product_name(root), "distro": g.inspect_get_distro(root),
                        "arch": g.inspect_get_arch(root), "root": root}
             kernels = sorted(g.glob_expand("/boot/vmlinuz-*"))
@@ -391,7 +393,7 @@ class ImageEngine:
         return {"format": fmt, "virtual_size": info["virtual-size"],
                 "actual_size": path.stat().st_size, "allocated_size": info.get("actual-size"),
                 "os": os_info, "partitions": partitions, "files": files,
-                "services": sorted(services), "kernels": kernels, "oci_evidence": oci_evidence, "boot": boot,
+                "services": sorted(services), "systemd": systemd, "kernels": kernels, "oci_evidence": oci_evidence, "boot": boot,
                 "uefi_migration": {"version": 1, "layout": migration_layout, "guest": migration_guest},
                 "storage": storage, "platform": platform,
                 "warnings": ["Bootability and cloud-agent compatibility require a test launch after export."]}

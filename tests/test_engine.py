@@ -114,6 +114,7 @@ class InspectionTests(unittest.TestCase):
             g.inspect_get_arch.return_value = "x86_64"
             events = []
             boot = inspection()["boot"]
+            systemd = {"version": 1, "available": True, "units": [], "edges": [], "timing_available": False}
 
             @contextmanager
             def guest(*args, **kwargs):
@@ -138,10 +139,14 @@ class InspectionTests(unittest.TestCase):
                     patch("forge.boot.detect_boot", side_effect=detect), \
                     patch("forge.uefi.inspect_layout", return_value={}), \
                     patch("forge.uefi.inspect_prerequisites", return_value={}), \
+                    patch("forge.systemd.inspect_systemd", return_value=systemd) as systemd_scan, \
                     patch("forge.oci_guest.inspect_guest", return_value={}) as oci:
                 result = ImageEngine().inspect(source)
             self.assertEqual(events, ["boot", "root"])
             self.assertEqual(result["boot"], boot)
+            self.assertEqual(result["systemd"], systemd)
+            self.assertEqual(result["services"], [])
+            systemd_scan.assert_called_once_with(g)
             oci.assert_called_once_with(g, "/dev/sda2", [], [], boot=boot)
 
 
