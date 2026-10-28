@@ -30,6 +30,8 @@ The named `forge-data` volume stores imported images, jobs, build outputs, and m
 5. Check the changes and edited configuration files in **Review**. Use each card's **Edit** action to revise them, then select **Build image**.
 6. Stay in **Build & export** to follow progress and logs. Download the completed image and manifest, or upload it to S3 using an optional custom endpoint. OCI configuration is available when included in the build. **Exports** and **Activity** also provide access to completed files and job history.
 
+**Exports** keeps download and S3 upload actions beside each file. Open **Details** for the manifest, OCI configuration, checksum, and warnings. **Activity** separates running and queued work from searchable history, with status and operation filters. Open a job to read its log or return to its source/export; polling preserves open logs and your reading position.
+
 The wizard keeps your choices while you navigate. Its warm neutral, charcoal, and red palette takes cues from Oracle/OCI; Cloud Image Forge is an independent application. Help buttons work on hover, keyboard focus, or tap. Required errors and migration limits remain visible. Inspection, field validation, and required migration or OCI checks must finish before the relevant step can continue.
 
 Images must be shut down before export from the source hypervisor. Supported inputs are standalone **QCOW2, RAW, and fixed/dynamic VHD** disk files. The importer also accepts the reference project's two-member OCI export archive: regular root-level files named exactly `output.QCOW2` and `image_metadata.json`. It retains the metadata with the source and edits the extracted disk; it does not generate a new OCI metadata bundle on export.

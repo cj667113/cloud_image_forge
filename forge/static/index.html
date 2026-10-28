@@ -9,9 +9,13 @@
   <link rel="stylesheet" href="/wizard.css">
   <link rel="stylesheet" href="/redwood.css">
   <link rel="stylesheet" href="/systemd.css">
+  <link rel="stylesheet" href="/exports.css">
+  <link rel="stylesheet" href="/activity.css">
   <script src="/wizard.js" defer></script>
   <script src="/studio.js" defer></script>
   <script src="/systemd.js" defer></script>
+  <script src="/exports.js" defer></script>
+  <script src="/activity.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
@@ -21,6 +25,7 @@
     <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V3m-5 5 5-5 5 5M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/></symbol>
     <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v13m-5-5 5 5 5-5M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/></symbol>
     <symbol id="i-activity" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 10a8 8 0 1 0-2 8M20 4v6h-6"/></symbol>
     <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M4 12h16m-6-6 6 6-6 6"/></symbol>
     <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
     <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
@@ -32,7 +37,7 @@
     <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/></symbol>
   </defs></svg>
   <aside class="sidebar">
-    <a href="#images" class="brand"><span class="brand-mark"><svg class="icon"><use href="#i-stack"/></svg></span><span>cloud image<span class="brand-forge">forge<span class="brand-dot">.</span></span></span></a>
+    <a href="#images" class="brand" data-view="images" aria-label="Cloud Image Forge, Image studio"><span class="brand-mark"><svg class="icon"><use href="#i-stack"/></svg></span><span>cloud image<span class="brand-forge">forge<span class="brand-dot">.</span></span></span></a>
     <div class="workspace-label">YOUR WORKSPACE</div>
     <nav aria-label="Main navigation">
       <button type="button" class="nav-item active" data-view="images"><svg class="icon"><use href="#i-image"/></svg>Image studio<span id="image-count" class="nav-count">0</span></button>
@@ -46,16 +51,15 @@
     </div>
   </aside>
   <main>
-    <header class="topbar"><div class="breadcrumb">Workspace<span>/</span><strong id="breadcrumb-current">Image studio</strong></div><span class="topbar-tag"><span class="status-dot"></span>Originals preserved</span></header>
     <div class="page-content">
       <div id="global-error" class="notice error" role="alert" hidden></div>
       <div id="engine-notice" class="notice warning" hidden></div>
-      <section id="view-images" class="view">
-        <div class="page-heading"><div><h1>Image studio</h1></div><button class="button primary" data-action="open-import"><svg class="icon"><use href="#i-plus"/></svg>Import image</button></div>
+      <section id="view-images" class="view" aria-labelledby="images-title">
+        <div class="page-heading"><div><h1 id="images-title">Image studio</h1></div><button class="button primary" data-action="open-import" aria-label="Import image" title="Import image"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span class="page-action-label">Import image</span></button></div>
         <div id="image-workspace"></div>
       </section>
-      <section id="view-artifacts" class="view" hidden><div class="page-heading"><div><h1>Exports</h1></div><button class="button secondary" data-action="refresh"><svg class="icon"><use href="#i-activity"/></svg>Refresh</button></div><div id="artifacts-content"></div></section>
-      <section id="view-jobs" class="view" hidden><div class="page-heading"><div><h1>Activity</h1></div><button class="button secondary" data-action="refresh"><svg class="icon"><use href="#i-activity"/></svg>Refresh</button></div><div id="jobs-content"></div></section>
+      <section id="view-artifacts" class="view" aria-labelledby="artifacts-title" hidden><div class="page-heading"><div><h1 id="artifacts-title">Exports</h1></div><button class="button secondary" data-action="refresh" aria-label="Refresh exports" title="Refresh exports"><svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg><span class="page-action-label">Refresh</span></button></div><div id="artifacts-content"></div></section>
+      <section id="view-jobs" class="view" aria-labelledby="jobs-title" hidden><div class="page-heading"><div><h1 id="jobs-title">Activity</h1></div><button class="button secondary" data-action="refresh" aria-label="Refresh activity" title="Refresh activity"><svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg><span class="page-action-label">Refresh</span></button></div><div id="jobs-content"></div></section>
       <footer class="page-footer"><span><svg class="icon"><use href="#i-stack"/></svg>Cloud Image Forge</span></footer>
     </div>
   </main>

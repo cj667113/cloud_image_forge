@@ -59,7 +59,20 @@ async function api(path, options = {}) {
   if (response.status === 204) return null;
   return response.json();
 }
-function setView(view) { if (!['images','jobs','artifacts'].includes(view)) view = 'images'; state.view = view; $$('.view').forEach(el => el.hidden = el.id !== `view-${view}`); $$('.nav-item').forEach(el => { el.classList.toggle('active', el.dataset.view === view); if(el.dataset.view === view) el.setAttribute('aria-current','page'); else el.removeAttribute('aria-current'); }); $('#breadcrumb-current').textContent = {images:'Image studio',jobs:'Activity',artifacts:'Exports'}[view]; history.replaceState(null,'',`#${view}`); }
+function setView(view) {
+  if (!['images','jobs','artifacts'].includes(view)) view = 'images';
+  if (state.view==='jobs' && view!=='jobs') captureActivityView();
+  state.view = view;
+  $$('.view').forEach(el => el.hidden = el.id !== `view-${view}`);
+  $$('.nav-item').forEach(el => {
+    el.classList.toggle('active',el.dataset.view===view);
+    if(el.dataset.view===view) el.setAttribute('aria-current','page');
+    else el.removeAttribute('aria-current');
+  });
+  document.title = `${{images:'Image studio',jobs:'Activity',artifacts:'Exports'}[view]} · Cloud Image Forge`;
+  history.replaceState(null,'',`#${view}`);
+  if(view==='jobs') renderActivity();
+}
 function updateHealth(health) {
   state.health = health;
   const available = Boolean(health.engine?.available);
@@ -244,19 +257,9 @@ async function buildImage(event) {
   } catch(error) { notice('#build-error',errorText(error)); }
   finally { state.buildSubmitting = false; wizardSetBusy(false); }
 }
-function renderArtifacts() {
-  const signature = JSON.stringify(state.artifacts); if (renderArtifacts.signature === signature) return; renderArtifacts.signature = signature;
-  if (!state.artifacts.length) { $('#artifacts-content').innerHTML = `<div class="list-empty"><span class="large-icon">${icon('download')}</span><h2>No exports yet</h2><p>Build an image to download or upload to S3.</p><button class="button secondary" data-view="images">Open image studio${icon('arrow')}</button></div>`; return; }
-  const openChecksums = new Set($$('.artifact-checksum[open]').map(node => node.dataset.artifact));
-  $('#artifacts-content').innerHTML = state.artifacts.map(artifact => `<article class="artifact-card"><div class="artifact-top"><span class="image-banner-icon">${icon('image')}</span><div class="artifact-info"><h3>${esc(artifact.name || artifact.filename || 'Image export')}</h3><div class="artifact-meta"><span>${esc(profiles[artifact.target]?.label || artifact.target || 'Generic')}</span><span>${esc((artifact.format || '').toUpperCase())}</span><span>${bytes(artifact.size)}</span>${artifact.virtual_size ? `<span>${bytes(artifact.virtual_size)} virtual</span>` : ''}</div></div><div class="artifact-actions">${artifact.oci_config ? `<a class="button secondary small" href="/api/artifacts/${encodeURIComponent(artifact.id)}/oci-bundle" download>${icon('code')}OCI configuration</a>` : ''}<a class="button secondary small" href="/api/artifacts/${encodeURIComponent(artifact.id)}/download" download>${icon('download')}Download</a><button class="button primary small" data-s3="${esc(artifact.id)}">${icon('upload')}Upload to S3</button></div></div>${artifact.warnings?.length ? `<div class="artifact-notes">${artifact.warnings.map(warning => `<p>${esc(warning)}</p>`).join('')}</div>` : ''}<details class="artifact-checksum" data-artifact="${esc(artifact.id)}"${openChecksums.has(artifact.id)?' open':''}><summary>SHA-256 checksum</summary><code>${esc(artifact.sha256 || 'Not available')}</code></details></article>`).join('');
-}
-function renderJobs() {
-  const signature = JSON.stringify([state.jobs,state.images.map(image => [image.id,image.name])]); if (renderJobs.signature === signature) return; renderJobs.signature = signature;
-  const openIds = $$('.job-card[open]').map(el => el.dataset.job);
-  if (!state.jobs.length) { $('#jobs-content').innerHTML = `<div class="list-empty"><span class="large-icon">${icon('activity')}</span><h2>No activity yet</h2><p>Imports, builds and transfers appear here.</p><button class="button secondary" data-action="open-import">Import image${icon('arrow')}</button></div>`; return; }
-  $('#jobs-content').innerHTML = state.jobs.map(job => { const image = state.images.find(item => item.id === job.image_id); const title = {import:'Import image',upload:'Upload to S3',build:'Build image',s3_upload:'Upload to S3',inspect:'Inspect image'}[job.kind] || job.kind || 'Image operation'; const log = (job.logs || []).map(line => typeof line === 'string' ? line : JSON.stringify(line)).join('\n'); return `<details class="job-card" data-job="${esc(job.id)}"${openIds.includes(job.id) || (!openIds.length && ['running','queued'].includes(job.status)) ? ' open' : ''}><summary>${icon(job.kind === 'build' ? 'stack' : job.kind === 'upload' ? 'cloud' : 'activity')}<span class="job-summary"><strong>${esc(title)}</strong><span>${esc(image?.name || job.id)}</span></span>${badge(job.status)}<span class="job-chevron" aria-hidden="true">›</span></summary><div class="job-body">${job.error ? `<div class="notice error">${esc(job.error)}</div>` : ''}<pre class="job-log">${esc(log || (job.status === 'queued' ? 'Waiting for the image engine…' : 'No log messages yet.'))}</pre>${job.result?.artifact_id ? `<div class="job-result"><button class="button ghost" data-view="artifacts">View exported image${icon('arrow')}</button></div>` : ''}</div></details>`; }).join('');
-}
-function openJob(id) { const node = $$('.job-card').find(el => el.dataset.job === id); if (node) { node.open = true; node.scrollIntoView({behavior:'smooth',block:'nearest'}); } }
+function renderArtifacts() { renderExports(); }
+function renderJobs() { renderActivity(); }
+function openJob(id) { return openActivityJob(id); }
 async function refresh() {
   if (state.polling) return;
   state.polling = true;

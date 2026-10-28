@@ -14,12 +14,11 @@ body{background:var(--paper)}
 .nav-item.active .icon{color:#f1a18e}
 .sidebar-bottom p,.sidebar-link{color:#b5aaa1}
 .engine-status{color:#d7cdc5}
-.topbar{background:#faf8f4}
-.breadcrumb,.topbar-tag{color:#797169}
-.breadcrumb strong{color:#4e4540}
-.page-content{padding-top:30px}
-.page-heading{margin-bottom:24px}
-.page-heading h1{font-size:30px;letter-spacing:-1px}
+.page-content{padding-top:22px}
+.page-heading{margin-bottom:18px;min-height:40px}
+.page-heading>div{min-width:0}
+.page-heading>.button{flex-shrink:0}
+.page-heading h1{font-size:26px;letter-spacing:-.65px;line-height:1.2;margin:0}
 .page-heading p{font-size:12px}
 .eyebrow{letter-spacing:1.5px}
 .button{border-radius:5px;font-size:12px;padding:10px 15px}
@@ -395,9 +394,9 @@ input[type=range]{appearance:auto;accent-color:#bc4c30;border:0;background:trans
 .artifact-checksum summary{cursor:pointer;color:var(--muted);padding:5px 0}
 .artifact-checksum code{display:block;padding-top:7px;overflow-wrap:anywhere;white-space:normal}
 @media(max-width:650px){
-  .page-content{padding-top:20px}
-  .page-heading{margin-bottom:14px}
-  .page-heading h1{font-size:25px}
+  .page-content{padding-top:16px}
+  .page-heading{margin-bottom:14px;flex-direction:row;align-items:center;gap:12px}
+  .page-heading h1{font-size:22px}
   .wizard-context{padding:15px}
   .wizard-context h2{font-size:20px}
   .wizard-footer{padding:10px;gap:0;bottom:8px}
@@ -421,6 +420,7 @@ input[type=range]{appearance:auto;accent-color:#bc4c30;border:0;background:trans
   .filesystem-minimum .help-anchor,.filesystem-locked .help-anchor{margin-left:2px}
 }
 @media(pointer:coarse){.help-toggle,.studio-section-heading .help-toggle{width:32px;height:32px;min-width:32px}}
+@media(max-width:360px){.page-heading .page-action-label{display:none}.page-heading>.button{padding:9px;min-width:38px;min-height:38px}}
 @media(prefers-reduced-motion:reduce){
   .fs-capacity,.editor-disclosure>summary::before,.button,.wizard-step-button{transition:none!important}
   .plan-action-row .spinner{animation:none!important}
