@@ -85,7 +85,7 @@ function storagePlanBody(config=undefined,disk=undefined) {
 function storageRows() {
   return [...storageFilesystems()].sort((a,b)=>(a.mountpoint==='/'?-1:b.mountpoint==='/'?1:0)).map((fs,index)=>{
     const current=Math.ceil(Number(fs.size||0)/MiB),known=Number.isFinite(fs.used),minimum=Number(fs.minimum_size_mib)||32;
-    const unit=current>=1024?'gib':'mib',name=fs.mountpoint||fs.device;
+    const unit=current>=1024&&current%256===0?'gib':'mib',name=fs.mountpoint||fs.device;
     const description=fs.mountpoint==='/'?'System':fs.kind==='efi'?'EFI boot':fs.mountpoint==='/boot'?'Boot':fs.kind==='lv'?'Logical volume':'Partition';
     return `<article class="filesystem-row" data-fs-device="${esc(fs.device)}">
       <div class="filesystem-heading"><div><span class="filesystem-dot color-${index%5}"></span><strong>${esc(name)}</strong>${helpHint(`${description} · ${fs.filesystem||'Unknown'} · ${fs.device}${fs.editable?'. Sizes round up to whole MiB, or 4 MiB for LVM.':''}`,`About ${name}`)}</div><span class="filesystem-kind">${esc(description)} · ${esc(fs.filesystem||'Unknown')}</span></div>
