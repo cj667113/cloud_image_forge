@@ -524,6 +524,12 @@ def _plan_preserve(inspection, options, plan, oci_config, target_provider, boot_
             choice = config.get("capabilities", {}).get(key, {})
             if choice.get("default_value") != wanted or wanted not in (choice.get("values") or [choice.get("default_value")]):
                 blockers.append(f"OCI {key} must allow and prefer {wanted} to match the target being validated.")
+        launch = config.get("capabilities", {}).get("Compute.LaunchMode", {}).get("default_value")
+        expected_launch = ("NATIVE" if target == "bare_metal" else
+                           "ACCELERATEDPV" if network == "accelerated" and boot == "paravirtualized" else
+                           "PARAVIRTUALIZED" if boot == network == "paravirtualized" else "CUSTOM")
+        if launch not in {expected_launch, "CUSTOM"}:
+            blockers.append(f"OCI Compute.LaunchMode must be {expected_launch} or CUSTOM for this platform profile.")
         for item in config.get("import_options", {}).get("shape_compatibility", []):
             name = item.get("shape", "") if isinstance(item, dict) else str(item)
             if target == "vm" and name.startswith("BM.") or target == "bare_metal" and name.startswith("VM."):

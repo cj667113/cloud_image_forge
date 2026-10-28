@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from forge.engine import EngineError
+from forge.oci import OciConfig, compatibility_plan
 from forge.platform import MODULE_CONFIG, plan_platform, prepare_platform, verify_platform
 from forge.portability import (_local_root_completion, assess_portability, inspect_archive,
                                inspect_local_devices, inspect_portability)
@@ -80,6 +81,45 @@ def test_preserve_allows_same_machine_type_and_reconfigure_retains_old_rule():
     result = plan_platform(image(), options(strategy="reconfigure", source="vm"))
     assert not result["ready"]
     assert any("distinct" in error for error in result["blockers"])
+
+
+@pytest.mark.parametrize("network,mode,shape", [
+    ("paravirtualized", "PARAVIRTUALIZED", "VM.Standard.E5.Flex"),
+    ("accelerated", "ACCELERATEDPV", "VM.Standard.E6.Ax.Flex"),
+    ("paravirtualized", "CUSTOM", "VM.Standard.E5.Flex"),
+    ("accelerated", "CUSTOM", "VM.Standard.E6.Ax.Flex"),
+])
+def test_vm_to_vm_preserve_assesses_destination_without_a_driver_conversion(monkeypatch, network, mode, shape):
+    source = image()
+    before = deepcopy(source)
+    profile = options(source="vm", network_attachment=network)
+    config = OciConfig(guest={"prepare": False}, capabilities={
+        "Compute.LaunchMode": {"default_value": mode},
+        "Network.AttachmentType": {"default_value": "ACCELERATEDPV" if network == "accelerated" else "PARAVIRTUALIZED"}},
+        import_options={"shape_compatibility": [{"shape": shape}]})
+    preview = plan_platform(source, profile, oci_config=config.model_dump())
+    assert preview["ready"], preview["blockers"]
+    assert {"virtio_net", "virtio_pci"} <= set(preview["required_modules"])
+    assert "nvme" not in preview["required_modules"] and "mlx5_core" not in preview["required_modules"]
+    assert preview["fstab_changes"] == [] and preview["packages"] == []
+    assert not preview["boot_tested"]
+    # Isolate unrelated OCI guest prerequisites while keeping real platform and
+    # shape checks: the standalone preview and combined plan must agree.
+    monkeypatch.setattr("forge.oci_guest.plan_guest", lambda *a, **kw: {"changes": [], "warnings": [], "blockers": []})
+    combined = compatibility_plan(source, config, platform_migration=profile)
+    assert combined["ready_to_build"], combined["blockers"]
+    assert source == before
+
+
+@pytest.mark.parametrize("network,wrong_mode", [("paravirtualized", "ACCELERATEDPV"),
+                                               ("accelerated", "PARAVIRTUALIZED")])
+def test_preserve_preview_rejects_conflicting_preferred_launch_mode(network, wrong_mode):
+    config = OciConfig(guest={"prepare": False}, capabilities={
+        "Compute.LaunchMode": {"default_value": wrong_mode},
+        "Network.AttachmentType": {"default_value": "ACCELERATEDPV" if network == "accelerated" else "PARAVIRTUALIZED"}})
+    result = plan_platform(image(), options(source="vm", network_attachment=network), oci_config=config.model_dump())
+    assert not result["ready"]
+    assert any("Compute.LaunchMode" in message for message in result["blockers"])
 
 
 @pytest.mark.parametrize("driver", ["virtio_net", "virtio_pci", "virtio_scsi", "xfs", "dm_mod"])

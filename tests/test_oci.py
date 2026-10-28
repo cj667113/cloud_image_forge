@@ -241,6 +241,55 @@ def test_acceleron_shape_rejects_a_pv_only_image(ready_guest_plan, shape):
     assert any("supports only ACCELERATEDPV" in message for message in compatibility_plan({}, config)["blockers"])
 
 
+@pytest.mark.parametrize("shape", ["VM.Standard.E5.Flex", "VM.Standard.E6.Flex"])
+def test_pv_shapes_reject_accelerated_only_image(ready_guest_plan, shape):
+    config = accelerated_config(shape_compatibility=[{"shape": shape}])
+    plan = compatibility_plan({}, config)
+    assert not plan["ready_to_build"]
+    assert any(shape in message and "PARAVIRTUALIZED or VFIO" in message for message in plan["blockers"])
+
+
+@pytest.mark.parametrize("shape", ["VM.Standard.E5.Flex", "VM.Standard.E6.Flex"])
+@pytest.mark.parametrize("network", ["PARAVIRTUALIZED", "VFIO"])
+def test_pv_shapes_accept_each_documented_network_type(ready_guest_plan, shape, network):
+    config = OciConfig(capabilities={"Compute.LaunchMode": setting("CUSTOM"),
+                                    "Network.AttachmentType": setting(network)},
+                       import_options={"shape_compatibility": [{"shape": shape}]})
+    assert compatibility_plan({}, config)["ready_to_build"]
+
+
+@pytest.mark.parametrize("mode,network,destination", [
+    ("PARAVIRTUALIZED", "PARAVIRTUALIZED", "VM.Standard.E6.Ax.Flex"),
+    ("ACCELERATEDPV", "ACCELERATEDPV", "VM.Standard.E5.Flex"),
+    ("CUSTOM", "PARAVIRTUALIZED", "VM.Standard.E6.Ax.Flex"),
+])
+def test_multi_shape_network_support_warns_about_default_without_inventing_launch_override(
+        ready_guest_plan, mode, network, destination):
+    config = OciConfig(capabilities={"Compute.LaunchMode": setting(mode),
+                                    "Network.AttachmentType": setting(network, ["PARAVIRTUALIZED", "ACCELERATEDPV"])},
+                       import_options={"launch_mode": mode, "shape_compatibility": [
+                           {"shape": "VM.Standard.E5.Flex"}, {"shape": "VM.Standard.E6.Ax.Flex"}]})
+    original = config.model_dump()
+    plan = compatibility_plan({}, config)
+    assert plan["ready_to_build"], plan["blockers"]
+    assert any(destination in warning and "launchOptions.networkType" in warning for warning in plan["warnings"])
+    files = bundle_files(config, {})
+    launch = json.loads(files["instance-launch-options.json"])
+    assert launch["networkType"] == network
+    assert "launchMode" not in launch
+    assert "launchMode" not in json.loads(files["instance-launch-fragment.json"])
+    assert "preferred defaults" in files["README.txt"] and "override networkType" in files["README.txt"]
+    assert json.loads(files["schema-data.json"])["Network.AttachmentType"]["values"] == ["PARAVIRTUALIZED", "ACCELERATEDPV"]
+    assert config.model_dump() == original
+
+
+def test_network_shape_rules_do_not_guess_future_shape_support(ready_guest_plan):
+    config = accelerated_config(shape_compatibility=[{"shape": "VM.Standard.E7.Flex"}])
+    plan = compatibility_plan({}, config)
+    assert plan["ready_to_build"]
+    assert any("Verify the selected shapes" in warning for warning in plan["warnings"])
+
+
 def test_custom_mode_can_describe_accelerated_networking(ready_guest_plan):
     config = OciConfig(capabilities={"Compute.LaunchMode": setting("CUSTOM"), "Network.AttachmentType": setting("ACCELERATEDPV")})
     assert compatibility_plan({}, config)["ready_to_build"]
@@ -260,8 +309,8 @@ def test_import_mode_does_not_invent_image_capability_membership(ready_guest_pla
     assert json.loads(files["schema-data.json"])["Compute.LaunchMode"]["values"] == ["CUSTOM"]
 
 
-@pytest.mark.parametrize("shape", ["VM.Standard.E6.Ax.Flex", "BM.Standard.E5.192"])
-def test_reviewed_x86_shapes_reject_arm_guest(ready_guest_plan, shape):
+@pytest.mark.parametrize("shape", ["VM.Standard.E5.Flex", "VM.Standard.E6.Flex", "VM.Standard.E6.Ax.Flex", "BM.Standard.E5.192"])
+def test_known_x86_shapes_reject_arm_guest(ready_guest_plan, shape):
     config = accelerated_config(shape_compatibility=[{"shape": shape}])
     assert any("requires x86_64" in message for message in compatibility_plan({"os": {"arch": "aarch64"}}, config)["blockers"])
 

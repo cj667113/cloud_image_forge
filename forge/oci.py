@@ -27,6 +27,12 @@ CHECKED_ON = "2026-10-28"
 STORAGE_TYPES = ["ISCSI", "SCSI", "IDE", "PARAVIRTUALIZED"]
 ACCELERATED_VM_SHAPES = {"VM.Standard.E6.Ax.Flex", "VM.DenseIO.E6.Ax.Flex",
                          "VM.Standard4.Ax.Flex", "VM.Standard.A4.Ax.Flex"}
+# Exact documented shapes only: similar names do not establish attachment support.
+SHAPE_NETWORK_TYPES = {
+    **{shape: frozenset({"ACCELERATEDPV"}) for shape in ACCELERATED_VM_SHAPES},
+    "VM.Standard.E5.Flex": frozenset({"PARAVIRTUALIZED", "VFIO"}),
+    "VM.Standard.E6.Flex": frozenset({"PARAVIRTUALIZED", "VFIO"}),
+}
 
 
 def descriptor(kind, default, values=None):
@@ -58,7 +64,7 @@ DETAILS = {
     "Compute.Firmware": ("Firmware", "Verify BIOS/UEFI boot support for every advertised firmware. Optional BIOS-to-UEFI migration must pass its prerequisites and final inspection; metadata alone cannot install a bootloader."),
     "Compute.SecureBoot": ("Secure Boot", "OCI does not support Secure Boot for custom images; this must remain disabled."),
     "Compute.LaunchMode": ("Launch mode", "Match the device model to the guest drivers. Use CUSTOM for mixed settings; import mode is a separate OCI operation."),
-    "Network.AttachmentType": ("Primary network attachment", "Prepare emulated, hardware-assisted, PV, or Accelerated PV networking. Accelerated PV uses VirtIO guest drivers on the reviewed E6 Ax VM and requires a supported Acceleron shape, compatible image, and regional schema."),
+    "Network.AttachmentType": ("Primary network attachment", "Validate or prepare emulated, hardware-assisted, PV, or Accelerated PV networking. The reviewed E5 and E6 Ax VMs share VirtIO guest drivers; PV and Accelerated PV remain distinct OCI attachment values supported by different shapes. The image capabilities and destination region must allow the selected value."),
     "Network.IPv6Only": ("IPv6-only networking", "Configure IPv6-capable networking. OCI requires prior IPv6-only validation; VCN/subnet configuration remains external."),
     "Storage.BootVolumeType": ("Boot volume attachment", "Prepare boot storage drivers and initramfs, including early networking for iSCSI boot."),
     "Storage.LocalDataVolumeType": ("Local data volume attachment", "Include drivers for the selected local data volume attachment types."),
@@ -339,12 +345,20 @@ def compatibility_plan(inspection: dict, config: OciConfig, allow_network=False,
         if (inspection.get("os", {}).get("arch") == "x86_64"
                 and re.match(r"^(?:VM|BM)\.Standard\.A(?:1|2|4)\.", shape.shape)):
             plan["blockers"].append(f"{shape.shape} is an Arm shape. An x86_64 image cannot be converted to Arm by changing image capabilities.")
-        if shape.shape in ACCELERATED_VM_SHAPES and "ACCELERATEDPV" not in allowed.get("Network.AttachmentType", []):
-            plan["blockers"].append(f"{shape.shape} supports only ACCELERATEDPV networking. Include it in the allowed network attachment types.")
-        if shape.shape in {"VM.Standard.E6.Ax.Flex", "BM.Standard.E5.192"}:
+        supported_networks = SHAPE_NETWORK_TYPES.get(shape.shape)
+        if supported_networks is not None:
+            usable_networks = supported_networks.intersection(allowed.get("Network.AttachmentType", []))
+            if not usable_networks:
+                supported = " or ".join(sorted(supported_networks))
+                plan["blockers"].append(f"{shape.shape} supports only {supported} networking. Include a supported value in the allowed network attachment types.")
+            elif network not in supported_networks:
+                usable = " or ".join(sorted(usable_networks))
+                plan["warnings"].append(f"{shape.shape} does not support preferred network attachment {network}. For this destination, set launchOptions.networkType to {usable}, which the image allows, and verify the image's launch capabilities. The generated launch-options file contains the preferred default; shared guest drivers do not make OCI attachment values interchangeable.")
+        if shape.shape in {"VM.Standard.E5.Flex", "VM.Standard.E6.Flex", "VM.Standard.E6.Ax.Flex", "BM.Standard.E5.192"}:
             arch = inspection.get("os", {}).get("arch")
             if arch and arch != "x86_64":
                 plan["blockers"].append(f"{shape.shape} requires x86_64; changing image capabilities cannot convert the guest architecture.")
+        if shape.shape in {"VM.Standard.E5.Flex", "VM.Standard.E6.Ax.Flex", "BM.Standard.E5.192"}:
             if "UEFI_64" not in allowed.get("Compute.Firmware", []):
                 plan["warnings"].append(f"The reviewed {shape.shape} host uses UEFI. BIOS compatibility has not been established by that host audit.")
         if shape.shape == "BM.Standard.E5.192":
@@ -434,6 +448,9 @@ def bundle_files(config: OciConfig, artifact: dict) -> dict[str, str]:
         "5. Inspect the imported image and capability schema before launching:\n"
         "   oci compute image get --image-id IMAGE_OCID\n"
         "   instance-launch-options.json is an optional --launch-options fragment for instance launch, not an image-update payload.\n"
+        "   It contains the preferred defaults. For an image spanning shapes with different networking support,\n"
+        "   override networkType with a destination-supported value allowed by the image and verify its launch capabilities.\n"
+        "   PV and Accelerated PV may share VirtIO guest drivers; selecting a different OCI network value does not imply a driver swap.\n"
         "   instance-launch-fragment.json also includes top-level isPvEncryptionInTransitEnabled; merge it\n"
         "   into a complete instance launch request to configure boot/block encryption. It is not a complete launch request.\n"
         "   Launch mode comes from the image import/capability configuration; it is not a LaunchInstanceDetails field.\n"

@@ -1,6 +1,6 @@
 # OCI image compatibility
 
-Reviewed against Oracle's public documentation and two running hosts on **2026-10-28**.
+Reviewed against Oracle's public documentation and running source/clone hosts on **2026-10-28**.
 
 OCI image compatibility has three parts: the software and boot layout inside the disk, the image's cloud capability schema, and the hardware/network/storage selected when an instance is launched. A QCOW2 conversion only changes the disk container. Declaring a capability does not install a driver or prove that an instance boots.
 
@@ -81,7 +81,7 @@ To prepare an E6 Ax candidate, select **Accelerated PV** for the preferred netwo
 
 For the reviewed E5 bare-metal target, use **VM → Bare metal**, iSCSI boot, hardware/VFIO networking, and the `mlx5_core` NIC driver. Keep UEFI and allow iSCSI/VFIO in the OCI capabilities. When `BM.Standard.E5.192` is a shape entry, validation requires that actual driver instead of accepting an unrelated installed VF driver. In this context VFIO is OCI's launch setting; the physical Linux NIC is bound to `mlx5_core`, not `vfio-pci`. The existing preparation workflow requires firmware iSCSI discovery and complete early networking in the initramfs. It preserves the observed numeric `node.session.timeo.replacement_timeout` policy while removing machine-specific targets and identities during migration. It does not copy live host addresses, IQNs, or credentials.
 
-The platform images contain firmware-iSCSI arguments even on the running PV VM; those arguments alone do not prove that a guest actually booted over iSCSI. Transport selection must also use storage and firmware evidence. Forge's explicit VM migration removes iSCSI boot dependencies; the bare-metal path prepares them. The shared filesystem layout is already covered by the supported XFS/LVM rebuild workflow, subject to each imported image's own inspection and sizing checks.
+The platform images contain firmware-iSCSI arguments even on the running PV VM; those arguments alone do not prove that a guest actually booted over iSCSI. Transport selection must also use storage and firmware evidence. Forge's **Reconfigure** VM path removes iSCSI boot dependencies; its bare-metal path prepares them. **Preserve & validate** can retain verified optional discovery. The shared filesystem layout is already covered by the supported XFS/LVM rebuild workflow, subject to each imported image's own inspection and sizing checks.
 
 Oracle publishes [engineering guidance for preparing external images for VM and bare-metal boot](https://blogs.oracle.com/cloud-infrastructure/enabling-external-custom-images-virtual-and-bare-metal), while its [BYOI reference still excludes bare-metal support](https://docs.oracle.com/en-us/iaas/Content/Compute/References/bringyourownimage.htm). Forge therefore retains the experimental designation for bare-metal preparation. These audits did not import, launch, or reboot a Forge-built image on either new machine; destination boot validation remains outstanding.
 
@@ -96,6 +96,32 @@ Oracle cloud-init completed first-boot provisioning and wrote a DHCP profile for
 Forge now offers **Preserve & validate** to check existing prerequisites without rewriting hardware configuration. **Reconfigure** remains available when adaptation is required. The preserve assessment distinguishes optional firmware discovery from mandatory network-root requirements and treats unreadable or unsupported evidence as unknown. See [preservation behavior and boot logic](storage-and-platform.md#optional-firmware-discovery-and-local-root-discovery).
 
 Native OCI custom-image capture is distinct from importing an external BYOI image onto bare metal. OCI custom images inherit compatible shapes from their base image; the service launch configuration still determines the exposed devices. [OCI custom-image behavior](https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/managingcustomimages.htm)
+
+### E6 Ax to E5 Flex native-image portability
+
+A separate read-only comparison examined a `VM.Standard.E5.Flex` launched directly from the reviewed `VM.Standard.E6.Ax.Flex` instance's custom image, without Forge processing. SSH and the running root filesystem confirmed the clone was operational. IMDS confirmed both shape names. The individual launch-mode and launch-options metadata endpoints were unavailable, so this audit does not claim to have retrieved the instances' control-plane `networkType` fields or the custom image's capability schema.
+
+| Observed property | E6 Ax source | E5 Flex clone |
+| --- | --- | --- |
+| Linux NIC driver | `virtio_net` over `virtio-pci` | Same |
+| NIC PCI device | Modern VirtIO `1af4:1041`, address `00:05.0` | Same |
+| NIC subsystem | Oracle `108e:1200` | Oracle `108e:1100` |
+| NIC name | `enp0s5` | Same |
+| Boot controller | VirtIO SCSI `1af4:1048`, subsystem `108e:1100` | Same |
+| Kernel | UEK `6.12.0-207.111.5.1.el9uek.x86_64` | Same version and SHA-256 |
+| Initramfs and boot configuration | Existing OCI image configuration | Identical initramfs, GRUB defaults/generated menu, BLS and kernel-command-line hashes |
+| Root and firmware | UEFI, local XFS/LVM root; no iBFT or iSCSI sessions | Same |
+| Network identity | Source NIC MAC and generated DHCP profile | New MAC; generated DHCP profile matches the destination NIC |
+
+Oracle documents **AcceleratedPV** as the only E6 Ax networking type and **Paravirtualized/SR-IOV** for E5 Flex. The E5 guest's observed VirtIO NIC is consistent with the PV path. Acceleron describes the infrastructure providing the Ax data plane; it does not imply a separate Linux driver named Acceleron. Both observed devices bind to the existing VirtIO driver stack. The different subsystem IDs alone do not call for replacing that driver or rebuilding the initramfs. [Shape networking types](https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/edit-launch-options.htm)
+
+Cloud-init completed on both machines, and their cached instance identities matched their respective IMDS identities. The clone's cloud-init-generated `ifcfg-enp0s5` uses DHCP, is enabled at boot, and matches the clone's new MAC. Cloud configuration and dracut configuration hashes matched the source. The existing narrow Oracle bootstrap validator reported ready for both guests; no additional network-rewrite adapter was needed for this evidence.
+
+This move retains PV storage at both ends. Its portability is supported by the existing shared drivers, stable root identity and working first-boot networking. The retained iSCSI discovery arguments are a separate optional path; an iSCSI failure is not what converts AcceleratedPV networking to ordinary PV. The running clone establishes this native capture's behavior in the tested direction, without certifying every custom image or a Forge-built export.
+
+In Forge, use **Preserve & validate → Virtual machine → Virtual machine**, PV boot, and the destination's network attachment. For the E5 target select **Paravirtualized**; for an E6 Ax target select **Accelerated PV**. Keep OCI guest preparation at **Validate only** to retain existing hardware configuration. A source image's origin and PCI subsystem ID do not select the destination attachment automatically.
+
+An image intended for both destinations can advertise both network values when its guest and regional capability schema support them. Forge checks that each known shape has a supported allowed network choice. An AcceleratedPV-only image cannot advertise E5/E6 non-Ax support, and a PV-only image cannot advertise Ax support. When a portable image's preferred settings do not match an advertised shape, its generated default launch fragment needs destination-specific review. `LaunchOptions.networkType` can override network defaults; `launchMode` is not a top-level `LaunchInstanceDetails` field. [Launch options](https://docs.oracle.com/en-us/iaas/tools/python/latest/api/core/models/oci.core.models.LaunchOptions.html), [instance launch fields](https://docs.oracle.com/en-us/iaas/tools/python/latest/api/core/models/oci.core.models.LaunchInstanceDetails.html)
 
 ## Supported values and preferred values
 
