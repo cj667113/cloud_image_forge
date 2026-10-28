@@ -238,13 +238,17 @@ def compatibility_plan(inspection: dict, config: OciConfig, allow_network=False,
     platform_plan = None
     platform_nic_driver = None
     evidence = inspection
+    preserve_platform = bool(platform_migration and platform_migration.get("enabled")
+                             and platform_migration.get("strategy", "reconfigure") == "preserve")
     bm_e5_selected = any(shape.shape == "BM.Standard.E5.192" for shape in config.import_options.shape_compatibility)
     if platform_migration and platform_migration.get("enabled"):
         from copy import deepcopy
         from .platform import plan_platform
         platform_plan = plan_platform(inspection, platform_migration, allow_network, config.model_dump(),
                                       target_provider="oci", boot_migration=boot_migration)
-        if platform_plan["ready"]:
+        if platform_migration.get("network_attachment") == "vfio":
+            platform_nic_driver = platform_migration.get("nic_driver")
+        if platform_plan["ready"] and not preserve_platform:
             # This is explicitly planned evidence. The engine applies migration
             # first, then repeats OCI preparation against the actual working disk.
             evidence = deepcopy(inspection)
@@ -282,7 +286,12 @@ def compatibility_plan(inspection: dict, config: OciConfig, allow_network=False,
             plan[field] = list(platform_plan.get("actions" if field == "changes" else field, [])) + plan[field]
     if platform_plan:
         plan["platform_migration"] = platform_plan
-        plan["warnings"].append("Machine migration changes are planned. OCI preparation is checked again after those changes are applied to the working disk.")
+        if preserve_platform:
+            plan["warnings"].append("Hardware preservation uses existing inspected evidence; no missing drivers, networking or firmware are projected as prepared. Explicit edits elsewhere are checked again before export.")
+            if config.guest.prepare:
+                plan["blockers"].append("Preserve and validate requires OCI guest preparation disabled; use Validate only or select Reconfigure.")
+        else:
+            plan["warnings"].append("Machine migration changes are planned. OCI preparation is checked again after those changes are applied to the working disk.")
     if migration_plan:
         plan["boot_migration"] = migration_plan
         if pending:

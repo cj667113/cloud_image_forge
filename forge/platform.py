@@ -21,6 +21,7 @@ from .oci_guest import _glob, _network_files, _read
 
 MODULE_CONFIG = {**OCI_MODULE_CONFIG, "nvme": "CONFIG_BLK_DEV_NVME", "nvme_core": "CONFIG_NVME_CORE",
                  "ahci": "CONFIG_SATA_AHCI", "iscsi_ibft": "CONFIG_ISCSI_IBFT",
+                 "dm_mod": "CONFIG_BLK_DEV_DM", "xfs": "CONFIG_XFS_FS", "ext4": "CONFIG_EXT4_FS",
                  "ixgbe": "CONFIG_IXGBE", "i40e": "CONFIG_I40E", "mlx4_en": "CONFIG_MLX4_EN",
                  "bnxt_en": "CONFIG_BNXT"}
 NIC_DRIVERS = {"ixgbe", "ixgbevf", "i40e", "iavf", "mlx4_en", "mlx5_core", "bnxt_en"}
@@ -254,7 +255,7 @@ def inspect_platform(g, root, partitions, kernels, oci_evidence=None):
     """Optional evidence must not prevent ordinary inspection of older images."""
     try:
         return _inspect_platform(g, root, partitions, kernels, oci_evidence)
-    except (RuntimeError, ValueError, KeyError, TypeError, OverflowError) as exc:
+    except (RuntimeError, ValueError, KeyError, TypeError, OverflowError, AttributeError) as exc:
         return {"version": 1, "errors": ["Cannot verify optional platform migration prerequisites: " + str(exc)],
                 "boot_tested": False}
 
@@ -293,6 +294,7 @@ def _generated_grub_evidence(g, partitions):
 def _inspect_platform(g, root, partitions, kernels, oci_evidence=None):
     """Read evidence only; old imports need refreshing before migration."""
     from .oci_guest import inspect_guest
+    from .portability import inspect_archive, inspect_portability
     base = deepcopy(oci_evidence) if oci_evidence is not None else inspect_guest(g, root, partitions, kernels)
     inventory = {}
     for path in kernels:
@@ -305,7 +307,7 @@ def _inspect_platform(g, root, partitions, kernels, oci_evidence=None):
         builtin = _module_inventory(g, version, _read(g, f"/lib/modules/{version}/modules.builtin"))
         builtin.update(name for name, option in MODULE_CONFIG.items() if config.get(option) == "y")
         initrd = old.get("initrd")
-        listed, iscsi_userspace = None, False
+        listed, iscsi_userspace, members = None, False, None
         digest = None
         if initrd:
             try:
@@ -321,7 +323,8 @@ def _inspect_platform(g, root, partitions, kernels, oci_evidence=None):
                 pass
         inventory[version] = {"modules": sorted(installed), "builtin": sorted(builtin),
                               "initrd": initrd, "initrd_modules": listed, "initrd_sha256": digest,
-                              "initrd_iscsi_userspace": iscsi_userspace}
+                              "initrd_iscsi_userspace": iscsi_userspace,
+                              "portability": inspect_archive(g, initrd, members)}
     tools = dict(base.get("tools", {}))
     for name in ("iscsistart", "iscsid", "iscsi-iname", "dnf", "yum", "apt-get"):
         tools[name] = any(g.is_file(directory + "/" + name) for directory in ("/usr/sbin", "/usr/bin", "/sbin", "/bin"))
@@ -336,7 +339,7 @@ def _inspect_platform(g, root, partitions, kernels, oci_evidence=None):
             persistent.append(path)
     environment, environment_errors, environment_paths = _inspect_boot_environment(g)
     generated, generated_errors = _generated_grub_evidence(g, partitions)
-    return {"version": 1, "kernels": inventory, "tools": tools, "fstab": _fstab_evidence(g, partitions),
+    result = {"version": 1, "kernels": inventory, "tools": tools, "fstab": _fstab_evidence(g, partitions),
             "boot_files": boot_files, "persistent_network_files": persistent,
             "generated_grub": generated, "generated_grub_errors": generated_errors,
             "boot_environment": environment, "boot_environment_errors": environment_errors,
@@ -349,6 +352,11 @@ def _inspect_platform(g, root, partitions, kernels, oci_evidence=None):
             "os_version": base.get("os_version", {}),
             "blacklisted_modules": base.get("blacklisted_modules", []),
             "boot_tested": False}
+    try:
+        result["portability"] = inspect_portability(g, partitions, result, base)
+    except (RuntimeError, ValueError, AttributeError, TypeError) as exc:
+        result["portability"] = {"version": 1, "errors": ["Cannot inspect preservation prerequisites: " + str(exc)]}
+    return result
 
 
 def _boot_args(text, *, assignment=False, environment=None):
@@ -448,16 +456,79 @@ def _firmware(inspection, options, boot_migration, allow_network):
     return available, chosen, planned
 
 
+def _plan_preserve(inspection, options, plan, oci_config, target_provider, boot_migration=None, allow_network=False):
+    from .portability import assess_portability
+    blockers, warnings = plan["blockers"], plan["warnings"]
+    target, network, boot = options.get("target"), options.get("network_attachment"), options.get("boot_attachment")
+    if options.get("source") not in {"vm", "bare_metal"} or target not in {"vm", "bare_metal"}:
+        blockers.append("Select valid source and target machine types; the prior machine is not inferred from disk contents.")
+    if boot not in {"paravirtualized", "iscsi"} or network not in {"paravirtualized", "accelerated", "vfio"}:
+        blockers.append("Select a supported target boot and network attachment profile.")
+    if network == "vfio" and options.get("nic_driver") not in NIC_DRIVERS:
+        blockers.append("Select the actual target physical/VF NIC driver to validate existing coverage.")
+    if target == "bare_metal" and (boot != "iscsi" or network != "vfio"):
+        blockers.append("The supported bare-metal assessment profile uses firmware iSCSI boot and a selected hardware NIC.")
+    if any(options.get(name) for name in ("install_packages", "configure_network", "configure_serial_console")):
+        blockers.append("Preserve mode does not install packages or rewrite networking/serial settings. Disable those changes or choose Reconfigure.")
+    if inspection.get("os", {}).get("arch") != "x86_64":
+        blockers.append("Existing hardware validation supports x86_64 Linux images only.")
+    if target_provider not in {"oci", "generic"}:
+        blockers.append("Hardware preservation validation is available for OCI and generic exports.")
+    available, firmware, planned = _firmware(inspection, options, boot_migration, allow_network)
+    selected = _dict(oci_config).get("capabilities", {}).get("Compute.Firmware", {}).get("default_value")
+    if selected in available:
+        firmware = selected
+    if not available or target == "bare_metal" and "UEFI_64" not in available:
+        blockers.append("A detected compatible boot chain is required; the bare-metal profile requires UEFI.")
+    plan.update(effective_firmware=firmware, planned_firmware=planned)
+    assessment = assess_portability(inspection, options, target_provider)
+    plan["portability"] = assessment
+    plan["required_modules"] = assessment.get("required_modules", [])
+    blockers.extend(assessment["blockers"])
+    warnings.extend(assessment["warnings"])
+    plan["actions"] = ["Validate existing target boot prerequisites and retain boot, initramfs, mount and network configuration without rewriting."]
+    plan["fstab_changes"] = []
+    plan["network_backend"] = inspection.get("platform", {}).get("network_backend")
+    if oci_config is not None:
+        config = _dict(oci_config)
+        if config.get("guest", {}).get("prepare", True):
+            blockers.append("Preserve mode requires OCI guest preparation to be disabled; it would rewrite the configuration being retained.")
+        expected = {"Storage.BootVolumeType": "ISCSI" if boot == "iscsi" else "PARAVIRTUALIZED",
+                    "Network.AttachmentType": {"vfio": "VFIO", "accelerated": "ACCELERATEDPV"}.get(network, "PARAVIRTUALIZED")}
+        if firmware:
+            expected["Compute.Firmware"] = firmware
+        for key, wanted in expected.items():
+            choice = config.get("capabilities", {}).get(key, {})
+            if choice.get("default_value") != wanted or wanted not in (choice.get("values") or [choice.get("default_value")]):
+                blockers.append(f"OCI {key} must allow and prefer {wanted} to match the target being validated.")
+        for item in config.get("import_options", {}).get("shape_compatibility", []):
+            name = item.get("shape", "") if isinstance(item, dict) else str(item)
+            if target == "vm" and name.startswith("BM.") or target == "bare_metal" and name.startswith("VM."):
+                warnings.append(f"{name} is outside the selected {target} target assessment; its prerequisites are not established by this result.")
+    if target == "bare_metal":
+        warnings.append("Oracle's external BYOI import restriction differs from OCI-native custom images captured from a platform image. This offline assessment cannot establish import eligibility or shape compatibility.")
+    warnings.append("Preserve applies to hardware preparation. Explicit edits in other steps run first and are validated again; resulting bootability still needs a target launch.")
+    plan["blockers"] = list(dict.fromkeys(blockers))
+    plan["warnings"] = list(dict.fromkeys(warnings))
+    plan["ready"] = not plan["blockers"]
+    return plan
+
+
 def plan_platform(inspection, options, allow_network=False, oci_config=None, target_provider="oci", boot_migration=None):
     options = _dict(options)
     requested = options.get("enabled", False)
     plan = {"requested": bool(requested), "ready": True, "source": options.get("source"), "target": options.get("target"),
+            "strategy": options.get("strategy", "reconfigure"),
             "actions": [], "blockers": [], "warnings": [], "required_modules": [], "packages": [],
             "effective_firmware": None, "provider_supported": options.get("target") != "bare_metal",
             "experimental": options.get("target") == "bare_metal", "boot_tested": False, "sources": SOURCES,
             "fstab_changes": [], "network_backend": None, "initramfs_backend": None}
     if not requested:
         return plan
+    if plan["strategy"] == "preserve":
+        return _plan_preserve(inspection, options, plan, oci_config, target_provider, boot_migration, allow_network)
+    if plan["strategy"] != "reconfigure":
+        plan["blockers"].append("Unsupported hardware preparation strategy.")
     blockers, warnings, actions = plan["blockers"], plan["warnings"], plan["actions"]
     source, target = options.get("source"), options.get("target")
     boot, network, nic = options.get("boot_attachment"), options.get("network_attachment"), options.get("nic_driver")
@@ -797,6 +868,18 @@ def verify_platform(inspection, options, *, oci_config=None, target_provider="oc
     plan = plan_platform(inspection, options, False, oci_config, target_provider)
     if not plan["requested"]:
         return plan
+    if options.get("strategy") == "preserve":
+        expected = (receipt or {}).get("preserved_files")
+        if receipt is not None and not expected:
+            plan["blockers"].append("The preservation receipt has no baseline file fingerprints.")
+        if expected is not None:
+            actual = inspection.get("platform", {}).get("portability", {}).get("hashes", {})
+            changed = sorted(path for path in set(actual) | set(expected) if actual.get(path) != expected.get(path))
+            if changed:
+                plan["blockers"].append("Preserved boot/network configuration changed after validation: " + ", ".join(changed[:20]))
+        plan["ready"] = not plan["blockers"]
+        plan["verified"] = plan["ready"]
+        return plan
     blockers = plan["blockers"]
     evidence = inspection.get("platform") or {}
     if plan["fstab_changes"]:
@@ -859,6 +942,16 @@ def prepare_platform(work: Path, inspection, options, allow_network, log, *, oci
         return plan
     if not plan["ready"]:
         raise EngineError("Platform preparation blocked: " + " ".join(plan["blockers"]))
+    if options.get("strategy") == "preserve":
+        # Re-read the actual working image after the user's explicit edits.
+        # This branch never opens a writable guest or runs a guest command.
+        current = ImageEngine().inspect(work)
+        final = verify_platform(current, options, oci_config=oci_config, target_provider=target_provider)
+        if not final["ready"]:
+            raise EngineError("Existing hardware configuration cannot be preserved: " + " ".join(final["blockers"]))
+        final["preserved_files"] = deepcopy(current["platform"]["portability"]["hashes"])
+        log("Existing hardware boot prerequisites verified; boot files, initramfs and network settings retained without rewriting")
+        return final
     for action in plan["actions"]:
         log("Platform: " + action)
     if plan["packages"]:

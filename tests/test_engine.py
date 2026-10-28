@@ -199,6 +199,17 @@ class CommandTests(unittest.TestCase):
 
 
 class RecipeTests(unittest.TestCase):
+    def test_preservation_rejects_automatic_mutations_before_disk_commands(self):
+        base = {"enabled": True, "strategy": "preserve"}
+        for field in ("install_packages", "configure_network", "configure_serial_console"):
+            with self.subTest(field=field), self.assertRaisesRegex(EngineError, "Preserve and validate"):
+                _validate_recipe({"platform_migration": {**base, field: True}}, inspection())
+        for oci in ({}, {"guest": {"prepare": True}}):
+            with self.subTest(oci=oci), self.assertRaisesRegex(EngineError, "OCI guest preparation disabled"):
+                _validate_recipe({"target": "oci", "platform_migration": base, "oci": oci}, inspection())
+        _validate_recipe({"target": "oci", "platform_migration": base,
+                          "oci": {"guest": {"prepare": False}}}, inspection())
+
     def test_xfs_shrink_is_blocked_before_disk_commands(self):
         recipe = {"partition_changes": [{"device": "/dev/sda2", "size_mib": 512}]}
         with self.assertRaisesRegex(EngineError, "XFS and LVM"):
@@ -235,6 +246,63 @@ class RecipeTests(unittest.TestCase):
 
 
 class BuildTests(unittest.TestCase):
+    def test_preservation_validates_after_explicit_edits_and_before_publication(self):
+        for final_ready in (True, False):
+            with self.subTest(final_ready=final_ready), tempfile.TemporaryDirectory() as directory:
+                directory = Path(directory)
+                source = directory / "source.qcow2"
+                source.write_bytes(qcow_header())
+                original = source.read_bytes()
+                info = inspection()
+                edited = {**info, "test_stage": "after-explicit-edits"}
+                final = {**info, "test_stage": "final-working-disk"}
+                events, conversions = [], []
+                engine = ImageEngine()
+                receipt = {"warnings": [], "preservation_manifest": {"kernel": "unchanged-hash"}}
+                plan = {"requested": True, "ready": True, "blockers": [], "required_modules": []}
+                recipe = {"target": "generic", "output_format": "qcow2", "sparsify": True,
+                          "platform_migration": {"enabled": True, "strategy": "preserve"},
+                          "kernel_args": "loglevel=4"}
+
+                def run(command, log=None):
+                    if command[:2] == ["qemu-img", "convert"]:
+                        conversions.append(command)
+                        Path(command[-1]).write_bytes(qcow_header())
+                    if command[0] == "virt-sparsify":
+                        events.append("sparsify")
+                    return ""
+
+                def prepare(work, current, *args, **kwargs):
+                    self.assertEqual(current, edited)
+                    self.assertEqual(events, ["explicit-edits"])
+                    events.append("preserve-baseline")
+                    return receipt
+
+                def verify(current, *args, **kwargs):
+                    self.assertEqual(current, final)
+                    self.assertIs(kwargs["receipt"], receipt)
+                    self.assertEqual(events, ["explicit-edits", "preserve-baseline", "sparsify"])
+                    return {"ready": final_ready, "blockers": [] if final_ready else ["Preserved boot file changed"],
+                            "strategy": "preserve", "boot_tested": False}
+
+                with patch("forge.engine._run", side_effect=run), \
+                        patch("forge.engine._image_info", return_value={"virtual-size": info["virtual_size"]}), \
+                        patch.object(engine, "capabilities", return_value={"available": True}), \
+                        patch.object(engine, "inspect", side_effect=[edited, final]), \
+                        patch.object(engine, "_customize", side_effect=lambda *a: events.append("explicit-edits")), \
+                        patch("forge.platform.plan_platform", return_value=plan), \
+                        patch("forge.platform.prepare_platform", side_effect=prepare), \
+                        patch("forge.platform.verify_platform", side_effect=verify):
+                    if final_ready:
+                        result = engine.build(source, directory / "build", info, recipe, lambda _: None)
+                        self.assertEqual(result["platform_migration"]["strategy"], "preserve")
+                        self.assertFalse(result["platform_migration"]["boot_tested"])
+                    else:
+                        with self.assertRaisesRegex(EngineError, "Preserved boot file changed"):
+                            engine.build(source, directory / "build", info, recipe, lambda _: None)
+                self.assertEqual(len(conversions), 2 if final_ready else 1)
+                self.assertEqual(source.read_bytes(), original)
+
     def run_build(self, *, output_format="qcow2", compare_failure=False, virtual_size=10 * GIB):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)

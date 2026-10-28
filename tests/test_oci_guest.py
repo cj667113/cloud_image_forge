@@ -35,6 +35,19 @@ def inspected():
 
 
 class PlanTests(unittest.TestCase):
+    def test_verified_oracle_bootstrap_can_preserve_prior_nic_profiles_without_claiming_ipv6(self):
+        image, profile = inspected(), config(prepare=False)
+        image["oci_evidence"].update(network_ready=False, cloud_init_ready=False)
+        self.assertTrue(plan_guest(image, profile)["blockers"])
+        image["platform"] = {"portability": {"version": 1, "network_bootstrap": {"version": 1, "ready": True}}}
+        self.assertFalse(plan_guest(image, profile)["blockers"])
+        self.assertTrue(any("first-boot DHCP" in warning for warning in plan_guest(image, profile)["warnings"]))
+        profile["capabilities"]["Network.IPv6Only"] = {"default_value": True, "values": None}
+        self.assertTrue(any("network" in item.lower() for item in plan_guest(image, profile)["blockers"]))
+        profile["capabilities"]["Network.IPv6Only"]["default_value"] = False
+        image["platform"]["portability"]["network_blockers"] = ["Renderer is masked"]
+        self.assertTrue(plan_guest(image, profile)["blockers"])
+
     def test_acceleratedpv_uses_audited_guest_virtio_without_inventing_nvme(self):
         image, profile = inspected(), config()
         profile["capabilities"]["Network.AttachmentType"] = {"default_value": "ACCELERATEDPV", "values": ["ACCELERATEDPV"]}
@@ -160,7 +173,7 @@ class PlanTests(unittest.TestCase):
         image, profile = inspected(), config(configure_network=False)
         profile["capabilities"]["Network.IPv6Only"]["default_value"] = True
         image["oci_evidence"]["network_ready"] = False
-        self.assertTrue(any("DHCP/IPv6" in item for item in plan_guest(image, profile)["blockers"]))
+        self.assertTrue(any("IPv6" in item and "network" in item for item in plan_guest(image, profile)["blockers"]))
 
     def test_ipv6_modular_config_requires_installed_module(self):
         image, profile = inspected(), config()

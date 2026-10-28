@@ -45,7 +45,18 @@ Minimum sizes include measured use and conservative headroom, but sparse files c
 
 ## VM to bare metal, and bare metal to VM
 
-Destination offers explicit source and target machine types. Offline images do not establish whether the original machine was virtual or physical, and the target's NIC cannot be inferred from them. Select the actual target hardware driver.
+**Destination → Hardware compatibility** offers two behaviors. Leave the feature off to keep the existing export workflow; enable it to check or prepare a specific hardware target. Offline images do not establish whether the original machine was virtual or physical, and the target's NIC cannot be inferred from them. Select the actual target hardware driver when using physical networking.
+
+| Behavior | Purpose | Guest changes by hardware preparation |
+| --- | --- | --- |
+| **Preserve & validate** | Check an image that may already support the destination, including an OCI-native image captured from another machine type | None; retain existing boot files, initramfs, mount references, and networking |
+| **Reconfigure** | Prepare an image whose existing configuration needs adaptation | Back up and update mounts, transport arguments, initramfs and explicitly selected network/console settings |
+
+New UI checks start with **Preserve & validate**. Existing API recipes that omit `strategy` retain their previous `reconfigure` behavior. Preservation can check the same declared source and target type; a reconfiguration still requires distinct source and target types. The selected target is checked independently; passing a VM check does not also certify bare-metal compatibility.
+
+Preservation requires actual offline evidence from each non-rescue kernel and its initramfs, a resolvable local root, compatible firmware and destination drivers, and an established network startup path. A missing requirement blocks the check. An unreadable archive, unsupported boot syntax, or unrecognized provisioning implementation is **unknown**, which also prevents export in preservation mode. Neither outcome establishes that the original image cannot boot; it means Forge cannot prove the selected offline prerequisites without further work. Refresh older inspections to collect this evidence.
+
+OCI guest preparation must be set to **Validate only** while preserving hardware settings. Otherwise it would independently rebuild initramfs and replace networking. Other explicitly requested operations—such as filesystem resizing or edits in Boot & kernel—still run. The preservation baseline is taken after those edits; final verification checks readiness and retained configuration before publishing the converted artifact. This mode does not promise that the entire exported image is byte-identical to the imported source.
 
 `POST /api/images/{image_id}/platform/plan` accepts, for example:
 
@@ -55,21 +66,46 @@ Destination offers explicit source and target machine types. Offline images do n
   "allow_network": false,
   "platform_migration": {
     "enabled": true,
+    "strategy": "preserve",
     "source": "bare_metal",
     "target": "vm",
     "boot_attachment": "paravirtualized",
     "network_attachment": "paravirtualized",
     "nic_driver": null,
     "install_packages": false,
-    "configure_network": true,
-    "configure_serial_console": true
+    "configure_network": false,
+    "configure_serial_console": false
   }
 }
 ```
 
-For the experimental bare-metal profile, use `source: "vm"`, `target: "bare_metal"`, iSCSI boot, hardware/VFIO networking and an explicit supported `nic_driver`. UEFI must be detected or provided by an eligible separately enabled BIOS-to-UEFI migration. These profiles are available for OCI and generic exports; they do not convert x86 images to Arm.
+Use `strategy: "reconfigure"` to request adaptation. For the experimental bare-metal profile, use `source: "vm"`, `target: "bare_metal"`, iSCSI boot, hardware/VFIO networking and an explicit supported `nic_driver`. UEFI must be detected or provided by an eligible separately enabled BIOS-to-UEFI migration. These profiles are available for OCI and generic exports; they do not convert x86 images to Arm.
 
-Preparation checks installed or built-in drivers for every non-rescue kernel, uses stable UUID mounts, adapts root and boot-transport arguments, and rebuilds generic initramfs with native guest-tool verification. Physical profiles include the selected NIC and NVMe/AHCI support; VM PV profiles require VirtIO. Standard GRUB `kernelopts` and `tuned_params` can be resolved from validated, inspected GRUB environment data; unknown or dynamic shell substitutions remain blockers. Existing configuration and unrelated boot arguments are retained or backed up. Networking and serial changes have explicit controls. Required guest packages need both package permission and guest networking; missing kernel drivers are not replaced with guessed packages.
+Reconfiguration checks installed or built-in drivers for every non-rescue kernel, uses stable UUID mounts, adapts root and boot-transport arguments, and rebuilds generic initramfs with native guest-tool verification. Its broad physical profile includes the selected NIC and NVMe/AHCI support; that bundle is not the minimum needed by an E5 bare-metal iSCSI root. VM PV profiles require VirtIO. Standard GRUB `kernelopts` and `tuned_params` can be resolved from validated, inspected GRUB environment data; unknown or dynamic shell substitutions remain blockers. Existing configuration and unrelated boot arguments are retained or backed up. Networking and serial changes have explicit controls. Required guest packages need both package permission and guest networking; missing kernel drivers are not replaced with guessed packages.
+
+### Optional firmware discovery and local root discovery
+
+The VM3 audit demonstrated a working OCI-native bare-metal image launched unchanged on an E5 Flex VM. The running kernel, initramfs, and `/etc/default/grub` matched the source's SHA-256 hashes. Oracle's generic initramfs already contained both VirtIO and physical NIC/iSCSI drivers. The VM discovered the same LVM/XFS root through VirtIO SCSI while its retained firmware-iSCSI arguments produced nonfatal discovery warnings. Cloud-init configured its new NIC at first boot. [Hardware review](oci-compatibility.md#vm3-native-image-portability)
+
+This is not a universal sequence of “fail iSCSI, then convert to VM.” The existing kernel and initramfs must support the local device. The inspected systemd dracut iSCSI hook accepts an active `initrd-root-device.target` as a completion condition, so local root discovery can satisfy boot without an iSCSI session. Forge reads this archived hook as data; it does not execute guest shell code during inspection. [Dracut firmware-discovery completion](https://github.com/dracutdevs/dracut/blob/master/modules.d/95iscsi/parse-iscsiroot.sh)
+
+```mermaid
+flowchart LR
+    A[UEFI and existing kernel/initramfs] --> B[VirtIO SCSI discovers disk]
+    B --> C[LVM locates the configured root]
+    C --> D[Local root requirement satisfied]
+    A --> E[Optional firmware iSCSI discovery]
+    E --> F[No firmware target: warning]
+    D --> G[Continue boot]
+```
+
+Preserve mode only accepts that optional path when the configured root resolves to the imported local filesystem and the archived hook supports local-root completion. An explicit remote root/target, mandatory network boot, missing drivers, conflicting boot entries or unverified archive remains a blocker or unknown. The mere presence of `netroot=iscsi`, the installed dracut package, or a generic-initramfs configuration file is insufficient proof. iSCSI remains essential when the selected destination actually provides its root over iSCSI.
+
+For images intended for multiple OCI machine types, retain working generic driver coverage and stable UUID/LVM references. For a dedicated target, reconfiguration can remove unused discovery and reduce warning noise. Do not remove iSCSI or its physical NIC drivers from an image that must still boot bare metal. A target boot test remains separate from these offline checks.
+
+Preserve networking through either a verified portable DHCP profile or a recognized Oracle cloud-init first-boot implementation with compatible configuration. A copied MAC-bound profile alone is insufficient, but it need not be fatal when the provisioning path will replace it for a new instance. Disabled networking, masked startup units, static overrides, trusted stale cache or unsupported configuration cannot be assumed portable. Cloud-init normally checks the instance identity; explicit cache-trust settings change that behavior. [Cloud-init first-boot determination](https://docs.cloud-init.io/en/latest/explanation/first_boot.html)
+
+The recognized Oracle bootstrap profile is deliberately narrow: Oracle Linux 9.8 with the audited cloud-init 24.4 implementation. Other implementations remain unknown until reviewed. See [the exact bootstrap validation scope](oracle-bootstrap-validation.md).
 
 iSCSI preparation uses standard firmware discovery. It does not invent a server address, IQN, initiator name or credentials. The target firmware must supply valid iBFT/boot connection information. Every kernel must provide `iscsi_tcp` and `iscsi_ibft` (`CONFIG_ISCSI_IBFT`), built in or included in its rebuilt initramfs, alongside the selected storage and NIC drivers.
 
@@ -77,4 +113,4 @@ Verification checks the actual dracut archive for its iSCSI/network modules, com
 
 When OCI capability preparation is also selected, its settings must agree with the machine profile. Valid previews can account for explicitly planned boot/network changes, but builds apply and verify the actual changes. Subsequent OCI initramfs rebuilding retains the machine profile's required drivers, and final publication repeats the hardware checks against the actual output.
 
-**OCI BYOI to bare-metal instances is documented as unsupported.** The bare-metal result is experimental offline hardware preparation, not provider certification or automatic physical deployment. Test the desired firmware, boot transport, networking and destination hardware before using it. This application does not capture running physical hosts or provision machines. The [reference repositories and primary documentation](../sources.md) explain the source material and limits.
+**External BYOI import to bare-metal instances is documented as unsupported.** This is distinct from capturing an existing OCI-native image and launching it on a compatible VM, as VM3 demonstrated. Forge's bare-metal result remains experimental offline hardware preparation, not provider certification or automatic physical deployment. Test the desired firmware, boot transport, networking and destination hardware before using it. This application does not capture running physical hosts or provision machines. The [reference repositories and primary documentation](../sources.md) explain the source material and limits.

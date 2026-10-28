@@ -35,6 +35,7 @@ function ociAcceleratedSchemaError(catalog = state.ociCatalog, capabilities) {
 }
 function updateDisclosureSummaries() {
   updateOciVisibility();
+  updatePlatformPreserveConflict();
   const serviceSummary=$('[data-service-change-count]');
   if(serviceSummary) { const count=$$('.rule-row').length;serviceSummary.textContent=count?`${count} ${count===1?'action':'actions'}`:'None'; }
   const firmwareAlert = $('#oci-firmware-alert');
@@ -152,6 +153,7 @@ function restoreEditorDraft(draft) {
     if (node.type === 'checkbox' || node.type === 'radio') node.checked = item.checked;
     else if (node.tagName !== 'SELECT' || [...node.options].some(option => option.value === item.value)) node.value = item.value;
   }
+  if(!draft.fields.some(item=>item.key[0]==='id'&&item.key[1]==='platform-strategy'))$('#platform-strategy').value='reconfigure';
   $('#oci-schema-status').textContent = state.ociLoadedSchema ? 'Current OCI schema loaded' : 'Bundled catalog';
   $$('details[data-disclosure]').forEach(node => { if (node.dataset.disclosure in (draft.disclosures || {})) node.open = draft.disclosures[node.dataset.disclosure]; });
   setTab(draft.tab);
@@ -460,6 +462,7 @@ function renderOciPanel() {
     <div id="oci-catalog-error" class="notice error" role="alert"${state.ociCatalog ? ' hidden' : ''}>${esc(state.ociCatalogError || 'The OCI capability catalog is not available yet. Refresh the catalog to configure this image.')} <button type="button" class="button ghost small" data-action="oci-refresh-catalog">Refresh catalog</button></div>
     <div id="oci-settings" hidden><div id="oci-firmware-alert">${['dual','unknown'].includes(studioImage()?.inspection?.boot?.mode) ? `<div class="notice warning">${studioImage().inspection.boot.mode === 'dual' ? 'Both firmware modes are present. Confirm your firmware choice under Compute.' : 'Firmware support is unknown. Refresh inspection before choosing OCI firmware.'}</div>` : !studioImage()?.inspection?.boot ? '<div class="notice warning">Refresh inspection to detect firmware support.</div>' : ''}</div>
     <div id="oci-accelerated-note" class="notice warning" hidden></div>
+    <div id="oci-platform-preserve-conflict" class="notice error" role="alert" hidden>Preserve &amp; validate requires OCI guest preparation off. <button type="button" class="button ghost small" data-studio-action="platform-validate-oci">Use validate-only</button></div>
     <div id="oci-capabilities"></div>
     <details class="editor-disclosure oci-section" data-disclosure="oci-preparation"><summary>Guest preparation <span class="disclosure-meta" id="oci-preparation-summary">Enabled</span></summary><div class="details-content">
       <label class="check-field"><input type="checkbox" id="oci-prepare" checked><span>Prepare this guest for the selected capabilities<small>Apply supported driver, initramfs, network, cloud-init, and console changes to the working image.</small></span></label>
@@ -550,6 +553,7 @@ function parseOciJson(selector, label, fallback = {}) {
 }
 function getOciConfig() {
   if (!state.ociCatalog?.capabilities?.length) throw new Error('Load the OCI capability catalog before building with OCI settings.');
+  if(platformPreserveConflict())throw editorError('Turn off OCI guest preparation to preserve the existing hardware configuration.','#oci-prepare');
   const acceleratedIssue=ociAcceleratedSchemaError(); if(acceleratedIssue)throw editorError(acceleratedIssue,'#oci-schema-json');
   const boot = state.images.find(image => image.id === state.selected)?.inspection?.boot;
   if (boot?.mode === 'dual' && !state.ociFirmwareEdited && state.ociCatalog.capabilities.some(capability => capability.key === 'Compute.Firmware')) throw editorError('Confirm the OCI firmware choice for this dual-mode image.','#oci-firmware-confirm');

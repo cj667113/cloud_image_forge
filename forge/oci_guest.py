@@ -204,6 +204,15 @@ def plan_guest(inspection: dict, config: dict, allow_network=False, planned_firm
     changes, blockers, warnings, packages = [], [], [], set()
     guest = config.get("guest", {})
     prepare = guest.get("prepare", True)
+    portability = inspection.get("platform", {}).get("portability", {})
+    bootstrap = portability.get("network_bootstrap", {})
+    bootstrap_ready = (portability.get("version") == 1 and bootstrap.get("version") == 1
+                       and bootstrap.get("ready") is True and not portability.get("network_blockers"))
+    # The Oracle datasource can replace a prior machine's NIC profile at first
+    # boot, but only the separately inspected implementation/configuration proof
+    # establishes that path. Installed cloud-init alone is insufficient.
+    network_ready = (bool(evidence.get("network_ready")) and not portability.get("network_blockers")) or (
+        not prepare and bootstrap_ready and not _flag(config, "Network.IPv6Only"))
     tools = evidence.get("tools", {})
     kernels = evidence.get("kernels", {})
     distro = inspection.get("os", {}).get("distro", "")
@@ -328,18 +337,23 @@ def plan_guest(inspection: dict, config: dict, allow_network=False, planned_firm
             blockers.append("Remove cloud-init=disabled from guest boot parameters before enabling OCI cloud-init preparation.")
         if prepare:
             changes.append("Select the Oracle cloud-init datasource, enable its units, and clear previous instance state for first-boot metadata/SSH-key provisioning.")
-        elif not evidence.get("cloud_init_ready"):
-            blockers.append("Oracle cloud-init datasource configuration is not ready; enable guest preparation.")
+        elif not (evidence.get("cloud_init_ready") or bootstrap_ready):
+            blockers.append("Existing Oracle cloud-init initialization cannot be verified. Supply supported first-boot configuration or choose Reconfigure.")
     backend = evidence.get("network_backend")
+    network_unverified = ("Existing IPv6-capable network initialization cannot be verified; supply portable IPv6 configuration or choose Reconfigure."
+                          if _flag(config, "Network.IPv6Only") else
+                          "Existing network initialization cannot be verified. Supply portable DHCP or a verified Oracle first-boot network path, or choose Reconfigure.")
     if guest.get("configure_network", True):
         if not backend:
             blockers.append("No supported network renderer detected (NetworkManager, netplan or systemd-networkd); install/configure one before OCI preparation.")
         if prepare:
             changes.append(f"Back up existing {backend or 'network'} profiles and replace them with DHCP + IPv6 autoconfiguration without MAC binding; disable persistent NIC rules.")
-        elif not evidence.get("network_ready"):
-            blockers.append("DHCP/IPv6 networking without MAC binding cannot be verified; enable guest preparation.")
-    elif not evidence.get("network_ready"):
-        blockers.append("Network preparation is disabled and DHCP/IPv6 readiness without MAC binding cannot be verified; enable preparation or supply an already-configured guest.")
+        elif not network_ready:
+            blockers.append(network_unverified)
+    elif not network_ready:
+        blockers.append(network_unverified)
+    if not prepare and bootstrap_ready and not evidence.get("network_ready") and network_ready:
+        warnings.append("Retaining the verified Oracle first-boot DHCP path instead of rewriting prior NIC profiles. OCI metadata and a distinct destination instance identity are required; IPv6-only readiness is not inferred from this path.")
     if guest.get("configure_serial_console", True):
         if prepare:
             if not (tools.get("update-grub") or tools.get("grub2-mkconfig")):

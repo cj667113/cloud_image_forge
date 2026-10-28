@@ -6,7 +6,7 @@ import zipfile
 import pytest
 from pydantic import ValidationError
 
-from forge.models import Recipe
+from forge.models import PlatformMigration, Recipe
 from forge.oci import (GLOBAL_SCHEMA, OciConfig, ShapeCompatibility, bundle_files,
                        capability_schema, catalog, compatibility_plan, normalize_schema)
 
@@ -282,3 +282,41 @@ def test_accelerated_migration_network_roundtrips_recipe():
     recipe = Recipe(platform_migration={"enabled": True, "source": "bare_metal", "target": "vm",
                                         "boot_attachment": "paravirtualized", "network_attachment": "accelerated"})
     assert Recipe.model_validate(recipe.model_dump()).platform_migration.network_attachment == "accelerated"
+
+
+def test_preservation_is_explicit_and_legacy_recipes_keep_reconfiguration():
+    assert PlatformMigration(enabled=True).strategy == "reconfigure"
+    preserve = PlatformMigration(enabled=True, strategy="preserve", source="vm", target="vm")
+    assert not preserve.install_packages and not preserve.configure_network and not preserve.configure_serial_console
+    assert PlatformMigration.model_validate(preserve.model_dump()) == preserve
+    with pytest.raises(ValidationError, match="different source"):
+        PlatformMigration(enabled=True, source="vm", target="vm")
+    for field in ("install_packages", "configure_network", "configure_serial_console"):
+        with pytest.raises(ValidationError, match="Preserve and validate"):
+            PlatformMigration(enabled=True, strategy="preserve", **{field: True})
+
+
+def test_preservation_rejects_oci_rewrites_but_allows_explicit_other_edits():
+    with pytest.raises(ValidationError, match="OCI guest preparation disabled"):
+        Recipe(platform_migration={"enabled": True, "strategy": "preserve"}, oci={})
+    recipe = Recipe(platform_migration={"enabled": True, "strategy": "preserve"},
+                    oci={"guest": {"prepare": False}}, kernel_args="loglevel=4")
+    assert recipe.kernel_args == "loglevel=4"
+
+
+def test_preservation_never_projects_missing_oci_evidence(monkeypatch):
+    source = {"oci_evidence": {"kernels": {"test": {"modules": [], "initrd_modules": []}},
+                               "iscsi_boot_configured": False, "network_ready": False, "serial_console_ready": False},
+              "platform": {"kernels": {"test": {"modules": ["mlx5_core"], "builtin": ["iscsi_ibft"]}}}}
+    original = deepcopy(source)
+    monkeypatch.setattr("forge.platform.plan_platform", lambda *a, **kw: {
+        "ready": True, "actions": [], "blockers": [], "warnings": [], "required_modules": ["mlx5_core", "iscsi_ibft"]})
+    seen = []
+    def guest(evidence, *args, **kwargs):
+        seen.append(deepcopy(evidence))
+        return {"changes": [], "blockers": [], "warnings": []}
+    monkeypatch.setattr("forge.oci_guest.plan_guest", guest)
+    config = OciConfig(guest={"prepare": False})
+    compatibility_plan(source, config, platform_migration={"enabled": True, "strategy": "preserve",
+                        "boot_attachment": "iscsi", "configure_network": True, "configure_serial_console": True})
+    assert source == original and seen == [original]

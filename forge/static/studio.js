@@ -205,7 +205,7 @@ function beginStudioPlan(button) {
 function finishStudioPlan(button,requestId,kind) {
   if(!button?.isConnected||button.dataset.requestId!==requestId)return;
   button.removeAttribute('aria-busy');button.disabled=wizardInspectionPending()||(kind==='storage'&&Boolean(studioSession().storageFitPending));
-  button.innerHTML=icon('check')+(kind==='storage'?'Check sizes':'Check hardware');
+  button.innerHTML=icon('check')+(kind==='storage'?'Check sizes':'Check compatibility');
 }
 async function previewStorage(config=undefined,beforeBuild=false,disk=undefined) {
   const imageId=state.selected,revision=state.editorRevision,snapshot=studioInspectionKey(),button=$('#storage-plan-button'),requestId=beginStudioPlan(button);notice('#storage-plan-error','');
@@ -250,36 +250,48 @@ function syncFilesystemInput(device,fromDisplay=false) {
 }
 function renderPlatformStudio() {
   return `<section id="platform-studio" class="platform-studio">
-    <div class="studio-section-heading"><h3>Machine migration</h3>${helpHint('Prepares boot drivers, mounts and networking for another machine type. CPU architecture stays the same; test the output on the destination.','Machine migration')}</div>
-    <label class="check-field feature-switch"><input type="checkbox" id="platform-enabled"><span>Prepare for different hardware</span></label>
+    <div class="studio-section-heading"><h3>Hardware compatibility</h3>${helpHint('Check the existing guest for a target, or explicitly reconfigure boot drivers, mounts and networking. Image origin alone does not establish compatibility.','Hardware compatibility')}</div>
+    <label class="check-field feature-switch"><input type="checkbox" id="platform-enabled"><span>Check or prepare target hardware</span></label>
     <div id="platform-controls" hidden>
       ${!studioImage()?.inspection?.platform?'<div class="notice warning">Refresh inspection to check hardware support. <button type="button" class="button ghost small" data-action="refresh-inspection">Refresh</button></div>':''}
-      <div class="platform-direction"><label class="field">From<select id="platform-source"><option value="vm">Virtual machine</option><option value="bare_metal">Bare metal</option></select></label><span class="direction-arrow" aria-hidden="true">${icon('arrow')}</span><label class="field">To<select id="platform-target"><option value="bare_metal">Bare metal</option><option value="vm">Virtual machine</option></select></label></div>
+      <label class="field">Behavior<select id="platform-strategy"><option value="preserve" selected>Preserve &amp; validate</option><option value="reconfigure">Reconfigure</option></select>${helpHint('Preserve validates existing hardware settings without rewriting them. Separately requested edits still apply. Reconfigure changes boot drivers, mounts and networking as shown in the plan.','Hardware behavior')}</label>
+      <div class="platform-direction"><label class="field">Source type<select id="platform-source"><option value="vm">Virtual machine</option><option value="bare_metal">Bare metal</option></select>${helpHint('Your declared source type; offline inspection does not establish where the image last ran.','Source type')}</label><span class="direction-arrow" aria-hidden="true">${icon('arrow')}</span><label class="field">Target type<select id="platform-target"><option value="bare_metal">Bare metal</option><option value="vm" selected>Virtual machine</option></select></label></div>
       <div class="notice warning" id="platform-provider-warning"></div>
-      <div class="form-grid"><label class="field">Boot attachment<select id="platform-boot"><option value="iscsi">Firmware iSCSI</option><option value="paravirtualized">Paravirtualized</option></select>${helpHint('Bare-metal boot needs an iBFT table from the target firmware. Target addresses and credentials are never invented.','Boot attachment')}</label><label class="field">Network attachment<select id="platform-network"><option value="vfio">Physical / VFIO</option><option value="paravirtualized">Paravirtualized</option><option value="accelerated">Accelerated PV</option></select>${helpHint('Choose the adapter exposed by the destination. Accelerated PV requires a supported Acceleron shape and compatible image. Physical networking needs the matching NIC driver.','Network attachment')}</label></div>
+      <div class="form-grid"><label class="field">Boot attachment<select id="platform-boot"><option value="iscsi">Firmware iSCSI</option><option value="paravirtualized" selected>Paravirtualized</option></select>${helpHint('Choose the target attachment. Firmware iSCSI uses target-provided iBFT; optional firmware discovery alone does not mean the guest requires network root.','Boot attachment')}</label><label class="field">Network attachment<select id="platform-network"><option value="vfio">Physical / VFIO</option><option value="paravirtualized" selected>Paravirtualized</option><option value="accelerated">Accelerated PV</option></select>${helpHint('Choose the adapter exposed by the destination. Accelerated PV requires a supported Acceleron shape and compatible image. Physical networking needs the matching NIC driver.','Network attachment')}</label></div>
       <div id="platform-accelerated-note" class="notice warning" hidden>Accelerated PV is shape-dependent. Confirm image and regional schema support, then test the OCI launch.</div>
       <label class="field" id="platform-nic-field">NIC driver<select id="platform-nic"><option value="">Select target driver</option>${['ixgbe','ixgbevf','i40e','iavf','mlx4_en','mlx5_core','bnxt_en'].map(driver=>`<option value="${driver}">${driver}</option>`).join('')}</select>${helpHint('Select the destination NIC module; every installed kernel is checked. The reviewed BM.Standard.E5.192 host uses mlx5_core (ConnectX-6 Dx). Confirm your target hardware.','NIC driver')}</label>
-      <details class="editor-disclosure" data-disclosure="platform-options"><summary>Preparation options <span class="disclosure-meta">Network, console & packages</span></summary><div class="details-content platform-options">
+      <details class="editor-disclosure" id="platform-write-options" data-disclosure="platform-options" hidden><summary>Preparation options <span class="disclosure-meta">Network, console & packages</span></summary><div class="details-content platform-options">
         <label class="check-field"><input type="checkbox" id="platform-configure-network" checked><span>Configure network startup${helpHint('Replaces machine-bound network profiles with portable DHCP and prepares early networking when required.','Network startup')}</span></label>
         <label class="check-field"><input type="checkbox" id="platform-serial-console" checked><span>Enable serial console${helpHint('Enables ttyS0 at 115200 baud and a serial login service.','Serial console')}</span></label>
         <label class="check-field"><input type="checkbox" id="platform-install-packages"><span>Install required packages${helpHint('Uses the guest repositories. Guest network access must also be enabled.','Package installation')}</span></label>
         <label class="check-field"><input type="checkbox" id="platform-allow-network"><span>Allow guest network access</span></label>
       </div></details>
+      <div class="notice error" id="platform-preserve-conflict" role="alert" hidden>Preserve &amp; validate requires OCI guest preparation off. <button type="button" class="button ghost small" id="platform-preserve-validate-button" data-studio-action="platform-validate-oci">Use validate-only</button></div>
       <div class="platform-oci-note" id="platform-oci-note" hidden></div>
-      <div class="plan-action-row"><button type="button" class="button secondary" id="platform-plan-button" data-studio-action="platform-preview">${icon('check')}Check hardware</button></div>
+      <div class="plan-action-row"><button type="button" class="button secondary" id="platform-plan-button" data-studio-action="platform-preview">${icon('check')}Check compatibility</button></div>
       <div id="platform-plan-error" class="notice error" role="alert" hidden></div><div id="platform-plan" class="studio-plan"></div>
     </div></section>`;
 }
 function getPlatformMigrationConfig() {
   if(!$('#platform-enabled')?.checked)return null;
-  const config={enabled:true,source:$('#platform-source').value,target:$('#platform-target').value,boot_attachment:$('#platform-boot').value,network_attachment:$('#platform-network').value,nic_driver:$('#platform-nic').value||null,install_packages:$('#platform-install-packages').checked,configure_network:$('#platform-configure-network').checked,configure_serial_console:$('#platform-serial-console').checked};
-  if(config.source===config.target)throw new Error('Choose different source and target platforms.');
+  const strategy=$('#platform-strategy').value,preserve=strategy==='preserve';
+  const config={enabled:true,strategy,source:$('#platform-source').value,target:$('#platform-target').value,boot_attachment:$('#platform-boot').value,network_attachment:$('#platform-network').value,nic_driver:$('#platform-nic').value||null,install_packages:!preserve&&$('#platform-install-packages').checked,configure_network:!preserve&&$('#platform-configure-network').checked,configure_serial_console:!preserve&&$('#platform-serial-console').checked};
+  if(!preserve&&config.source===config.target)throw editorError('Reconfiguration requires different source and target platforms.','#platform-target');
+  if(platformPreserveConflict())throw editorError('Turn off OCI guest preparation to preserve the existing hardware configuration.','#platform-preserve-validate-button');
   if((config.target==='bare_metal'||config.network_attachment==='vfio')&&!config.nic_driver)throw new Error('Choose the NIC driver for the destination hardware.');
   if(config.install_packages&&!$('#allow-network').checked)throw new Error('Enable networking to install platform packages.');
   return config;
 }
+function platformPreserveConflict() { return Boolean($('#platform-enabled')?.checked&&$('#platform-strategy')?.value==='preserve'&&$('input[name="target"]:checked')?.value==='oci'&&$('#oci-enabled')?.checked&&$('#oci-prepare')?.checked); }
+function updatePlatformPreserveConflict() { for(const id of ['platform-preserve-conflict','oci-platform-preserve-conflict']) { const node=$(`#${id}`);if(node)node.hidden=!platformPreserveConflict(); } }
+function preservePlatformConfiguration() {
+  if($('#oci-prepare'))$('#oci-prepare').checked=false;
+  studioSession().pendingOciPlatformSync=false;
+  if($('#oci-enabled')?.checked)markOciChanged();else updateDisclosureSummaries();
+}
 function syncOciPlatformChoices() {
   if(!$('#platform-enabled')?.checked)return;
+  if($('#platform-strategy')?.value==='preserve'){studioSession().pendingOciPlatformSync=false;return;}
   if($('input[name="target"]:checked')?.value!=='oci'){studioSession().pendingOciPlatformSync=true;return;}
   studioSession().pendingOciPlatformSync=false;
   const boot=$('#platform-boot').value==='iscsi'?'ISCSI':'PARAVIRTUALIZED',network={vfio:'VFIO',paravirtualized:'PARAVIRTUALIZED',accelerated:'ACCELERATEDPV'}[$('#platform-network').value];
@@ -303,14 +315,16 @@ function syncOciPlatformChoices() {
 }
 function updatePlatformStudio() {
   if(!$('#platform-studio'))return;
-  const enabled=$('#platform-enabled').checked,bare=$('#platform-target').value==='bare_metal',oci=$('input[name="target"]:checked')?.value==='oci';
+  const enabled=$('#platform-enabled').checked,preserve=$('#platform-strategy').value==='preserve',bare=$('#platform-target').value==='bare_metal',oci=$('input[name="target"]:checked')?.value==='oci';
   $('#platform-controls').hidden=!enabled;
+  $('#platform-write-options').hidden=preserve;
+  updatePlatformPreserveConflict();
   $('#platform-provider-warning').hidden=!bare;
   $('#platform-provider-warning').textContent=oci?'Experimental: OCI BYOI does not support bare metal. Test the output on the target hardware.':'Experimental hardware preparation. A destination boot test is required.';
   $('#platform-nic-field').hidden=!bare&&$('#platform-network').value!=='vfio';
   const accelerated=$('#platform-accelerated-note'),issue=oci?ociAcceleratedSchemaError():'';
   accelerated.hidden=$('#platform-network').value!=='accelerated';accelerated.className=`notice ${issue?'error':'warning'}`;accelerated.textContent=issue||'Accelerated PV is shape-dependent. Confirm image and regional schema support, then test the destination launch.';
-  const note=$('#platform-oci-note');note.hidden=!oci||!note.textContent;
+  const note=$('#platform-oci-note');note.hidden=preserve||!oci||!note.textContent;
   $('#platform-allow-network').checked=Boolean($('#allow-network')?.checked);
   const button=$('#platform-plan-button');button.disabled=wizardInspectionPending()||button.getAttribute('aria-busy')==='true';
 }
@@ -323,7 +337,10 @@ function renderPlatformPlan(plan) {
   if(container.dataset.renderedPlan===signature&&$('.plan-status',container))return;
   container.dataset.renderedPlan=signature;
   const lines=items=>(items||[]).map(item=>`<li>${esc(typeof item==='string'?item:JSON.stringify(item))}</li>`).join('');
-  $('#platform-plan').innerHTML=`<div role="status" class="plan-status ${plan.ready?'ready':'blocked'}">${icon(plan.ready?'check':'info')}<strong>${plan.ready?'Hardware plan ready':'Resolve platform blockers'}</strong></div>${plan.blockers?.length?`<ul class="plan-blockers" role="alert">${lines(plan.blockers)}</ul>`:''}<div class="plan-facts"><span>Firmware <strong>${esc(Array.isArray(plan.effective_firmware)?plan.effective_firmware.join(', '):plan.effective_firmware||'Not established')}</strong></span><span>Initramfs <strong>${esc(plan.initramfs_backend||'Not established')}</strong></span></div>${plan.required_modules?.length||plan.packages?.length?`<details><summary>Drivers & packages</summary>${plan.required_modules?.length?`<p class="module-list"><strong>Drivers</strong> ${plan.required_modules.map(esc).join(', ')}</p>`:''}${plan.packages?.length?`<p class="module-list"><strong>Packages</strong> ${plan.packages.map(esc).join(', ')}</p>`:''}</details>`:''}${plan.actions?.length?`<details><summary>Planned changes</summary><ul>${lines(plan.actions)}</ul></details>`:''}${plan.warnings?.length?`<details><summary>Checks & limitations (${plan.warnings.length})</summary><ul>${lines(plan.warnings)}</ul></details>`:''}`;
+  const preserve=(plan.strategy||$('#platform-strategy').value)==='preserve',assessment=plan.portability,ready=plan.ready&&!plan.blockers?.length;
+  const rootLabel={local:'Local root',optional_firmware_iscsi:'Local root · optional iSCSI discovery',mandatory_network:'Network root required',unknown:'Not established'}[assessment?.root_transport]||'Not established';
+  const assessmentDetails=assessment?`<details class="platform-portability-evidence"><summary>Offline evidence${assessment.checks?.length?` · ${assessment.checks.length} checks`:''}</summary><ul>${(assessment.checks||[]).map(check=>`<li><strong>${esc(check.label||check.id)} · ${esc(check.status)}</strong>${check.evidence?.length?`<ul>${lines(check.evidence)}</ul>`:''}</li>`).join('')}</ul>${assessment.kernels?.length?`<div class="table-wrap"><table><thead><tr><th>Kernel</th><th>Offline status</th><th>Missing drivers</th></tr></thead><tbody>${assessment.kernels.map(kernel=>`<tr><td><code>${esc(kernel.version)}</code></td><td>${esc(kernel.status)}</td><td>${esc([...(kernel.missing_installed||[]),...(kernel.missing_initramfs||[])].filter((value,index,list)=>list.indexOf(value)===index).join(', ')||'None reported')}</td></tr>`).join('')}</tbody></table></div>`:''}${assessment.dual_environment?`<p class="module-list"><strong>VM + bare metal prerequisites</strong> ${esc(assessment.dual_environment.status||'unknown')} ${helpHint('Offline evidence only. A target may need a physical NIC driver chosen explicitly; a successful check does not prove either environment boots.','Cross-environment evidence')}</p>`:''}</details>`:'';
+  $('#platform-plan').innerHTML=`<div role="status" class="plan-status ${ready?'ready':'blocked'}">${icon(ready?'check':'info')}<strong>${ready?(preserve?'Offline prerequisites met':'Reconfiguration plan ready'):'Resolve hardware blockers'}</strong></div>${plan.blockers?.length?`<ul class="plan-blockers" role="alert">${lines(plan.blockers)}</ul>`:''}${assessment?.status==='unknown'?`<button type="button" class="button secondary small" data-action="refresh-inspection">${icon('activity')}Refresh inspection</button>`:''}<div class="plan-facts"><span>Firmware <strong>${esc(Array.isArray(plan.effective_firmware)?plan.effective_firmware.join(', '):plan.effective_firmware||'Not established')}</strong></span>${assessment?`<span>Root boot <strong>${esc(rootLabel)}</strong>${helpHint('Optional firmware iSCSI discovery can coexist with local root. Mandatory network-root arguments are assessed separately.','Root boot')}</span>`:`<span>Initramfs <strong>${esc(plan.initramfs_backend||'Not established')}</strong></span>`}<span>Boot verification <strong>Not tested</strong></span></div>${assessmentDetails}${plan.required_modules?.length||plan.packages?.length?`<details><summary>Drivers & packages</summary>${plan.required_modules?.length?`<p class="module-list"><strong>Drivers</strong> ${plan.required_modules.map(esc).join(', ')}</p>`:''}${plan.packages?.length?`<p class="module-list"><strong>Packages</strong> ${plan.packages.map(esc).join(', ')}</p>`:''}</details>`:''}${plan.actions?.length?`<details><summary>${preserve?'Validation actions':'Planned changes'}</summary><ul>${lines(plan.actions)}</ul></details>`:''}${plan.warnings?.length?`<details><summary>Checks & limitations (${plan.warnings.length})</summary><ul>${lines(plan.warnings)}</ul></details>`:''}`;
 }
 async function previewPlatform(config=undefined,beforeBuild=false,recipe=null) {
   const imageId=state.selected,revision=state.editorRevision,snapshot=studioInspectionKey(),button=$('#platform-plan-button'),requestId=beginStudioPlan(button);notice('#platform-plan-error','');
@@ -341,6 +358,7 @@ function invalidateStudioPlans(kind) {
   const node=$(`#${kind}-plan`);
   if(node)node.innerHTML=studioSession()[kind]?'<p class="storage-note">Settings changed. Recheck the plan.</p>':'';
   if(kind==='storage')updateStorageStudio();
+  if(kind==='platform'&&$('#oci-enabled')?.checked)markOciChanged();
 }
 document.addEventListener('click',event=>{
   const help=event.target.closest('.help-toggle');if(help){event.preventDefault();const anchor=help.closest('.help-anchor'),pinned=anchor.classList.contains('pinned');closeHelp();if(!pinned){studioState.dismissedHelp.delete(anchor);openHelp(anchor);anchor.classList.add('pinned');}return;}
@@ -349,6 +367,7 @@ document.addEventListener('click',event=>{
   if(button.dataset.studioAction==='storage-preview')previewStorage();
   if(button.dataset.studioAction==='storage-fit')fitStorageDisk();
   if(button.dataset.studioAction==='platform-preview')previewPlatform();
+  if(button.dataset.studioAction==='platform-validate-oci'){preservePlatformConfiguration();state.editorRevision++;invalidateStudioPlans('platform');updatePlatformStudio();}
 });
 document.addEventListener('mouseover',event=>{
   const anchor=event.target.closest('.help-anchor');if(!anchor)return;
@@ -379,13 +398,19 @@ document.addEventListener('change',event=>{
   if(input.id==='disk-size-unit'){const previous=input.dataset.previousUnit||'gib',value=getDiskCapacityBytes(previous);if(value!==null)$('#disk-size').value=String(value/(input.value==='gb'?1e9:GiB));input.dataset.previousUnit=input.value;invalidateStudioPlans('storage');}
   if(input.dataset.fsSizeUnit){syncFilesystemInput(input.dataset.fsSizeUnit);invalidateStudioPlans('storage');}
   if(input.id==='storage-rebuild-enabled'){updateStorageStudio();invalidateStudioPlans('storage');}
-  if(input.id==='platform-enabled'||['platform-source','platform-target'].includes(input.id)) {
-    if(input.id==='platform-source')$('#platform-target').value=input.value==='vm'?'bare_metal':'vm';
-    if(input.id==='platform-target')$('#platform-source').value=input.value==='vm'?'bare_metal':'vm';
-    const bare=$('#platform-target').value==='bare_metal';$('#platform-boot').value=bare?'iscsi':'paravirtualized';$('#platform-network').value=bare?'vfio':'paravirtualized';
-    syncOciPlatformChoices();updatePlatformStudio();invalidateStudioPlans('platform');
+  if(['platform-enabled','platform-strategy','platform-source','platform-target'].includes(input.id)) {
+    const preserve=$('#platform-strategy').value==='preserve';
+    if(input.id==='platform-strategy')$('#platform-oci-note').textContent='';
+    if(!preserve&&['platform-source','platform-target'].includes(input.id)) {
+      if(input.id==='platform-source')$('#platform-target').value=input.value==='vm'?'bare_metal':'vm';
+      if(input.id==='platform-target')$('#platform-source').value=input.value==='vm'?'bare_metal':'vm';
+      const bare=$('#platform-target').value==='bare_metal';$('#platform-boot').value=bare?'iscsi':'paravirtualized';$('#platform-network').value=bare?'vfio':'paravirtualized';
+      syncOciPlatformChoices();
+    } else if(preserve&&$('#platform-enabled').checked&&['platform-enabled','platform-strategy'].includes(input.id))preservePlatformConfiguration();
+    updatePlatformStudio();invalidateStudioPlans('platform');
   }
   if(['platform-boot','platform-network'].includes(input.id)){syncOciPlatformChoices();updatePlatformStudio();invalidateStudioPlans('platform');}
+  if(['oci-enabled','oci-prepare'].includes(input.id)){updatePlatformPreserveConflict();invalidateStudioPlans('platform');}
   if(input.closest('#panel-storage'))updateStorageStudio();
   if(['allow-network','oci-allow-network','migration-allow-network','platform-allow-network'].includes(input.id)) {
     ['allow-network','oci-allow-network','migration-allow-network','platform-allow-network'].forEach(id=>{if($(`#${id}`))$(`#${id}`).checked=input.checked;});invalidateStudioPlans('platform');

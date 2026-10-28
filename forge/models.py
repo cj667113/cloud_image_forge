@@ -82,6 +82,9 @@ class StorageRebuild(StrictModel):
 
 class PlatformMigration(StrictModel):
     enabled: bool = False
+    # Omitted strategy preserves the meaning of existing saved recipes. The UI
+    # explicitly chooses preserve for new hardware checks.
+    strategy: Literal["preserve", "reconfigure"] = "reconfigure"
     source: Literal["vm", "bare_metal"] = "vm"
     target: Literal["vm", "bare_metal"] = "bare_metal"
     boot_attachment: Literal["paravirtualized", "iscsi"] = "iscsi"
@@ -93,8 +96,13 @@ class PlatformMigration(StrictModel):
 
     @model_validator(mode="after")
     def migration_direction(self):
-        if self.enabled and self.source == self.target:
+        if self.enabled and self.strategy == "reconfigure" and self.source == self.target:
             raise ValueError("Select different source and target machine types")
+        if self.strategy == "preserve":
+            for name in ("install_packages", "configure_network", "configure_serial_console"):
+                if name in self.model_fields_set and getattr(self, name):
+                    raise ValueError("Preserve and validate cannot enable " + name + "; select Reconfigure to change hardware settings")
+                setattr(self, name, False)
         return self
 
 
@@ -137,6 +145,9 @@ class Recipe(StrictModel):
 
     @model_validator(mode="after")
     def compatible_recipe(self):
+        if (self.platform_migration and self.platform_migration.enabled
+                and self.platform_migration.strategy == "preserve" and self.oci and self.oci.guest.prepare):
+            raise ValueError("Preserve and validate requires OCI guest preparation disabled; select Validate only or Reconfigure")
         if self.oci is not None and self.target != "oci":
             raise ValueError("OCI capabilities can be applied only to an OCI export")
         expected = {"oci": "qcow2", "aws": "raw", "azure": "vhd", "gcp": "gcp"}

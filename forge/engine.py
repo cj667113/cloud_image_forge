@@ -262,6 +262,12 @@ def _grub_assignment(content: str, name: str, value: str) -> str:
 
 
 def _validate_recipe(recipe: dict, inspection: dict) -> None:
+    platform = recipe.get("platform_migration") or {}
+    if platform.get("enabled") and platform.get("strategy", "reconfigure") == "preserve":
+        if any(platform.get(name, False) for name in ("install_packages", "configure_network", "configure_serial_console")):
+            raise EngineError("Preserve and validate cannot request hardware configuration changes; select Reconfigure.")
+        if recipe.get("oci") is not None and recipe["oci"].get("guest", {}).get("prepare", True):
+            raise EngineError("Preserve and validate requires OCI guest preparation disabled.")
     target = recipe.get("target", "generic")
     fmt = recipe.get("output_format", "qcow2")
     target_formats = {"oci": "qcow2", "aws": "raw", "azure": "vhd", "gcp": "gcp"}
@@ -500,7 +506,7 @@ class ImageEngine:
                                       recipe.get("oci"), target_provider=recipe.get("target", "generic"),
                                       boot_migration=migration_options)
         if platform_plan["requested"] and not platform_plan["ready"]:
-            raise EngineError("Machine migration blocked: " + " ".join(platform_plan["blockers"]))
+            raise EngineError("Hardware compatibility blocked: " + " ".join(platform_plan["blockers"]))
         from .storage import plan_rebuild
         storage_plan = plan_rebuild(inspection, recipe.get("storage_rebuild"), recipe.get("disk_size_gib"))
         oci_config = None
@@ -542,6 +548,8 @@ class ImageEngine:
             warnings.extend(migration["warnings"])
         platform_receipt = None
         if platform_plan["requested"]:
+            # Preservation starts after the user's explicit storage/kernel/file
+            # edits. It never substitutes planned readiness for this inspection.
             customized = self.inspect(work)
             platform_receipt = prepare_platform(work, customized, platform_options, recipe.get("allow_network", False), log,
                                                 oci_config=recipe.get("oci"), target_provider=target)
@@ -609,7 +617,7 @@ class ImageEngine:
             platform_result = verify_platform(result_inspection, platform_options, oci_config=recipe.get("oci"),
                                               target_provider=target, receipt=platform_receipt)
             if not platform_result["ready"]:
-                raise EngineError("Final machine migration verification failed: " + " ".join(platform_result["blockers"]))
+                raise EngineError("Final hardware compatibility verification failed: " + " ".join(platform_result["blockers"]))
         filenames = {"qcow2": "image.qcow2", "raw": "image.raw", "vhd": "image.vhd", "gcp": "image.tar.gz"}
         output = destination_dir / filenames[final_format]
         conversion = destination_dir / "disk.raw" if final_format == "gcp" else output
