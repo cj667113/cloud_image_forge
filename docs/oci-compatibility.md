@@ -117,6 +117,8 @@ Oracle documents **AcceleratedPV** as the only E6 Ax networking type and **Parav
 
 Cloud-init completed on both machines, and their cached instance identities matched their respective IMDS identities. The clone's cloud-init-generated `ifcfg-enp0s5` uses DHCP, is enabled at boot, and matches the clone's new MAC. Cloud configuration and dracut configuration hashes matched the source. The existing narrow Oracle bootstrap validator reported ready for both guests; no additional network-rewrite adapter was needed for this evidence.
 
+The clone also has a second identical `/.swapfile none swap sw 0 0` entry in `fstab`, as observed in the earlier bare-metal-to-VM clone. Preserve mode already retains and warns about identical duplicate swap entries; it does not treat that duplication alone as a boot blocker or silently remove it.
+
 This move retains PV storage at both ends. Its portability is supported by the existing shared drivers, stable root identity and working first-boot networking. The retained iSCSI discovery arguments are a separate optional path; an iSCSI failure is not what converts AcceleratedPV networking to ordinary PV. The running clone establishes this native capture's behavior in the tested direction, without certifying every custom image or a Forge-built export.
 
 In Forge, use **Preserve & validate → Virtual machine → Virtual machine**, PV boot, and the destination's network attachment. For the E5 target select **Paravirtualized**; for an E6 Ax target select **Accelerated PV**. Keep OCI guest preparation at **Validate only** to retain existing hardware configuration. A source image's origin and PCI subsystem ID do not select the destination attachment automatically.
