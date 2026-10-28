@@ -174,7 +174,7 @@ async function wizardValidateStep(id, remote = false) {
   if (id === 'startup') {
     for (const row of $$('.rule-row')) {
       const name = $('.service-name',row).value.trim();
-      if (name && !/^[A-Za-z0-9_][A-Za-z0-9_@.:-]*\.(service|timer|socket|target)$/.test(name)) throw new Error('Use a valid systemd unit name, such as sshd.service.');
+      if (name && !/^[A-Za-z0-9_][A-Za-z0-9_@.:-]*\.(service|timer|socket|target)$/.test(name)) throw editorError('Use a valid systemd unit name, such as sshd.service.',$('.service-name',row));
     }
     const path = $('#custom-file-path').value.trim(), content = $('#custom-file-content').value;
     if (Boolean(path) !== Boolean(content)) throw editorError('Enter both a path and contents for the custom startup file, or leave both empty.',path?'#custom-file-content':'#custom-file-path');
