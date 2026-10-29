@@ -43,7 +43,7 @@ def image():
                          "kernels": {KERNEL: {"modules": drivers, "builtin": [],
                                               "initrd": f"/boot/initramfs-{KERNEL}.img", "initrd_modules": drivers,
                                               "initrd_sha256": "a" * 64, "initrd_iscsi_userspace": True}},
-                         "tools": {name: True for name in ("dracut", "lsinitrd", "systemctl", "grub2-mkconfig", "grubby", "iscsiadm", "iscsistart", "iscsid", "iscsi-iname", "dnf")},
+                         "tools": {name: True for name in ("dracut", "lsinitrd", "systemctl", "grub2-mkconfig", "grubby", "iscsiadm", "iscsistart", "iscsid", "iscsi-iname", "dnf", "NetworkManager")},
                          "fstab": {"entries": [{"line": 1, "mountpoint": "/", "source": "UUID=" + ROOT_UUID,
                                                  "replacement": "UUID=" + ROOT_UUID}], "errors": [], "root_uuid": ROOT_UUID,
                                    "sha256": hashlib.sha256(FSTAB.encode()).hexdigest()},
@@ -56,13 +56,41 @@ def image():
 
 
 class Guest:
-    def __init__(self, files=None):
+    def __init__(self, files=None, partitions=None):
         self.files = dict(files or {})
         self.links = set()
         self.members = []
+        self.filesystems = deepcopy(partitions if partitions is not None else image()["partitions"])
+
+    def list_filesystems(self):
+        return {item["device"]: item.get("filesystem", "ext4") for item in self.filesystems}
+
+    def vfs_uuid(self, device):
+        return next(item.get("uuid", "") for item in self.filesystems if item["device"] == device)
+
+    def vfs_label(self, device):
+        return "root" if device == "/dev/sda1" else ""
+
+    def lvm_canonical_lv_name(self, device):
+        raise RuntimeError("not an LV")
+
+    def part_to_dev(self, device):
+        raise RuntimeError("no table fixture")
+
+    def canonical_device_name(self, device):
+        return device
+
+    def mountpoints(self):
+        return {"/dev/sda1": "/"}
+
+    def statns(self, path):
+        return {"st_mode": 0o100644, "st_uid": 0, "st_gid": 0, "st_nlink": 1}
 
     def is_file(self, path):
         return path in self.files
+
+    def is_dir(self, path):
+        return any(name.startswith(path.rstrip("/") + "/") for name in self.files)
 
     def is_symlink(self, path):
         return path in self.links
@@ -198,21 +226,31 @@ class InspectionTests(unittest.TestCase):
     def test_uuid_duplicate_and_required_external_mount_fail_closed(self):
         g = Guest({"/etc/fstab": FSTAB + "/dev/sdb1 /data xfs defaults 0 0\n"})
         partitions = image()["partitions"]
-        result = _fstab_evidence(g, partitions)
+        result = _fstab_evidence(g, "/dev/sda1", partitions)
         self.assertTrue(any("/data" in error for error in result["errors"]))
-        result = _fstab_evidence(Guest({"/etc/fstab": FSTAB}), partitions + [{"device": "/dev/sda2", "uuid": ROOT_UUID}])
+        duplicated = partitions + [{"device": "/dev/sda2", "uuid": ROOT_UUID}]
+        result = _fstab_evidence(Guest({"/etc/fstab": FSTAB}, duplicated), "/dev/sda1", duplicated)
         self.assertTrue(result["errors"])
+
+    def test_mount_evidence_repairs_only_independently_observed_targets(self):
+        text = "UUID=stale-root / ext4 defaults 0 1\n/dev/missing /data ext4 defaults 0 2\n"
+        hints = image()["partitions"] + [{"device": "/dev/sda1", "mountpoint": "/data", "uuid": ROOT_UUID}]
+        result = _fstab_evidence(Guest({"/etc/fstab": text}), "/dev/sda1", hints)
+        self.assertEqual(result["entries"][0]["replacement"], "UUID=" + ROOT_UUID)
+        self.assertTrue(result["boot_reference_check_required"])
+        self.assertTrue(any("/data" in error for error in result["errors"]))
+        self.assertNotIn("replacement", result["entries"][1])
 
     def test_optional_future_mount_and_bind_mount_are_retained(self):
         text = FSTAB + "/dev/sdb1 /data xfs nofail 0 0\n/var/lib /srv none bind 0 0\n"
-        result = _fstab_evidence(Guest({"/etc/fstab": text}), image()["partitions"])
+        result = _fstab_evidence(Guest({"/etc/fstab": text}), "/dev/sda1", image()["partitions"])
         self.assertEqual(result["errors"], [])
         self.assertTrue(result["entries"][1]["preserve"])
         self.assertTrue(result["entries"][2]["preserve"])
 
     def test_device_to_uuid_change_preserves_options_comments_and_spacing(self):
         text = "# mounts\n  /dev/sda1\t/\text4\tdefaults,noatime 0 1 # root\n"
-        result = _fstab_evidence(Guest({"/etc/fstab": text}), image()["partitions"])
+        result = _fstab_evidence(Guest({"/etc/fstab": text}), "/dev/sda1", image()["partitions"])
         self.assertFalse(result["errors"])
         item = result["entries"][0]
         updated = _fstab_text(text, [{"line": item["line"], "from": item["source"], "to": item["replacement"]}])
@@ -224,6 +262,95 @@ class InspectionTests(unittest.TestCase):
 
 
 class PlanTests(unittest.TestCase):
+    def test_network_dispatcher_does_not_force_uninstalled_networkmanager(self):
+        source = image()
+        source["platform"]["tools"]["NetworkManager"] = False
+        source["platform"]["dracut_modules"] = ["iscsi", "network-manager", "network", "systemd-networkd"]
+        profile = options(source="vm", target="bare_metal", boot_attachment="iscsi", network_attachment="vfio", nic_driver="mlx5_core")
+        plan = plan_platform(source, profile)
+        self.assertTrue(plan["ready"], plan["blockers"])
+        self.assertEqual(plan["dracut_network_module"], "network")
+        source["platform"]["dracut_modules"] = ["iscsi", "network-manager"]
+        self.assertFalse(plan_platform(source, profile)["ready"])
+
+    def test_automatic_nic_bundle_requires_every_selected_driver_in_every_initramfs(self):
+        source = image()
+        profile = options(source="vm", target="bare_metal", boot_attachment="iscsi", network_attachment="vfio", nic_driver="auto")
+        result = plan_platform(source, profile)
+        expected = {"bnxt_en", "i40e", "iavf", "ixgbe", "ixgbevf", "mlx4_en", "mlx5_core"}
+        self.assertTrue(result["ready"], result["blockers"])
+        self.assertEqual(set(result["nic_drivers"]), expected)
+        self.assertTrue(expected <= set(result["required_modules"]))
+        script = _initramfs_script(source, result, profile)
+        for driver in expected:
+            self.assertIn(driver.replace("_", "[-_]"), script)
+        source["platform"]["kernels"]["second"] = {"modules": [], "builtin": []}
+        self.assertTrue(any("automatic bundle" in error for error in plan_platform(source, profile)["blockers"]))
+
+    def test_mount_preserve_validates_but_does_not_normalize_existing_reference(self):
+        source = image()
+        entry = source["platform"]["fstab"]["entries"][0]
+        entry.update(source="/dev/sda1", reason="Resolved current filesystem identity")
+        automatic = plan_platform(source, options())
+        self.assertTrue(automatic["fstab_changes"])
+        preserved = plan_platform(source, options(), mount_policy="preserve")
+        self.assertTrue(preserved["ready"], preserved["blockers"])
+        self.assertFalse(preserved["fstab_changes"])
+        entry.update(source="UUID=stale", reason="Reconciled against independently inspected root")
+        preserved = plan_platform(source, options(), mount_policy="preserve")
+        self.assertFalse(preserved["ready"])
+        self.assertTrue(any("does not resolve" in error for error in preserved["blockers"]))
+
+    def test_ubuntu_dracut_archive_overrides_update_initramfs_command_name(self):
+        source = image()
+        source["os"]["distro"] = "ubuntu"
+        source["platform"]["tools"].update({"update-initramfs": True, "update-grub": True})
+        source["platform"]["kernels"][KERNEL]["portability"] = {"readable": True, "dracut_modules": ["systemd", "base"]}
+        result = plan_platform(source, options(source="unknown"))
+        self.assertTrue(result["ready"], result["blockers"])
+        self.assertEqual(result["initramfs_backend"], "dracut")
+        self.assertFalse(result["packages"])
+
+    def test_ubuntu_missing_dracut_network_can_be_installed_only_with_both_consents(self):
+        source = image()
+        source["os"]["distro"] = "ubuntu"
+        source["platform"]["tools"].update({"apt-get": True, "update-grub": True})
+        source["platform"].update(dracut_modules=[], iscsi_userspace_backend=None)
+        profile = options(boot_attachment="iscsi", install_packages=True)
+        self.assertFalse(plan_platform(source, profile, False)["ready"])
+        result = plan_platform(source, profile, True)
+        self.assertTrue(result["ready"], result["blockers"])
+        self.assertEqual(result["packages"], ["dracut-network"])
+
+    def test_arm_bare_metal_requires_actual_acpi_pci_and_nic_without_x86_controllers(self):
+        source = json.loads(json.dumps(image()).replace(KERNEL, "6.12.0-test.aarch64"))
+        source["os"]["arch"] = "aarch64"
+        source["boot"].update(architecture="aarch64", efi_loaders=[{"architecture": "aarch64"}])
+        kernel = next(iter(source["platform"]["kernels"].values()))
+        kernel["config"] = {key: "y" for key in ("CONFIG_ARM64", "CONFIG_EFI", "CONFIG_EFI_STUB", "CONFIG_ACPI", "CONFIG_PCI")}
+        for module in ("nvme", "nvme_core", "ahci"):
+            kernel["modules"].remove(module)
+        profile = options(source="vm", target="bare_metal", boot_attachment="iscsi", network_attachment="vfio", nic_driver="mlx5_core")
+        with patch("forge.architecture.worker_arch", return_value="aarch64"):
+            ready = plan_platform(source, profile)
+            self.assertTrue(ready["ready"], ready["blockers"])
+            self.assertFalse(ready["provider_supported"])
+            self.assertTrue(ready["experimental"])
+            self.assertFalse({"nvme", "ahci"} & set(ready["required_modules"]))
+            self.assertTrue({"iscsi_ibft", "iscsi_tcp", "mlx5_core"} <= set(ready["required_modules"]))
+            kernel["config"].pop("CONFIG_ACPI")
+            self.assertTrue(any("CONFIG_ACPI" in error for error in plan_platform(source, profile)["blockers"]))
+            kernel["config"]["CONFIG_ACPI"] = "y"
+            profile["nic_driver"] = None
+            self.assertTrue(any("actual target" in error for error in plan_platform(source, profile)["blockers"]))
+
+    def test_same_type_reconfiguration_is_valid(self):
+        result = plan_platform(image(), options(source="vm", target="vm"))
+        self.assertTrue(result["ready"], result["blockers"])
+        result = plan_platform(image(), options(source="unknown", target="vm"))
+        self.assertTrue(result["ready"], result["blockers"])
+        self.assertEqual(result["source"], "unknown")
+
     def test_arm_reconfiguration_requires_native_worker_and_uses_arm_console(self):
         source = json.loads(json.dumps(image()).replace(KERNEL, "6.12.0-test.aarch64"))
         source["os"]["arch"] = "aarch64"
@@ -539,6 +666,18 @@ class IscsiInitramfsTests(unittest.TestCase):
         source["platform"]["tools"]["iscsistart"] = False
         self.assertTrue(plan_platform(source, options(boot_attachment="iscsi"))["ready"])
 
+    def test_dracut110_var_hook_location_is_exact_and_still_required(self):
+        members = [name.replace("usr/lib/dracut/hooks/", "var/lib/dracut/hooks/") for name in self.modern]
+        result = self.run_native(members)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        unknown = [name.replace("var/lib/dracut/hooks/", "tmp/dracut/hooks/") for name in members]
+        self.assertNotEqual(self.run_native(unknown).returncode, 0)
+        g = Guest()
+        with patch.object(g, "initrd_cat", create=True, side_effect=lambda path, name:
+                          "iscsiadm -m fw -l\n" if name.endswith("iscsiroot") else "iscsi\nnetwork\nsystemd\n"):
+            self.assertTrue(_iscsi_archive_ready(g, "/boot/test.img", members + ["usr/lib/dracut/modules.txt"]))
+            self.assertFalse(_iscsi_archive_ready(g, "/boot/test.img", unknown + ["usr/lib/dracut/modules.txt"]))
+
     def test_each_modern_component_is_required_even_with_unused_legacy_helper(self):
         for missing in self.modern:
             with self.subTest(missing=missing):
@@ -571,6 +710,28 @@ class IscsiInitramfsTests(unittest.TestCase):
 
 
 class VerificationTests(unittest.TestCase):
+    def test_generated_mapper_and_uuid_must_both_resolve_to_actual_root(self):
+        source = image()
+        evidence = source["platform"]
+        device, alias = "/dev/ubuntu-vg/ubuntu-lv", "/dev/mapper/ubuntu--vg-ubuntu--lv"
+        evidence["fstab"]["root_device"] = device
+        evidence["portability"] = {"local_devices": [{"device": device, "aliases": [device, alias],
+                                                       "is_lv": True, "uuid": ROOT_UUID, "mountpoint": "/"}]}
+        def menu(arguments):
+            evidence["generated_grub"]["/boot/grub2/grub.cfg"] = f"linux /vmlinuz-{KERNEL} {arguments} quiet\n"
+        menu(f"root={alias} root=UUID={ROOT_UUID}")
+        self.assertTrue(verify_platform(source, options())["ready"])
+        for arguments in (f"root=UUID={ROOT_UUID} root={alias}", f"root=/dev/mapper/other root=UUID={ROOT_UUID}",
+                          f"root=/dev/sda1 root=UUID={ROOT_UUID}", f"root=UUID=wrong root=UUID={ROOT_UUID}",
+                          f"root={alias} root=UUID={ROOT_UUID} netroot=iscsi:old"):
+            with self.subTest(arguments=arguments):
+                menu(arguments)
+                self.assertFalse(verify_platform(source, options())["ready"])
+        menu(f"root={alias} root=UUID={ROOT_UUID}")
+        evidence["portability"]["local_devices"].append({"device": "/dev/other/root", "aliases": [],
+                                                        "is_lv": True, "uuid": ROOT_UUID, "mountpoint": "/other"})
+        self.assertFalse(verify_platform(source, options())["ready"])
+
     def test_late_grub_override_cannot_pass_correct_default_source(self):
         source = image()
         source["platform"]["generated_grub"]["/boot/grub2/grub.cfg"] = f"menuentry 'custom' {{\n linuxefi /vmlinuz-{KERNEL} root=/dev/sdb1 netroot=iscsi:old\n}}\n"

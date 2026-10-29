@@ -195,6 +195,7 @@ async function wizardValidateStep(id, remote = false) {
     if (remote && migration) await previewBootMigration(migration,true,$('#allow-network').checked);
   }
   if (id === 'mounts') {
+    validateMountPolicy();
     const fstab = $('[data-file="/etc/fstab"]');
     if (fstab.value !== fstab.defaultValue) {
       for (const [index,line] of fstab.value.split('\n').entries()) {
@@ -278,7 +279,7 @@ function wizardRenderReview() {
   startup.push(...recipe.files.filter(file => /\/cron|\/systemd\//.test(file.path)).map(file => `Edit ${file.path}`));
   add('Startup','startup',startup.length ? startup : ['Unchanged'],Boolean(startup.length));
   add('SSH access','access',sshAccessReview(recipe.ssh_access),Boolean(recipe.ssh_access));
-  add('Mounts','mounts',[recipe.files.some(file => file.path === '/etc/fstab') ? 'Update /etc/fstab' : 'Unchanged'],recipe.files.some(file => file.path === '/etc/fstab'));
+  add('Mounts','mounts',[recipe.mount_policy==='auto'?'Use filesystem UUIDs for local mounts':'Keep current mount identifiers',...(recipe.files.some(file=>file.path==='/etc/fstab')?['Apply manual fstab edits before the mount policy']:[])],recipe.mount_policy==='auto'||recipe.files.some(file=>file.path==='/etc/fstab'));
   const boot = [recipe.boot_migration ? `Migrate BIOS to UEFI; requested ESP ${recipe.boot_migration.esp_size_mib} MiB` : 'Keep existing firmware arrangement'];
   if (recipe.kernel_default) boot.push(`Default kernel: ${recipe.kernel_default}`);
   if (recipe.kernel_args) boot.push(`Kernel arguments: ${recipe.kernel_args}`);
@@ -290,7 +291,7 @@ function wizardRenderReview() {
   boot.push(recipe.allow_network ? 'Guest networking enabled during customization' : 'Guest networking disabled during customization');
   add('Boot and kernel','boot',boot,Boolean(recipe.boot_migration || recipe.kernel_default || recipe.kernel_args || recipe.packages_install.length || recipe.packages_remove.length || recipe.rebuild_initramfs || recipe.regenerate_grub || recipe.allow_network || recipe.files.some(file => /\/modules-load\.d\/|\/modprobe\.d\//.test(file.path))));
   add('Destination','export',[profiles[recipe.target].label,`Output: ${recipe.output_format.toUpperCase()}`,recipe.sparsify ? 'Reclaim unused space' : 'Keep unused blocks',...(recipe.output_format === 'qcow2' ? [recipe.compress ? 'Compress QCOW2 output' : 'Uncompressed QCOW2 output'] : [])]);
-  if(recipe.platform_migration) { const platform=recipe.platform_migration;add('Hardware compatibility','export',[platform.strategy==='preserve'?'Preserve & validate · hardware settings unchanged':'Reconfigure hardware settings',`${platform.source==='vm'?'Virtual machine':'Bare metal'} → ${platform.target==='vm'?'Virtual machine':'Bare metal'}`,`Boot: ${platform.boot_attachment}; network: ${platform.network_attachment==='accelerated'?'Accelerated PV':platform.network_attachment}`,...(platform.nic_driver?[`NIC driver: ${platform.nic_driver}`]:[]),...(platform.target==='bare_metal'?['Experimental · OCI bare-metal BYOI is unsupported']:[])]); }
+  if(recipe.platform_migration) { const platform=recipe.platform_migration;add('Hardware compatibility','export',[platform.strategy==='preserve'?'Preserve & validate · hardware settings unchanged':'Reconfigure hardware settings',platform.source==='unknown'?`Destination: ${platform.target==='vm'?'Virtual machine':'Bare metal'}; previous platform unspecified`:`${platform.source==='vm'?'Virtual machine':'Bare metal'} → ${platform.target==='vm'?'Virtual machine':'Bare metal'}`,`Boot: ${platform.boot_attachment}; network: ${platform.network_attachment==='accelerated'?'Accelerated PV':platform.network_attachment}`,...(platform.nic_driver?[platform.nic_driver==='auto'?'NIC drivers: automatic available bundle':`NIC driver: ${platform.nic_driver}`]:[]),...(platform.target==='bare_metal'?['Experimental · OCI bare-metal BYOI is unsupported']:[])]); }
   if (recipe.target === 'oci') {
     const firmware = recipe.oci?.capabilities?.['Compute.Firmware'];
     add('OCI compatibility','oci',recipe.oci ? [`Apply ${Object.keys(recipe.oci.capabilities).length} capability settings`,...(firmware ? [`Preferred firmware: ${firmware.default_value}; allowed: ${(firmware.values || [firmware.default_value]).join(', ')}`] : []),recipe.oci.guest.prepare ? 'Prepare the guest for selected capabilities' : 'Validate existing guest preparation'] : ['Disabled'],Boolean(recipe.oci));

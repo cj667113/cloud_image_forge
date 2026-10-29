@@ -29,10 +29,520 @@ NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,126}\Z")
 ARCHIVE_OPTIONS = {"compress": "gzip", "xattrs": True, "selinux": True, "acls": True}
 QUOTA_OPTIONS = {"quota", "qnoenforce", "uquota", "usrquota", "uqnoenforce", "gquota", "grpquota",
                  "gqnoenforce", "pquota", "prjquota", "pqnoenforce", "usrjquota", "grpjquota", "jqfmt"}
+LVM_PIN_ERROR = "Boot or mount configuration pins internal LVM UUIDs; this workflow preserves names and filesystem UUIDs only"
 
 
 class StorageError(RuntimeError):
     pass
+
+
+def _mount_identity(value):
+    return isinstance(value, str) and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{1,127}", value))
+
+
+def _fstab_unescape(value):
+    value = re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), value)
+    if any(character in value for character in "\0\r\n"):
+        raise StorageError("Mount references cannot contain NUL or line breaks")
+    return value
+
+
+def _filesystem_pairs(before, after):
+    """Map only a unique persistent identity, never position, size or fs type."""
+    pairs = []
+    for old in before:
+        matches, evidence = [], None
+        for field in ("partition_guid", "lv_uuid", "uuid"):
+            value = old.get(field)
+            norm = lambda item: str(item.get(field) or "").lower() if field == "uuid" else item.get(field)
+            if not value or sum(norm(item) == norm(old) for item in before) != 1:
+                continue
+            candidates = [item for item in after if norm(item) == norm(old)]
+            if len(candidates) == 1:
+                matches, evidence = candidates, field
+                break
+        if matches and old.get("filesystem") == matches[0].get("filesystem"):
+            pairs.append({"before": old, "after": matches[0], "evidence": evidence})
+    # Two old records may not converge on the same new filesystem.
+    counts = {}
+    for pair in pairs:
+        device = pair["after"]["device"]
+        counts[device] = counts.get(device, 0) + 1
+    return [pair for pair in pairs if counts[pair["after"]["device"]] == 1]
+
+
+def reconcile_fstab(text, filesystems, *, root_device, mounted=None, previous_filesystems=None):
+    """Plan UUID references using actual filesystems and an inspected OS root.
+
+    ``mounted`` is an independently observed mountpoint→device map, not fstab's
+    own mountpoint guesses. A stale root reference can be recovered from
+    ``root_device``. Other stale references require an actual mount or a unique
+    before→after GPT/LV identity. Filesystem UUIDs are never generated/changed.
+    """
+    result = {"version": 1, "ready": False, "errors": [], "warnings": [], "entries": [], "changes": [],
+              "content": text, "sha256": hashlib.sha256(text.encode()).hexdigest(), "root_uuid": None,
+              "uuid_map": [], "root_uuid_changed": False, "boot_update_required": False,
+              "boot_reference_check_required": False}
+    errors = result["errors"]
+    if len(text.encode()) > 2 * MIB or len(text.splitlines()) > 4096 or "\0" in text:
+        errors.append("fstab exceeds the bounded text/line limit or contains NUL bytes")
+        return result
+    if len(filesystems) > 256 or len(previous_filesystems or []) > 256:
+        errors.append("Filesystem identity inventory exceeds 256 entries")
+        return result
+    actual = [dict(item) for item in filesystems if item.get("filesystem") not in {None, "", "unknown", "LVM2_member", "crypto_LUKS", "linux_raid_member"}]
+    before = previous_filesystems or []
+    pairs = _filesystem_pairs(before, actual)
+    aliases, uuid_index, label_index, partuuid_index, partlabel_index = {}, {}, {}, {}, {}
+    for item in actual:
+        for alias in {item["device"], *item.get("aliases", [])}:
+            aliases.setdefault(alias, []).append(item)
+        for field, index, fold in (("uuid", uuid_index, True), ("label", label_index, False), ("partuuid", partuuid_index, True), ("partlabel", partlabel_index, False)):
+            if item.get(field):
+                value = item[field].lower() if fold else item[field]
+                index.setdefault(value, []).append(item)
+
+    def unique(values):
+        devices = {item["device"]: item for item in values}
+        return next(iter(devices.values())) if len(devices) == 1 else None
+
+    def candidates(source):
+        for prefix, index, fold in (("UUID=", uuid_index, True), ("LABEL=", label_index, False), ("PARTUUID=", partuuid_index, True), ("PARTLABEL=", partlabel_index, False),
+                                    ("/dev/disk/by-uuid/", uuid_index, True), ("/dev/disk/by-label/", label_index, False),
+                                    ("/dev/disk/by-partuuid/", partuuid_index, True), ("/dev/disk/by-partlabel/", partlabel_index, False)):
+            if source.startswith(prefix):
+                value = source[len(prefix):]
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                    value = value[1:-1]
+                return index.get(value.lower() if fold else value, [])
+        return aliases.get(source, [])
+
+    def selector(source, records=actual):
+        if records is not actual:
+            # Before-map lookups use exact source identities; aliases are data
+            # captured during earlier inspection, never synthesized by position.
+            prefixes = {"UUID=": "uuid", "LABEL=": "label", "PARTUUID=": "partuuid", "PARTLABEL=": "partlabel",
+                        "/dev/disk/by-uuid/": "uuid", "/dev/disk/by-label/": "label",
+                        "/dev/disk/by-partuuid/": "partuuid", "/dev/disk/by-partlabel/": "partlabel"}
+            for prefix, field in prefixes.items():
+                if source.startswith(prefix):
+                    value = source[len(prefix):]
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                        value = value[1:-1]
+                    if field in {"uuid", "partuuid"}:
+                        return unique([item for item in records if str(item.get(field, "")).lower() == value.lower()])
+                    return unique([item for item in records if item.get(field) == value])
+            return unique([item for item in records if source == item["device"] or source in item.get("aliases", [])])
+        return unique(candidates(source))
+
+    root = selector(root_device)
+    if root is None or not _mount_identity(root.get("uuid")) or len(uuid_index.get(root.get("uuid", "").lower(), [])) != 1:
+        errors.append("The independently inspected root must identify one filesystem with a unique usable UUID")
+    observed = dict(mounted or {})
+    if root:
+        if observed.get("/") and selector(observed["/"]) != root:
+            errors.append("Observed root mount disagrees with the independently inspected operating-system root")
+        observed["/"] = root["device"]
+        result["root_uuid"] = root["uuid"]
+    for pair in pairs:
+        old, new = pair["before"], pair["after"]
+        result["uuid_map"].append({"previous_device": old["device"], "device": new["device"],
+                                   "before": old.get("uuid"), "after": new.get("uuid"), "evidence": pair["evidence"],
+                                   "changed": str(old.get("uuid")).lower() != str(new.get("uuid")).lower()})
+        if root and new["device"] == root["device"] and str(old.get("uuid")).lower() != str(new.get("uuid")).lower():
+            result["root_uuid_changed"] = result["boot_update_required"] = True
+    changed_lines, roots, seen_mounts, swap_lines = [], [], {}, set()
+    for number, line in enumerate(text.splitlines(keepends=True), 1):
+        tokens = list(re.finditer(r"\S+", line))
+        tokens = tokens[:next((index for index, token in enumerate(tokens) if token.group().startswith("#")), len(tokens))]
+        if not tokens:
+            changed_lines.append(line)
+            continue
+        fields = [token.group() for token in tokens]
+        if not 4 <= len(fields) <= 6 or any(not re.fullmatch(r"[0-9]+", value) for value in fields[4:]):
+            errors.append(f"fstab line {number} has invalid fields; use 4–6 fields and escape spaces")
+            changed_lines.append(line)
+            continue
+        try:
+            source, mount = _fstab_unescape(fields[0]), _fstab_unescape(fields[1])
+        except StorageError as exc:
+            errors.append(f"fstab line {number}: {exc}")
+            changed_lines.append(line)
+            continue
+        fs, opts = fields[2:4]
+        if not mount.startswith("/") and not (fs == "swap" and mount in {"none", "swap", "-"}):
+            errors.append(f"fstab line {number} needs an absolute mountpoint")
+        options = set(opts.split(","))
+        optional = mount != "/" and bool(options & {"nofail", "noauto", "_netdev"})
+        entry = {"line": number, "source": fields[0], "mountpoint": mount, "filesystem": fs,
+                 "options": opts, "optional": optional}
+        result["entries"].append(entry)
+        if mount == "/":
+            roots.append(entry)
+        if mount in seen_mounts and fs != "swap":
+            errors.append(f"fstab mountpoint {mount} occurs more than once; automatic reconciliation would be ambiguous")
+        seen_mounts[mount] = number
+        if fs == "swap":
+            normalized = tuple(fields)
+            if normalized in swap_lines:
+                result["warnings"].append("Duplicate identical swap entry retained without modification")
+            swap_lines.add(normalized)
+        local = source.startswith(("/dev/", "UUID=", "LABEL=", "PARTUUID=", "PARTLABEL="))
+        if optional or not local or options & {"bind", "rbind"}:
+            entry["preserve"] = True
+            if mount == "/":
+                errors.append("Root fstab entry must reference the independently inspected local root filesystem")
+            changed_lines.append(line)
+            continue
+        current = selector(source)
+        expected = selector(observed[mount]) if mount in observed else None
+        if mount in observed and expected is None:
+            errors.append(f"fstab line {number}: the independently observed {mount} filesystem is missing or ambiguous in the current inventory")
+            entry["preserve"] = True
+            changed_lines.append(line)
+            continue
+        old = selector(source, before) if before else None
+        mapped = next((pair for pair in pairs if old is not None and pair["before"]["device"] == old["device"]), None)
+        reason = "Resolved current filesystem identity"
+        if current and mapped and current["device"] != mapped["after"]["device"]:
+            errors.append(f"fstab line {number}: existing identity conflicts with the preserved filesystem mapping")
+            entry["preserve"] = True
+            changed_lines.append(line)
+            continue
+        if current and expected and current["device"] != expected["device"]:
+            errors.append(f"fstab line {number}: existing identity points to another filesystem, not the observed {mount}; refusing to guess")
+            entry["preserve"] = True
+            changed_lines.append(line)
+            continue
+        if current is None:
+            # An ambiguous existing UUID/label must never be treated as stale.
+            duplicate = len(candidates(source)) > 1
+            if duplicate:
+                errors.append(f"fstab line {number}: filesystem identity is duplicated")
+            elif mapped:
+                current = mapped["after"]
+                reason = "Reconciled from unique preserved " + mapped["evidence"]
+            elif expected:
+                current = expected
+                reason = "Reconciled against independently inspected root" if mount == "/" else "Reconciled against an independently observed mount"
+            else:
+                errors.append(f"fstab line {number}: required {mount} has no unambiguous actual filesystem mapping")
+        if current is not None:
+            identity = current.get("uuid")
+            if not _mount_identity(identity) or len(uuid_index.get(str(identity).lower(), [])) != 1:
+                errors.append(f"fstab line {number}: {mount} needs a unique usable filesystem UUID")
+                current = None
+            elif fs != "auto" and fs != current.get("filesystem") and {fs, current.get("filesystem")} - {"vfat", "fat", "msdos"}:
+                errors.append(f"fstab line {number}: filesystem type disagrees with the actual {mount} filesystem")
+                current = None
+        if current is None:
+            entry["preserve"] = True
+            changed_lines.append(line)
+            continue
+        if expected and current["device"] != expected["device"]:
+            errors.append(f"fstab line {number}: identity map conflicts with the observed {mount}")
+        replacement = "UUID=" + current["uuid"]
+        entry.update({"device": current["device"], "uuid": current["uuid"], "replacement": replacement, "reason": reason})
+        if fields[0] != replacement:
+            result["changes"].append({"line": number, "mountpoint": mount, "from": fields[0], "to": replacement,
+                                       "device": current["device"], "reason": reason})
+            if (mount in {"/", "/boot", "/boot/efi", "/efi"} or current.get("partition_type") == EFI_GUID) and reason.startswith("Reconciled"):
+                result["boot_reference_check_required"] = True
+            changed_lines.append(line[:tokens[0].start()] + replacement + line[tokens[0].end():])
+        else:
+            changed_lines.append(line)
+        if mapped and str(mapped["before"].get("uuid")).lower() != current["uuid"].lower() and (mount in {"/", "/boot", "/boot/efi", "/efi"} or current.get("partition_type") == EFI_GUID):
+            result["boot_update_required"] = True
+    if len(roots) != 1 or not roots[0].get("uuid") or (root and roots[0].get("device") != root["device"]):
+        errors.append("Exactly one fstab root entry must resolve to the independently inspected root filesystem")
+    result["errors"] = list(dict.fromkeys(errors))
+    result["ready"] = not result["errors"]
+    if result["ready"]:
+        result["content"] = "".join(changed_lines)
+    return result
+
+
+def _prior_mount_filesystems(inspection):
+    """Upgrade old inspection records without inventing persistent identities."""
+    if not inspection:
+        return []
+    evidence = inspection.get("mount_reconciliation", {})
+    if evidence.get("version") == 1:
+        return deepcopy(evidence.get("filesystems", []))
+    storage = inspection.get("storage", {})
+    records = deepcopy(storage.get("filesystems") or inspection.get("partitions", []))
+    parts = {item["device"]: item for item in storage.get("layout", {}).get("partitions", [])}
+    lvs = {item.get("device"): item for item in storage.get("lvm", {}).get("lvs", [])}
+    for item in records:
+        part, lv = parts.get(item["device"], {}), lvs.get(item["device"], {})
+        if part.get("partition_guid"):
+            item["partition_guid"] = part["partition_guid"]
+        if lv.get("lv_uuid"):
+            item["lv_uuid"] = lv["lv_uuid"]
+    return records
+
+
+def _mount_inventory(g):
+    """Read current identities, independent of fstab-derived inspection hints."""
+    warnings, records = [], []
+    filesystems = g.list_filesystems()
+    if len(filesystems) > 256:
+        raise StorageError("Filesystem identity inventory exceeds 256 entries")
+    for device, filesystem in sorted(filesystems.items()):
+        if filesystem in {"", "unknown", "LVM2_member", "crypto_LUKS", "linux_raid_member"}:
+            continue
+        item = {"device": device, "filesystem": filesystem, "aliases": []}
+        records.append(item)
+        for field, method in (("uuid", "vfs_uuid"), ("label", "vfs_label")):
+            try:
+                item[field] = getattr(g, method)(device)
+            except RuntimeError:
+                item[field] = ""
+                warnings.append(f"Cannot read filesystem {field} for {device}; references requiring it remain unverified")
+        try:
+            canonical = g.lvm_canonical_lv_name(device)
+            if canonical and canonical.startswith("/dev/"):
+                item["lv_uuid"] = g.lvuuid(canonical)
+                item["aliases"].append(canonical)
+                parts = canonical.removeprefix("/dev/").split("/")
+                if len(parts) == 2 and all(NAME.fullmatch(part) for part in parts):
+                    item["aliases"].append("/dev/mapper/" + "-".join(part.replace("-", "--") for part in parts))
+                    try:
+                        vg_uuid = g.vguuid(parts[0]).replace("-", "")
+                        lv_uuid = item["lv_uuid"].replace("-", "")
+                        if re.fullmatch(r"[A-Za-z0-9]{32}", vg_uuid) and re.fullmatch(r"[A-Za-z0-9]{32}", lv_uuid):
+                            item["vg_uuid"] = vg_uuid
+                            item["aliases"].append("/dev/disk/by-id/dm-uuid-LVM-" + vg_uuid + lv_uuid)
+                    except (RuntimeError, AttributeError):
+                        warnings.append(f"Cannot verify the VG/LV identifier alias for {device}")
+                continue
+        except RuntimeError:
+            pass
+        try:
+            disk, number = g.part_to_dev(device), g.part_to_partnum(device)
+            table = g.part_get_parttype(disk)
+            if table == "gpt":
+                guid = UUID(g.part_get_gpt_guid(disk, number))
+                item.update(partuuid=str(guid), partition_guid=guid.bytes_le.hex(), partlabel=g.part_get_name(disk, number))
+                try:
+                    item["partition_type"] = g.part_get_gpt_type(disk, number).lower()
+                except (RuntimeError, AttributeError):
+                    warnings.append(f"Partition type is unavailable for {device}; custom EFI mountpoint classification remains unverified")
+            elif table == "msdos":
+                signature = g.pread_device(disk, 4, 440)
+                if len(signature) == 4:
+                    item["partuuid"] = f"{int.from_bytes(signature, 'little'):08x}-{number:02x}"
+        except (RuntimeError, ValueError):
+            # A filesystem UUID remains useful when optional table metadata is
+            # unavailable; no geometry fallback is introduced here.
+            pass
+    return records, warnings
+
+
+def _canonical_mount_device(g, device):
+    try:
+        return g.canonical_device_name(device)
+    except RuntimeError:
+        return device
+
+
+def _fstab_state(g):
+    """Configuration identity and metadata; never follow a mutable hardlink."""
+    for path in ("/etc", "/etc/fstab"):
+        if g.is_symlink(path):
+            raise StorageError(f"Mount reconciliation requires a regular {path}, not a symlink")
+    if not g.is_file("/etc/fstab"):
+        raise StorageError("A readable /etc/fstab is required for automatic mount reconciliation")
+    stat = g.statns("/etc/fstab")
+    if stat.get("st_nlink", 1) != 1:
+        raise StorageError("Mount reconciliation cannot edit a hard-linked /etc/fstab")
+    if g.filesize("/etc/fstab") > MIB:
+        raise StorageError("fstab exceeds the 1 MiB configuration limit")
+    data = g.read_file("/etc/fstab")
+    try:
+        text = data.decode("utf-8") if isinstance(data, bytes) else data
+    except UnicodeError as exc:
+        raise StorageError("fstab must be valid UTF-8 text") from exc
+    return text, {"sha256": hashlib.sha256(text.encode()).hexdigest(),
+                  "mode": stat["st_mode"] & 0o7777, "uid": stat["st_uid"], "gid": stat["st_gid"]}
+
+
+def inspect_mount_references(g, root, partitions=None, previous_inspection=None):
+    """Read-only preview, with the inspected root already mounted.
+
+    ``partitions`` is accepted for the platform inspector's shared interface but
+    never used as identity or mount evidence: its mountpoints come from fstab.
+    """
+    try:
+        text, state = _fstab_state(g)
+        filesystems, warnings = _mount_inventory(g)
+        root_device = _canonical_mount_device(g, root)
+        mounted = {_mount: _canonical_mount_device(g, device) for device, _mount in g.mountpoints().items()}
+        # Canonical device aliases are resolved by libguestfs, not by rewriting
+        # sd/vd/nvme strings or trusting fstab's requested mountpoint.
+        for line in text.splitlines():
+            fields = line.split()
+            if not fields or fields[0].startswith("#"):
+                continue
+            source = _fstab_unescape(fields[0])
+            if source.startswith("/dev/") and not source.startswith("/dev/disk/"):
+                canonical = _canonical_mount_device(g, source)
+                for item in filesystems:
+                    if canonical == item["device"] or canonical in item["aliases"]:
+                        item["aliases"].append(source)
+        for item in filesystems:
+            item["aliases"] = sorted(set(item["aliases"]) - {item["device"]})
+        result = reconcile_fstab(text, filesystems, root_device=root_device, mounted=mounted,
+                                 previous_filesystems=_prior_mount_filesystems(previous_inspection))
+        result.update(filesystems=filesystems, root_device=root_device, mounted=mounted, file_state=state)
+        result["warnings"] = list(dict.fromkeys(warnings + result["warnings"]))
+        return result
+    except (RuntimeError, AttributeError, ValueError, UnicodeError) as exc:
+        return {"version": 1, "ready": False, "errors": [f"Mount identity inspection is unavailable: {exc}"],
+                "warnings": [], "entries": [], "changes": [], "filesystems": [], "uuid_map": [],
+                "root_uuid": None, "boot_update_required": False, "boot_reference_check_required": False}
+
+
+def _inspect_mount_image(path, previous_inspection=None):
+    from .engine import _guest, _roots
+    with _guest(path, "qcow2", readonly=True) as g:
+        root = _roots(g)
+        g.mount_ro(root, "/")
+        return inspect_mount_references(g, root, previous_inspection=previous_inspection)
+
+
+def reconcile_mounts(work: Path, previous_inspection=None, policy="auto", log=lambda message: None):
+    """Apply source-token fixes to a disposable working disk; no guest execution.
+
+    Call after explicit filesystem edits. Reinspect again after every later
+    preparation step and before publication using ``verify_mounts``. Actual
+    boot filesystem UUID changes require a separate verified boot update and
+    are deliberately refused here; transport changes do not alter UUIDs.
+    """
+    if policy not in {"auto", "preserve"}:
+        raise StorageError("Mount policy must be auto or preserve")
+    plan = _inspect_mount_image(work, previous_inspection)
+    if not plan.get("file_state"):
+        raise StorageError("; ".join(plan["errors"]))
+    if policy == "auto" and not plan["ready"]:
+        raise StorageError("; ".join(plan["errors"]))
+    if policy == "auto" and plan["boot_update_required"]:
+        raise StorageError("A boot filesystem UUID changed: update and verify its GRUB and initramfs references before mount reconciliation")
+    changed = policy == "auto" and bool(plan["changes"])
+    if changed:
+        from .engine import _guest, _roots, _write_guest, _relabel_edited_files
+        with _guest(work, "qcow2", readonly=False) as g:
+            root = _roots(g)
+            g.mount(root, "/")
+            current = inspect_mount_references(g, root, previous_inspection=previous_inspection)
+            if (not current["ready"] or current["file_state"] != plan["file_state"]
+                    or current["filesystems"] != plan["filesystems"] or current["root_uuid"] != plan["root_uuid"]):
+                raise StorageError("Mount identities or fstab changed after reconciliation preflight")
+            _write_guest(g, "/etc/fstab", plan["content"])
+            _relabel_edited_files(g, ["/etc/fstab"])
+        log(f"Reconciled {len(plan['changes'])} local mount reference(s) against actual filesystem UUIDs")
+    final = _inspect_mount_image(work)
+    expected_hash = hashlib.sha256(plan["content"].encode()).hexdigest() if changed else plan["file_state"]["sha256"]
+    if not final.get("file_state") or final["file_state"]["sha256"] != expected_hash:
+        raise StorageError("Mount reconciliation readback did not match the expected fstab")
+    receipt = {"version": 1, "policy": policy, "changed": changed,
+               "changes": plan["changes"] if changed else [], "uuid_map": plan["uuid_map"],
+               "root_uuid": final["root_uuid"], "file_state": final["file_state"], "filesystems": final["filesystems"],
+               "mounts_validated": final["ready"], "warnings": list(plan["warnings"]),
+               "boot_reference_check_required": changed and plan["boot_reference_check_required"]}
+    if policy == "preserve" and plan["errors"]:
+        receipt["warnings"].append("Mount identifiers were preserved; existing unresolved references were not repaired or certified")
+    verification = verify_mounts(work, receipt, inspection=final)
+    if not verification["ready"]:
+        raise StorageError("; ".join(verification["blockers"]))
+    return receipt
+
+
+def verify_mounts(work: Path, receipt, *, inspection=None):
+    """Fresh output inspection checks the receipt; never trust source UUIDs."""
+    blockers = []
+    if not receipt or receipt.get("version") != 1 or not receipt.get("file_state") or not receipt.get("filesystems"):
+        return {"ready": False, "blockers": ["Mount verification receipt is missing or incomplete"]}
+    current = inspection if inspection is not None else _inspect_mount_image(work)
+    if current.get("file_state") != receipt["file_state"]:
+        blockers.append("fstab content or ownership/mode changed after mount reconciliation")
+    if current.get("root_uuid") != receipt.get("root_uuid"):
+        blockers.append("The independently inspected root UUID changed after mount reconciliation")
+    identity_fields = ("filesystem", "uuid", "label", "partition_guid", "partuuid", "partlabel", "lv_uuid", "vg_uuid")
+    before = {item["device"]: tuple(item.get(field) for field in identity_fields) for item in receipt["filesystems"]}
+    after = {item["device"]: tuple(item.get(field) for field in identity_fields) for item in current.get("filesystems", [])}
+    if before != after:
+        blockers.append("Output filesystem identities changed after mount reconciliation")
+    if receipt.get("policy") == "auto" and (not current.get("ready") or current.get("changes")):
+        blockers.extend(current.get("errors", []))
+        blockers.append("Output local mount references no longer match their reconciled UUIDs")
+    return {"ready": not blockers, "blockers": list(dict.fromkeys(blockers)),
+            "root_uuid": current.get("root_uuid"), "filesystems": current.get("filesystems", []),
+            "mounts_validated": current.get("ready", False), "actual_file_state": current.get("file_state")}
+
+
+def verify_mount_boot_references(inspection, receipt):
+    """Check existing boot selection after a stale critical fstab repair.
+
+    This does not regenerate boot files or assess a destination's transport.
+    Call against a fresh full inspection after all requested preparation.
+    """
+    required = bool(receipt and receipt.get("boot_reference_check_required"))
+    if not required:
+        return {"required": False, "ready": True, "blockers": []}
+    from .platform import _boot_args
+    from .portability import _boot_entries
+    blockers, evidence = [], inspection.get("platform", {})
+    current = inspection.get("mount_reconciliation") or evidence.get("fstab", {})
+    filesystems = current.get("filesystems", [])
+    root_uuid = current.get("root_uuid")
+    roots = [item for item in filesystems if item.get("uuid") == root_uuid]
+    if len(roots) != 1 or root_uuid != receipt.get("root_uuid"):
+        return {"required": True, "ready": False, "blockers": ["Fresh boot validation needs the reconciled actual root UUID and filesystem inventory"]}
+
+    def matches_root(value):
+        for prefix, field in (("UUID=", "uuid"), ("LABEL=", "label"), ("PARTUUID=", "partuuid"), ("PARTLABEL=", "partlabel"),
+                              ("/dev/disk/by-uuid/", "uuid"), ("/dev/disk/by-partuuid/", "partuuid")):
+            if value.startswith(prefix):
+                wanted = value[len(prefix):]
+                if len(wanted) >= 2 and wanted[0] == wanted[-1] and wanted[0] in "\"'":
+                    wanted = wanted[1:-1]
+                matches = [item for item in filesystems if (str(item.get(field) or "").lower() == wanted.lower()
+                           if field in {"uuid", "partuuid"} else item.get(field) == wanted)]
+                return len(matches) == 1 and matches[0]["device"] == roots[0]["device"]
+        matches = [item for item in filesystems if value == item["device"] or value in item.get("aliases", [])]
+        return len(matches) == 1 and matches[0]["device"] == roots[0]["device"]
+
+    blockers.extend(evidence.get("boot_environment_errors", []))
+    blockers.extend(evidence.get("generated_grub_errors", []))
+    try:
+        entries = _boot_entries(evidence)
+        if not entries:
+            blockers.append("No installed kernel boot entries are available for root-reference verification")
+        for version, records in entries.items():
+            if not records:
+                blockers.append(f"Kernel {version}: generated GRUB/BLS root selection is unverified")
+            for record in records:
+                values = [word[5:] for word in record["words"] if word.startswith("root=")]
+                if not values or not all(matches_root(value) for value in values):
+                    blockers.append(f"Kernel {version}: generated boot root does not resolve to the reconciled filesystem; regenerate and verify boot configuration")
+            archive = evidence.get("kernels", {}).get(version, {}).get("portability", {})
+            if not archive.get("readable"):
+                blockers.append(f"Kernel {version}: embedded initramfs root references are unreadable after the fstab repair")
+                continue
+            for name, text in archive.get("embedded_cmdline", {}).items():
+                words = _boot_args(" ".join(line for line in text.splitlines() if not line.lstrip().startswith("#")))
+                if any(not matches_root(word[5:]) for word in words if word.startswith("root=")):
+                    blockers.append(f"Kernel {version}: archived {name} retains a conflicting root reference; rebuild and verify initramfs")
+            if "embedded_fstab_present" not in archive or "embedded_mounts" not in archive:
+                blockers.append(f"Kernel {version}: archived mount references have not been inspected; refresh inspection")
+            for mount in archive.get("embedded_mounts", []):
+                if mount.get("mountpoint") in {"/", "/sysroot"} and not matches_root(mount["source"]):
+                    blockers.append(f"Kernel {version}: archived fstab retains a conflicting root mount; rebuild and verify initramfs")
+    except (ValueError, RuntimeError, TypeError, KeyError) as exc:
+        blockers.append("Cannot verify existing boot references after mount repair: " + str(exc))
+    return {"required": True, "ready": not blockers, "blockers": list(dict.fromkeys(blockers)),
+            "root_uuid": root_uuid, "boot_tested": False}
 
 
 def _ceil(value, unit=MIB):
@@ -108,10 +618,19 @@ def _inspect_initrd_lvm(g, identifiers, errors, warnings):
     for path in paths:
         record = {"path": path, "status": "unavailable", "checked_files": []}
         results.append(record)
+        reader = g
         try:
             names = {str(PurePosixPath(name)): name for name in g.initrd_list(path)}
         except RuntimeError:
             names = {}
+        if not set(names) & {"init", "usr/lib/systemd/systemd", "lib/systemd/systemd"}:
+            try:
+                from .initramfs import read_archive
+                reader = read_archive(g, path)
+                names = {str(PurePosixPath(name)): name for name in reader.initrd_list(path)}
+                record["formats"] = reader.formats
+            except (RuntimeError, ValueError, AttributeError, TypeError, OSError):
+                names = {}
         if not set(names) & {"init", "usr/lib/systemd/systemd", "lib/systemd/systemd"}:
             warnings.append(f"Cannot fully inspect embedded LVM metadata in {path}; its bytes will be preserved, and a UEFI boot test is required before use.")
             continue
@@ -123,7 +642,7 @@ def _inspect_initrd_lvm(g, identifiers, errors, warnings):
                 errors.append(f"Unsafe initramfs storage configuration path in {path}")
                 continue
             try:
-                value = g.initrd_cat(path, names[name])
+                value = reader.initrd_cat(path, names[name])
                 if len(value) > 2 * MIB:
                     raise RuntimeError("metadata too large")
                 text = value.decode("utf-8", "replace") if isinstance(value, bytes) else value
@@ -143,7 +662,8 @@ def _inspect_initrd_lvm(g, identifiers, errors, warnings):
 def inspect_storage(g, root, partitions: list[dict], layout: dict) -> dict:
     """Optional read-only evidence collector; call with the OS already mounted."""
     result = {"version": 1, "layout": deepcopy(layout), "filesystems": [],
-              "lvm": {"pvs": [], "vgs": [], "lvs": []}, "errors": [], "warnings": []}
+              "lvm": {"pvs": [], "vgs": [], "lvs": []}, "errors": [], "warnings": [],
+              "lvm_identity_pins": {"version": 1, "paths": [], "config_scan_complete": False, "fstab_sha256": None}}
     errors = result["errors"]
     try:
         if g.list_devices() != ["/dev/sda"]:
@@ -201,10 +721,15 @@ def inspect_storage(g, root, partitions: list[dict], layout: dict) -> dict:
                 errors.append("The mounted EFI partition's boot configuration directory is unreadable; LVM identity changes cannot be verified")
             else:
                 config_paths += g.glob_expand(esp_mount.rstrip("/") + "/EFI/*/grub.cfg")
-            config = "\n".join(_active(_read(g, path)) for path in config_paths)
+            configs = {path: _read(g, path) for path in sorted(set(config_paths))}
+            config = "\n".join(_active(text) for text in configs.values())
             identifiers = [str(item[key]).replace("-", "") for group, key in (("pvs", "pv_uuid"), ("vgs", "vg_uuid"), ("lvs", "lv_uuid")) for item in lvm[group]]
-            if any(identifier and identifier in config.replace("-", "") for identifier in identifiers):
-                errors.append("Boot or mount configuration pins internal LVM UUIDs; this workflow preserves names and filesystem UUIDs only")
+            pins = result["lvm_identity_pins"]
+            pins.update(paths=[path for path, text in configs.items() if any(identifier and identifier in _active(text).replace("-", "") for identifier in identifiers)],
+                        config_scan_complete=bool(esp_mount and g.is_dir(esp_mount.rstrip("/") + "/EFI")),
+                        fstab_sha256=hashlib.sha256(configs["/etc/fstab"].encode()).hexdigest())
+            if pins["paths"]:
+                errors.append(LVM_PIN_ERROR)
             if re.search(r"\buse_devicesfile\s*=\s*1\b", config):
                 errors.append("Guest requires an LVM devices file; automatic LVM identity regeneration is not supported")
             result["initramfs"] = _inspect_initrd_lvm(g, identifiers, errors, result["warnings"])
@@ -246,10 +771,10 @@ def _lvm_errors(lvm, partitions, filesystems):
     return errors
 
 
-def plan_rebuild(inspection: dict, options: dict | None, disk_size_gib=None) -> dict:
+def plan_rebuild(inspection: dict, options: dict | None, disk_size_gib=None, *, mount_policy="auto") -> dict:
     requested = bool(options and options.get("enabled"))
     result = {"requested": requested, "ready": False, "blockers": [], "warnings": [],
-              "changes": [], "layout": {}, "filesystems": [], "estimated_temporary_bytes": 0,
+              "changes": [], "layout": {}, "filesystems": [], "estimated_temporary_bytes": 0, "projected_mount_changes": [],
               "source_architecture": normalize_arch(inspection.get("os", {}).get("arch"))}
     if not requested:
         return result
@@ -258,7 +783,24 @@ def plan_rebuild(inspection: dict, options: dict | None, disk_size_gib=None) -> 
     if storage.get("version") != 1:
         errors.append("Storage rebuild evidence is missing; refresh inspection")
         return result
-    errors.extend(storage.get("errors", []))
+    source_errors = list(storage.get("errors", []))
+    if mount_policy not in {"auto", "preserve"}:
+        errors.append("Mount policy must be auto or preserve")
+    pins = storage.get("lvm_identity_pins", {})
+    mount = inspection.get("mount_reconciliation") or inspection.get("platform", {}).get("fstab", {})
+    initrds_checked = bool(storage.get("initramfs")) and all(item.get("status") == "checked" for item in storage["initramfs"])
+    if (mount_policy == "auto" and LVM_PIN_ERROR in source_errors
+            and pins.get("version") == 1 and pins.get("config_scan_complete")
+            and initrds_checked
+            and pins.get("paths") == ["/etc/fstab"] and mount.get("ready") and mount.get("changes")
+            and pins.get("fstab_sha256") == mount.get("sha256") and isinstance(mount.get("content"), str)):
+        identifiers = [str(item[key]).replace("-", "") for group, key in (("pvs", "pv_uuid"), ("vgs", "vg_uuid"), ("lvs", "lv_uuid"))
+                       for item in storage.get("lvm", {}).get(group, []) if item.get(key)]
+        if identifiers and not any(identifier in _active(mount["content"]).replace("-", "") for identifier in identifiers):
+            source_errors = [error for error in source_errors if error != LVM_PIN_ERROR]
+            result["projected_mount_changes"] = deepcopy(mount["changes"])
+            warnings.append("Automatic mount reconciliation will remove fstab-only LVM-ID references before rebuild; the executor must re-inspect the actual changed working disk. Boot/initramfs pins remain blocked.")
+    errors.extend(source_errors)
     warnings.extend(storage.get("warnings", []))
     old = storage.get("layout") or {}
     errors.extend(old.get("errors", []))
@@ -588,7 +1130,9 @@ def rebuild(source_work: Path, destination: Path, inspection: dict, recipe: dict
         raise StorageError("Rebuild source and destination must be different files")
     log("Refreshing storage evidence in the source working image before filesystem rebuild")
     fresh = ImageEngine().inspect(source_work)
-    plan = plan_rebuild(fresh, options, recipe.get("disk_size_gib"))
+    # Projection is preview-only. The actual source must already have had its
+    # fstab reconciled and freshly inspected before rebuilding LVM identities.
+    plan = plan_rebuild(fresh, options, recipe.get("disk_size_gib"), mount_policy="preserve")
     if not plan["ready"]:
         raise StorageError("Storage rebuild blocked: " + " ".join(plan["blockers"]))
     if fresh["format"] != "qcow2":

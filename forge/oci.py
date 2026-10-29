@@ -246,7 +246,7 @@ def capability_schema(config: OciConfig) -> dict:
 
 
 def compatibility_plan(inspection: dict, config: OciConfig, allow_network=False, boot_migration: dict | None = None,
-                       platform_migration: dict | None = None, *, project_platform=True) -> dict:
+                       platform_migration: dict | None = None, *, project_platform=True, mount_policy="auto") -> dict:
     from .oci_guest import plan_guest
 
     migration_plan = None
@@ -260,7 +260,7 @@ def compatibility_plan(inspection: dict, config: OciConfig, allow_network=False,
         from copy import deepcopy
         from .platform import plan_platform
         platform_plan = plan_platform(inspection, platform_migration, allow_network, config.model_dump(),
-                                      target_provider="oci", boot_migration=boot_migration)
+                                      target_provider="oci", boot_migration=boot_migration, mount_policy=mount_policy)
         if platform_migration.get("network_attachment") == "vfio":
             platform_nic_driver = platform_migration.get("nic_driver")
         if platform_plan["ready"] and not preserve_platform:
@@ -370,7 +370,7 @@ def compatibility_plan(inspection: dict, config: OciConfig, allow_network=False,
         if shape.shape == "BM.Standard.E5.192":
             if "ISCSI" not in allowed.get("Storage.BootVolumeType", []) or "VFIO" not in allowed.get("Network.AttachmentType", []):
                 plan["blockers"].append("BM.Standard.E5.192 requires iSCSI boot and hardware/VFIO networking in the allowed attachment types; its reviewed NIC driver is mlx5_core.")
-            if platform_migration and platform_migration.get("enabled") and platform_migration.get("nic_driver") not in {None, "mlx5_core"}:
+            if platform_migration and platform_migration.get("enabled") and platform_migration.get("nic_driver") not in {None, "auto", "mlx5_core"}:
                 plan["blockers"].append("BM.Standard.E5.192 uses mlx5_core on the reviewed hardware; the machine migration NIC driver conflicts with that target.")
     if config.import_options.shape_compatibility:
         plan["warnings"].append("Shape compatibility entries only advertise support. Verify the selected shapes' architecture, boot modes, memory/OCPU limits and confidential-computing support in the destination region.")

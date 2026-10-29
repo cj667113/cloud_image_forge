@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from forge.engine import (EngineError, GIB, MIB, ImageEngine, _grub_assignment,
-                          _input_format, _roots, _run, _validate_fstab, _validate_recipe)
+                          _input_format, _roots, _run, _validate_fstab, _validate_recipe, _mount, _run_guest_script)
 
 
 def qcow_header(*, backing=False, external=False, encrypted=False):
@@ -101,6 +101,16 @@ class HeaderTests(unittest.TestCase):
 
 
 class InspectionTests(unittest.TestCase):
+    def test_actual_mounts_resolve_persistent_aliases_and_independent_root(self):
+        guest = Mock()
+        guest.inspect_get_mountpoints.return_value = {
+            "/": "/dev/disk/by-id/old-root", "/boot": "/dev/disk/by-uuid/boot-id"}
+        guest.mountpoints.return_value = {"/dev/vg/root": "/", "/dev/sda2": "/boot"}
+        points = _mount(guest, "/dev/vg/root", True)
+        self.assertEqual(points, {"/": "/dev/vg/root", "/boot": "/dev/sda2"})
+        self.assertEqual(guest.mount_ro.call_args_list[0].args, ("/dev/vg/root", "/"))
+        guest.mount_ro.assert_any_call("/dev/disk/by-uuid/boot-id", "/boot")
+
     def test_boot_scan_precedes_os_mounts_and_is_shared_with_oci(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "disk.qcow2"
@@ -183,6 +193,38 @@ class FstabTests(unittest.TestCase):
 
 
 class CommandTests(unittest.TestCase):
+    def test_guest_script_uses_private_file_and_cleans_it_on_success_or_failure(self):
+        script = "set -eu\necho public-diagnostic"
+        for fails in (False, True):
+            with self.subTest(fails=fails):
+                paths = []
+                def run(command, log):
+                    path = Path(command[command.index("--run") + 1])
+                    paths.append(path)
+                    self.assertEqual(path.read_text(), "#!/bin/sh\n" + script + "\n")
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                    self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+                    self.assertIn("--network", command)
+                    self.assertIn("--selinux-relabel", command)
+                    self.assertNotIn(script, command)
+                    if fails:
+                        raise EngineError("actual guest failure")
+                    return "complete"
+                with patch("forge.engine._run", side_effect=run):
+                    if fails:
+                        with self.assertRaisesRegex(EngineError, "actual guest failure"):
+                            _run_guest_script(Path("work.qcow2"), script, lambda _: None, allow_network=True)
+                    else:
+                        self.assertEqual(_run_guest_script(Path("work.qcow2"), script, lambda _: None, allow_network=True), "complete")
+                self.assertTrue(paths)
+                self.assertFalse(paths[0].parent.exists())
+
+    def test_failure_retains_native_stdout_when_wrapper_stderr_is_long(self):
+        program = "import sys; print('native initramfs assertion failed'); sys.stderr.write('wrapper' * 1000); sys.exit(1)"
+        with self.assertRaisesRegex(EngineError, "native initramfs assertion failed") as error:
+            _run([sys.executable, "-c", program])
+        self.assertLess(len(str(error.exception)), 5200)
+
     def test_tool_output_memory_is_bounded(self):
         result = _run([sys.executable, "-c", "import sys; sys.stdout.write('x' * (3 * 1024 * 1024))"])
         self.assertEqual(len(result), 2 * MIB)
@@ -250,6 +292,66 @@ class RecipeTests(unittest.TestCase):
 
 
 class BuildTests(unittest.TestCase):
+    def setUp(self):
+        # Other orchestration tests isolate disk access; mount reconciliation
+        # has separate real-inventory tests and explicit publication tests below.
+        receipt = {"version": 1, "changed": False, "warnings": [], "changes": [],
+                   "uuid_map": [], "boot_reference_check_required": False}
+        for name, value in (("reconcile_mounts", receipt), ("verify_mounts", {"ready": True, "blockers": []}),
+                            ("verify_mount_boot_references", {"ready": True, "required": False, "blockers": []})):
+            patcher = patch("forge.storage." + name, return_value=value)
+            setattr(self, name, patcher.start())
+            self.addCleanup(patcher.stop)
+
+    def test_mount_failure_blocks_artifact_conversion_and_preserves_source(self):
+        def reject(work, receipt):
+            self.assertFalse((work.parent / "image.qcow2").exists())
+            self.assertEqual((work.parent.parent / "source.qcow2").read_bytes(), qcow_header())
+            return {"ready": False, "blockers": ["Root UUID changed unexpectedly"]}
+        self.verify_mounts.side_effect = reject
+        with self.assertRaisesRegex(EngineError, "Final mount verification.*Root UUID"):
+            self.run_build()
+        self.verify_mount_boot_references.assert_not_called()
+
+    def test_stale_boot_reference_check_survives_later_noop_reconciliation(self):
+        common = {"version": 1, "changed": False, "warnings": [], "changes": [], "uuid_map": []}
+        self.reconcile_mounts.side_effect = [
+            {**common, "changed": True, "boot_reference_check_required": True,
+             "changes": [{"mountpoint": "/", "from": "UUID=stale", "to": "UUID=current"}]},
+            {**common, "boot_reference_check_required": False}]
+        self.verify_mount_boot_references.return_value = {"ready": False, "blockers": ["Stale initramfs root selector"]}
+        with self.assertRaisesRegex(EngineError, "Final boot mount verification.*Stale initramfs"):
+            self.run_build()
+        receipt = self.verify_mount_boot_references.call_args.args[1]
+        self.assertTrue(receipt["boot_reference_check_required"])
+        self.assertEqual(receipt["changes"][0]["from"], "UUID=stale")
+
+    def test_prepared_inspection_is_reused_only_until_a_later_disk_write(self):
+        from forge.oci import OciConfig
+        for sparsify in (False, True):
+            with self.subTest(sparsify=sparsify), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                source = directory / "source.qcow2"
+                source.write_bytes(qcow_header())
+                info = inspection()
+                prepared = {**info, "prepared_snapshot": True}
+                engine = ImageEngine()
+                def run(command, log=None):
+                    if command[:2] == ["qemu-img", "convert"]:
+                        Path(command[-1]).write_bytes(qcow_header())
+                    return ""
+                with patch("forge.engine._run", side_effect=run), \
+                        patch("forge.engine._image_info", return_value={"virtual-size": info["virtual_size"]}), \
+                        patch.object(engine, "capabilities", return_value={"available": True}), \
+                        patch.object(engine, "inspect", side_effect=[info, prepared] if sparsify else [info]) as inspect, \
+                        patch.object(engine, "_customize"), \
+                        patch("forge.oci.compatibility_plan", return_value={"blockers": []}), \
+                        patch("forge.oci_guest.prepare_guest", return_value={"warnings": [], "_inspection": prepared}):
+                    result = engine.build(source, directory / "build", info,
+                                          {"target": "oci", "oci": OciConfig().model_dump(), "sparsify": sparsify}, lambda _: None)
+                self.assertEqual(inspect.call_count, 2 if sparsify else 1)
+                self.assertNotIn("_inspection", result)
+
     def test_ssh_applies_after_provider_preparation_and_verifies_before_conversion(self):
         from forge.oci import OciConfig
         for ready in (True, False):

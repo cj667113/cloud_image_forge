@@ -21,7 +21,7 @@ RUN case "$(dpkg --print-architecture)" in \
 # Debian's minimal appliance omits SELinux tools unless requested explicitly.
 # Install them in the worker and include them when supermin builds its appliance.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends policycoreutils selinux-utils \
+    && apt-get install -y --no-install-recommends policycoreutils selinux-utils libzstd1 ipxe-qemu \
     && set -- /usr/lib/*/guestfs/supermin.d/packages \
     && test "$#" -eq 1 && test -f "$1" \
     && printf 'policycoreutils\nselinux-utils\n' > "${1%/*}/zz-forge-selinux-packages" \

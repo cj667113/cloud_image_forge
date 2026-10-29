@@ -83,21 +83,19 @@ class StorageRebuild(StrictModel):
 class PlatformMigration(StrictModel):
     enabled: bool = False
     # Omitted strategy preserves the meaning of existing saved recipes. The UI
-    # explicitly chooses preserve for new hardware checks.
+    # explicitly supplies the selected preparation or preservation strategy.
     strategy: Literal["preserve", "reconfigure"] = "reconfigure"
-    source: Literal["vm", "bare_metal"] = "vm"
+    source: Literal["unknown", "vm", "bare_metal"] = "vm"
     target: Literal["vm", "bare_metal"] = "bare_metal"
     boot_attachment: Literal["paravirtualized", "iscsi"] = "iscsi"
     network_attachment: Literal["paravirtualized", "accelerated", "vfio"] = "vfio"
-    nic_driver: Literal["ixgbe", "ixgbevf", "i40e", "iavf", "mlx4_en", "mlx5_core", "bnxt_en"] | None = None
+    nic_driver: Literal["auto", "ixgbe", "ixgbevf", "i40e", "iavf", "mlx4_en", "mlx5_core", "bnxt_en"] | None = None
     install_packages: bool = False
     configure_network: bool = True
     configure_serial_console: bool = True
 
     @model_validator(mode="after")
     def migration_direction(self):
-        if self.enabled and self.strategy == "reconfigure" and self.source == self.target:
-            raise ValueError("Select different source and target machine types")
         if self.strategy == "preserve":
             for name in ("install_packages", "configure_network", "configure_serial_console"):
                 if name in self.model_fields_set and getattr(self, name):
@@ -166,6 +164,7 @@ class Recipe(StrictModel):
     storage_rebuild: StorageRebuild | None = None
     platform_migration: PlatformMigration | None = None
     ssh_access: SSHAccess | None = None
+    mount_policy: Literal["auto", "preserve"] = "auto"
     oci: OciConfig | None = None
 
     @field_validator("packages_install", "packages_remove")
@@ -212,6 +211,7 @@ class OciPlanRequest(StrictModel):
     allow_network: bool = False
     boot_migration: BootMigration | None = None
     platform_migration: PlatformMigration | None = None
+    mount_policy: Literal["auto", "preserve"] = "auto"
 
 
 class UefiPlanRequest(StrictModel):
@@ -222,6 +222,7 @@ class UefiPlanRequest(StrictModel):
 class StoragePlanRequest(StrictModel):
     storage_rebuild: StorageRebuild
     disk_size_gib: float | None = Field(default=None, gt=0, le=2048)
+    mount_policy: Literal["auto", "preserve"] = "auto"
 
 
 class PlatformPlanRequest(StrictModel):
@@ -230,6 +231,14 @@ class PlatformPlanRequest(StrictModel):
     target: Literal["oci", "aws", "azure", "gcp", "generic"] = "oci"
     oci: OciConfig | None = None
     boot_migration: BootMigration | None = None
+    mount_policy: Literal["auto", "preserve"] = "auto"
+
+
+class DestinationSelection(StrictModel):
+    profile_id: str = Field(min_length=1, max_length=160, pattern=r"^[A-Za-z0-9:_.-]+$")
+    source: Literal["unknown", "vm", "bare_metal"] = "unknown"
+    strategy: Literal["reconfigure", "preserve"] = "reconfigure"
+    nic_driver: Literal["auto", "ixgbe", "ixgbevf", "i40e", "iavf", "mlx4_en", "mlx5_core", "bnxt_en"] | None = None
 
 
 class OciSchemaRequest(StrictModel):

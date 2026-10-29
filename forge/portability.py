@@ -39,7 +39,8 @@ Every write to this completion hook must have the recognized OR expression.
 
 def inspect_archive(g, path, members=None):
     result = {"version": VERSION, "readable": False, "dracut_modules": [], "hostonly": None,
-              "embedded_cmdline": {}, "iscsi_local_root_completion": None, "lvm_userspace": False, "errors": []}
+              "embedded_cmdline": {}, "embedded_mounts": [], "embedded_fstab_present": False,
+              "iscsi_local_root_completion": None, "lvm_userspace": False, "errors": []}
     if not path:
         result["errors"].append("No initramfs was found.")
         return result
@@ -59,7 +60,24 @@ def inspect_archive(g, path, members=None):
         if len(cmdlines) > 64:
             raise ValueError("Too many embedded initramfs command-line files.")
         result["embedded_cmdline"] = {name: _archive_text(g, path, name, 65536) for name in cmdlines}
-        hooks = sorted(name for name in names if re.fullmatch(r"(?:usr/)?lib/dracut/hooks/cmdline/[0-9]+-parse-iscsiroot\.sh", name))
+        if "etc/fstab" in names:
+            result["embedded_fstab_present"] = True
+            fstab = _archive_text(g, path, "etc/fstab")
+            if len(fstab.splitlines()) > 4096:
+                raise ValueError("Embedded fstab exceeds the inspection line limit.")
+            for line in fstab.splitlines():
+                fields = line.split()
+                fields = fields[:next((index for index, value in enumerate(fields) if value.startswith("#")), len(fields))]
+                if not fields:
+                    continue
+                if not 4 <= len(fields) <= 6:
+                    raise ValueError("Embedded fstab contains unsupported fields.")
+                values = [re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), value) for value in fields[:3]]
+                if any(character in value for value in values for character in "\0\r\n"):
+                    raise ValueError("Embedded fstab contains invalid escapes.")
+                # Do not publish mount options, which may contain credentials.
+                result["embedded_mounts"].append(dict(zip(("source", "mountpoint", "filesystem"), values)))
+        hooks = sorted(name for name in names if re.fullmatch(r"(?:(?:usr|var)/)?lib/dracut/hooks/cmdline/[0-9]+-parse-iscsiroot\.sh", name))
         if len(hooks) > 8:
             raise ValueError("Too many archived iSCSI command-line hooks to verify.")
         systemd = {"systemd", "dracut-systemd"} <= set(result["dracut_modules"])
@@ -276,9 +294,10 @@ def assess_portability(inspection, options, target_provider="oci"):
             result["blockers"].extend(details or [label + " is not verified."])
     arch = normalize_arch(inspection.get("os", {}).get("arch"))
     architecture_errors = _architecture_errors(inspection, evidence.get("kernels", {}))
-    if arch == "aarch64" and (options.get("target") != "vm" or options.get("boot_attachment") != "paravirtualized"
-                               or options.get("network_attachment") not in {"paravirtualized", "accelerated"}):
-        architecture_errors.append("ARM64 preservation currently validates UEFI VM PV/Accelerated PV profiles, not ARM bare-metal or firmware-iSCSI targets.")
+    from .oci_guest import _hardware_architecture_errors
+    architecture_errors.extend(_hardware_architecture_errors(inspection, evidence.get("kernels", {}),
+                               iscsi=options.get("boot_attachment") == "iscsi",
+                               hardware_network=options.get("network_attachment") == "vfio"))
     check("architecture", "Native guest architecture", "blocked" if architecture_errors else "ready",
           architecture_errors or [f"Existing {arch} kernels are retained; no CPU architecture conversion is performed."])
     result["architecture"] = arch
@@ -321,8 +340,15 @@ def assess_portability(inspection, options, target_provider="oci"):
         mounts.append("A unique local root filesystem could not be resolved.")
     check("mounts", "Stable local mounts", "blocked" if mounts else "ready", mounts or ["Existing UUID/LVM mount identities resolve to this disk; rewriting fstab is unnecessary."])
     boot, network, nic = options.get("boot_attachment"), options.get("network_attachment"), options.get("nic_driver")
+    from .oci_guest import verified_nic_bundle
+    nic_modules = verified_nic_bundle(evidence.get("kernels", {})) if nic == "auto" else [nic] if nic in NIC_DRIVERS else []
+    result["nic_drivers"] = nic_modules if network == "vfio" else []
+    if network == "vfio" and nic == "auto":
+        if not nic_modules:
+            check("nic_bundle", "Automatic NIC bundle", "blocked", ["No supported physical NIC driver is present across every installed kernel."])
+        result["warnings"].append("The automatic NIC bundle validates installed driver coverage; the destination NIC remains unverified.")
     required = set(PV_DRIVERS if boot == "paravirtualized" else {"iscsi_tcp", "iscsi_ibft", "sd_mod"})
-    required.update({"virtio_pci", "virtio_net"} if network in {"paravirtualized", "accelerated"} else {nic} if nic in NIC_DRIVERS else set())
+    required.update({"virtio_pci", "virtio_net"} if network in {"paravirtualized", "accelerated"} else set(nic_modules))
     root = next((device for device in devices if device.get("mountpoint") == "/"), {})
     root_fs = root.get("filesystem")
     if root_fs in {"xfs", "ext4"}:

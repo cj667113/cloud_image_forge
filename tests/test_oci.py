@@ -355,8 +355,8 @@ def test_preservation_is_explicit_and_legacy_recipes_keep_reconfiguration():
     preserve = PlatformMigration(enabled=True, strategy="preserve", source="vm", target="vm")
     assert not preserve.install_packages and not preserve.configure_network and not preserve.configure_serial_console
     assert PlatformMigration.model_validate(preserve.model_dump()) == preserve
-    with pytest.raises(ValidationError, match="different source"):
-        PlatformMigration(enabled=True, source="vm", target="vm")
+    assert PlatformMigration(enabled=True, source="vm", target="vm").strategy == "reconfigure"
+    assert PlatformMigration(enabled=True, source="unknown", target="vm").source == "unknown"
     for field in ("install_packages", "configure_network", "configure_serial_console"):
         with pytest.raises(ValidationError, match="Preserve and validate"):
             PlatformMigration(enabled=True, strategy="preserve", **{field: True})

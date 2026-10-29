@@ -2,6 +2,7 @@
 from contextlib import contextmanager
 from copy import deepcopy
 import io
+import hashlib
 from pathlib import Path
 import shutil
 import tarfile
@@ -10,7 +11,7 @@ import unittest
 from unittest.mock import Mock, patch
 from uuid import UUID
 
-from forge.storage import (EFI_GUID, GIB, LINUX_GUID, LVM_GUID, MIB, StorageError,
+from forge.storage import (EFI_GUID, GIB, LINUX_GUID, LVM_GUID, LVM_PIN_ERROR, MIB, StorageError,
                            _archive_manifest, _compare_manifests, _configured_quotas, _inspect_initrd_lvm, _verify_layout,
                            inspect_storage, plan_rebuild, rebuild, verify_rebuild)
 
@@ -57,7 +58,44 @@ def inspected(lvm=True):
 OPTIONS = {"enabled": True, "sizes": [{"device": "/dev/ocivolume/root", "size_mib": 7680}]}
 
 
+def fstab_pinned():
+    image = inspected()
+    original = "/dev/disk/by-id/dm-uuid-LVM-vgidentitylvidentity / xfs defaults 0 1\n"
+    normalized = "UUID=root-uuid / xfs defaults 0 1\n"
+    digest = hashlib.sha256(original.encode()).hexdigest()
+    image["storage"]["errors"] = [LVM_PIN_ERROR]
+    image["storage"]["lvm_identity_pins"] = {"version": 1, "paths": ["/etc/fstab"], "config_scan_complete": True, "fstab_sha256": digest}
+    image["storage"]["initramfs"] = [{"path": "/boot/initramfs-test.img", "status": "checked"}]
+    image["mount_reconciliation"] = {"ready": True, "sha256": digest, "content": normalized,
+        "changes": [{"line": 1, "mountpoint": "/", "from": original.split()[0], "to": "UUID=root-uuid"}]}
+    return image
+
+
 class PlanTests(unittest.TestCase):
+    def test_only_verified_fstab_pins_can_be_projected_for_auto_preview(self):
+        image = fstab_pinned()
+        original = deepcopy(image)
+        result = plan_rebuild(image, OPTIONS, 10, mount_policy="auto")
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["projected_mount_changes"], image["mount_reconciliation"]["changes"])
+        self.assertEqual(image, original)
+        self.assertFalse(plan_rebuild(image, OPTIONS, 10, mount_policy="preserve")["ready"])
+
+    def test_pin_projection_never_waives_boot_pins_unknown_scan_or_stale_evidence(self):
+        for change in ("boot", "unknown", "hash", "unresolved", "still-pinned", "initrd", "unreadable-initrd", "old-evidence"):
+            with self.subTest(change=change):
+                image = fstab_pinned()
+                pins, mount = image["storage"]["lvm_identity_pins"], image["mount_reconciliation"]
+                if change == "boot": pins["paths"].append("/boot/grub/grub.cfg")
+                if change == "unknown": pins["config_scan_complete"] = False
+                if change == "hash": pins["fstab_sha256"] = "different"
+                if change == "unresolved": mount["ready"] = False
+                if change == "still-pinned": mount["content"] += "/dev/disk/by-id/dm-uuid-LVM-vgidentitylvidentity /data xfs defaults 0 1\n"
+                if change == "initrd": image["storage"]["errors"].append("Initramfs pins internal LVM identities")
+                if change == "unreadable-initrd": image["storage"]["initramfs"][0]["status"] = "unavailable"
+                if change == "old-evidence": image["storage"].pop("lvm_identity_pins")
+                self.assertFalse(plan_rebuild(image, OPTIONS, 10)["ready"])
+
     def test_disabled_and_old_inspection_fail_closed(self):
         self.assertFalse(plan_rebuild({}, None)["requested"])
         plan = plan_rebuild({}, OPTIONS)
@@ -336,6 +374,22 @@ class InspectionTests(unittest.TestCase):
                 result = inspect_storage(g, "root", parts, image["storage"]["layout"])
                 self.assertTrue(result["errors"])
 
+    def test_pin_evidence_identifies_exact_paths_and_original_fstab_hash(self):
+        image = inspected()
+        g = self.guest(image)
+        text = "/dev/disk/by-id/dm-uuid-LVM-vgidentitylvidentity / xfs defaults 0 1\n"
+        g.is_file.side_effect = lambda path: path == "/etc/fstab"
+        g.is_dir.return_value = True
+        g.filesize.return_value = len(text)
+        g.read_file.return_value = text.encode()
+        parts = deepcopy(image["storage"]["filesystems"])
+        for part in parts:
+            part["logical_volume"] = part["kind"] == "lv"
+        result = inspect_storage(g, "/dev/ocivolume/root", parts, image["storage"]["layout"])
+        self.assertEqual(result["lvm_identity_pins"], {"version": 1, "paths": ["/etc/fstab"],
+                         "config_scan_complete": True, "fstab_sha256": hashlib.sha256(text.encode()).hexdigest()})
+        self.assertIn(LVM_PIN_ERROR, result["errors"])
+
     def test_embedded_lvm_pins_block_but_unreadable_initrd_is_explicit_warning(self):
         g = Mock()
         g.glob_expand.side_effect = lambda pattern: ["/boot/initramfs-6.12.img"] if pattern == "/boot/initramfs-*.img" else []
@@ -389,6 +443,18 @@ class InspectionTests(unittest.TestCase):
 
 
 class ExecutorTests(unittest.TestCase):
+    def test_executor_requires_actual_pin_removal_even_when_preview_can_project_it(self):
+        image = fstab_pinned()
+        self.assertTrue(plan_rebuild(image, OPTIONS, 10)["ready"])
+        with tempfile.TemporaryDirectory() as folder, patch("forge.engine.ImageEngine.inspect", return_value=image), patch("forge.engine._guest") as guest:
+            source, output = Path(folder) / "source", Path(folder) / "output"
+            source.write_bytes(b"source")
+            with self.assertRaisesRegex(StorageError, "pins internal"):
+                rebuild(source, output, image, {"storage_rebuild": OPTIONS, "disk_size_gib": 10}, lambda _: None)
+            guest.assert_not_called()
+            self.assertFalse(output.exists())
+            self.assertEqual(source.read_bytes(), b"source")
+
     def run_rebuild(self, root, corrupt=False, fail_restore=False, arch="x86_64"):
         root = root.resolve()
         image = inspected()

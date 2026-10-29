@@ -81,9 +81,25 @@ def _run(args: list[str], log: Callable[[str], None] | None = None) -> str:
             raise
         output, error = read_tail(stdout), read_tail(stderr)
         if process.returncode:
-            detail = (error or output).strip()[-5000:]
+            if error.strip() and output.strip():
+                detail = "stderr:\n" + error.strip()[-2400:] + "\nstdout:\n" + output.strip()[-2400:]
+            else:
+                detail = (error or output).strip()[-5000:]
             raise EngineError(f"{args[0]} failed ({process.returncode}): {detail}")
         return output
+
+
+def _run_guest_script(work, script, log, *, allow_network=False, relabel=True):
+    """Keep script bodies out of tool errors; run only in the guest appliance."""
+    with tempfile.TemporaryDirectory(prefix="forge-guest-script-") as directory:
+        path = Path(directory) / "prepare.sh"
+        with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as stream:
+            stream.write("#!/bin/sh\n" + script + "\n")
+        command = ["virt-customize", "--format", "qcow2", "-a", str(work),
+                   "--network" if allow_network else "--no-network", "--run", str(path)]
+        if relabel:
+            command.append("--selinux-relabel")
+        return _run(command, log)
 
 
 def _input_format(path: Path) -> str:
@@ -165,7 +181,10 @@ def _guest(path: Path, fmt: str, readonly: bool = True):
 
 
 def _mount(handle, root: str, readonly: bool) -> dict:
-    points = handle.inspect_get_mountpoints(root)
+    points = dict(handle.inspect_get_mountpoints(root))
+    # inspect_os identifies the root independently of fstab. Mount that device
+    # even when an old UUID or a persistent alias appears in the root entry.
+    points["/"] = root
     for mountpoint, device in sorted(points.items(), key=lambda item: len(item[0])):
         if not mountpoint.startswith("/") or ".." in PurePosixPath(mountpoint).parts:
             raise EngineError("Invalid mountpoint in guest filesystem.")
@@ -176,7 +195,9 @@ def _mount(handle, root: str, readonly: bool) -> dict:
                 handle.mount(device, mountpoint)
         except RuntimeError as exc:
             raise EngineError(f"Unable to mount guest {mountpoint} ({device}); all configured local filesystems must be available.") from exc
-    return points
+    # Persistent by-id/by-uuid names are valid mount inputs, but they are not
+    # device inventory keys. Use the devices actually mounted by the appliance.
+    return {mountpoint: device for device, mountpoint in handle.mountpoints().items()}
 
 
 def _roots(handle) -> str:
@@ -236,13 +257,13 @@ def _validate_fstab(content: str, handle=None) -> None:
             raise EngineError(f"fstab line {number}: required {source} for {mountpoint} does not exist in the image. Use the correct identity, or nofail/noauto for a future optional volume.") from exc
 
 
-def _write_guest(handle, path: str, content: str) -> None:
+def _write_guest(handle, path: str, content: str, *, validate_mounts=True) -> None:
     if not _allowed_file(path):
         raise EngineError(f"Editing {path} is not allowed.")
     if len(content.encode()) > MIB or "\x00" in content:
         raise EngineError("Configuration files must be UTF-8 text, at most 1 MiB, without NUL bytes.")
     if path == "/etc/fstab":
-        _validate_fstab(content, handle)
+        _validate_fstab(content, handle if validate_mounts else None)
     if handle.is_symlink(path):
         raise EngineError(f"Refusing to replace symlink {path}; use a regular configuration file.")
     metadata = handle.statns(path) if handle.is_file(path) else None
@@ -295,6 +316,8 @@ def _relabel_edited_files(g, paths):
 
 
 def _validate_recipe(recipe: dict, inspection: dict) -> None:
+    if recipe.get("mount_policy", "auto") not in {"auto", "preserve"}:
+        raise EngineError("Mount policy must be auto or preserve.")
     if normalize_arch(inspection.get("os", {}).get("arch")) not in SUPPORTED_ARCHES:
         raise EngineError("A detected x86_64 or ARM64 (aarch64) guest architecture is required; refresh inspection.")
     execution_error = recipe_execution_blocker(inspection, recipe)
@@ -329,7 +352,8 @@ def _validate_recipe(recipe: dict, inspection: dict) -> None:
         from .storage import plan_rebuild
         if recipe.get("partition_changes") or recipe.get("expand_partition") or recipe.get("expand_lv"):
             raise EngineError("Filesystem rebuild cannot be combined with direct partition or LV expansion actions.")
-        storage_plan = plan_rebuild(inspection, recipe["storage_rebuild"], size)
+        storage_plan = plan_rebuild(inspection, recipe["storage_rebuild"], size,
+                                    mount_policy=recipe.get("mount_policy", "auto"))
         if not storage_plan["ready"]:
             raise EngineError("Storage rebuild blocked: " + " ".join(storage_plan["blockers"]))
     for item in recipe.get("files", []):
@@ -365,6 +389,22 @@ def _validate_recipe(recipe: dict, inspection: dict) -> None:
     kernel = recipe.get("kernel_default")
     if kernel and (kernel not in inspection.get("kernels", []) or not re.fullmatch(r"/boot/vmlinuz-[A-Za-z0-9_.+~-]+", kernel)):
         raise EngineError("Default kernel must name an inspected installed /boot/vmlinuz-* image.")
+
+
+def _merge_mount_receipts(previous, current):
+    """Rebase final identities without losing an earlier critical repair."""
+    if not previous:
+        return current
+    result = dict(current)
+    for key in ("changes", "uuid_map", "warnings"):
+        result[key] = []
+        for item in previous.get(key, []) + current.get(key, []):
+            if item not in result[key]:
+                result[key].append(item)
+    result["changed"] = bool(previous.get("changed") or current.get("changed"))
+    result["boot_reference_check_required"] = bool(previous.get("boot_reference_check_required")
+                                                   or current.get("boot_reference_check_required"))
+    return result
 
 
 class ImageEngine:
@@ -453,6 +493,7 @@ class ImageEngine:
                 "services": sorted(services), "systemd": systemd, "kernels": kernels, "oci_evidence": oci_evidence, "boot": boot,
                 "uefi_migration": {"version": 1, "layout": migration_layout, "guest": migration_guest},
                 "storage": storage, "platform": platform, "ssh_access": ssh_access,
+                "mount_reconciliation": platform.get("fstab"),
                 "warnings": ["Bootability and cloud-agent compatibility require a test launch after export."]}
 
     def _resize(self, work: Path, destination: Path, inspection: dict, recipe: dict, log) -> Path:
@@ -499,6 +540,7 @@ class ImageEngine:
         return resized
 
     def _customize(self, work: Path, inspection: dict, recipe: dict, log) -> None:
+        mount_receipt = None
         foreign = execution_blocker(inspection.get("os", {}).get("arch"))
         if foreign and customization_requires_execution(recipe):
             raise EngineError(foreign)
@@ -509,17 +551,25 @@ class ImageEngine:
             with _guest(work, "qcow2", readonly=False) as g:
                 _mount(g, _roots(g), False)
                 for item in files:
-                    _write_guest(g, item["path"], item["content"])
+                    if item["path"] == "/etc/fstab" and recipe.get("mount_policy", "auto") == "auto":
+                        _write_guest(g, item["path"], item["content"], validate_mounts=False)
+                    else:
+                        _write_guest(g, item["path"], item["content"])
                 if args is not None:
                     value = g.read_file("/etc/default/grub") if g.is_file("/etc/default/grub") else b""
                     content = value.decode() if isinstance(value, bytes) else value
                     _write_guest(g, "/etc/default/grub", _grub_assignment(content, "GRUB_CMDLINE_LINUX", args))
                 if foreign:
                     _relabel_edited_files(g, [item["path"] for item in files])
+        if any(item["path"] == "/etc/fstab" for item in files):
+            from .storage import reconcile_mounts
+            # Native tools mount from fstab themselves, so reconcile explicit
+            # edits before launching a guest package or service command.
+            mount_receipt = reconcile_mounts(work, inspection, recipe.get("mount_policy", "auto"), log)
         if foreign:
             # File writes and labeling use appliance-native tools. Never ask
             # virt-customize to execute a foreign /bin/sh or labeling fallback.
-            return
+            return mount_receipt
         command = ["virt-customize", "--format", "qcow2", "-a", str(work),
                    "--network" if recipe.get("allow_network") else "--no-network"]
         changed = bool(files or args is not None)
@@ -548,6 +598,7 @@ class ImageEngine:
             # virt-customize releases accept this compatibility option.
             command += ["--selinux-relabel"]
             _run(command, log)
+        return mount_receipt
 
     def build(self, source: Path, destination_dir: Path, inspection: dict, recipe: dict,
               log: Callable[[str], None]) -> dict:
@@ -561,20 +612,23 @@ class ImageEngine:
         if migration_plan["requested"] and not migration_plan["ready_to_migrate"]:
             raise EngineError("UEFI migration blocked: " + " ".join(migration_plan["blockers"]))
         from .platform import plan_platform, prepare_platform, verify_platform
+        from .storage import reconcile_mounts, verify_mounts, verify_mount_boot_references
+        mount_policy = recipe.get("mount_policy", "auto")
         platform_options = recipe.get("platform_migration")
         platform_plan = plan_platform(inspection, platform_options, recipe.get("allow_network", False),
                                       recipe.get("oci"), target_provider=recipe.get("target", "generic"),
-                                      boot_migration=migration_options)
+                                      boot_migration=migration_options, mount_policy=mount_policy)
         if platform_plan["requested"] and not platform_plan["ready"]:
             raise EngineError("Hardware compatibility blocked: " + " ".join(platform_plan["blockers"]))
         from .storage import plan_rebuild
-        storage_plan = plan_rebuild(inspection, recipe.get("storage_rebuild"), recipe.get("disk_size_gib"))
+        storage_plan = plan_rebuild(inspection, recipe.get("storage_rebuild"), recipe.get("disk_size_gib"),
+                                    mount_policy=mount_policy)
         oci_config = None
         if recipe.get("oci") is not None:
             from .oci import OciConfig, compatibility_plan
             oci_config = OciConfig.model_validate(recipe["oci"])
             preflight = compatibility_plan(inspection, oci_config, recipe.get("allow_network", False), migration_options,
-                                           platform_migration=platform_options)
+                                           platform_migration=platform_options, mount_policy=mount_policy)
             if preflight["blockers"]:
                 raise EngineError("OCI preparation blocked: " + " ".join(preflight["blockers"]))
         if not self.capabilities()["available"]:
@@ -599,29 +653,40 @@ class ImageEngine:
             warnings.append("On grubby/BLS guests, requested kernel arguments update matching names and retain other existing arguments.")
         log("Creating an independent QCOW2 working copy; source remains unchanged")
         _run(["qemu-img", "convert", "-f", fmt, "-O", "qcow2", str(source), str(work)], log)
-        work = self._resize(work, destination_dir, inspection, recipe, log)
-        self._customize(work, inspection, recipe, log)
+        initial_mount_receipt = reconcile_mounts(work, inspection, mount_policy, log)
+        resize_inspection = self.inspect(work) if storage_plan["requested"] and initial_mount_receipt["changed"] else inspection
+        work = self._resize(work, destination_dir, resize_inspection, recipe, log)
+        edit_mount_receipt = self._customize(work, resize_inspection, recipe, log)
+        mount_receipt = initial_mount_receipt
+        if isinstance(edit_mount_receipt, dict):
+            mount_receipt = _merge_mount_receipts(mount_receipt, edit_mount_receipt)
+        mount_receipt = _merge_mount_receipts(mount_receipt, reconcile_mounts(work, resize_inspection, mount_policy, log))
+        warnings.extend(mount_receipt.get("warnings", []))
         if migration_plan["requested"]:
             customized = self.inspect(work)
             migration = migrate(work, customized, migration_options, recipe.get("allow_network", False), log)
             migration_plan = migration["plan"]
             warnings.extend(migration["warnings"])
+            mount_receipt = _merge_mount_receipts(mount_receipt, reconcile_mounts(work, customized, mount_policy, log))
         platform_receipt = None
+        prepared_inspection = None
         if platform_plan["requested"]:
             # Preservation starts after the user's explicit storage/kernel/file
             # edits. It never substitutes planned readiness for this inspection.
             customized = self.inspect(work)
             platform_receipt = prepare_platform(work, customized, platform_options, recipe.get("allow_network", False), log,
-                                                oci_config=recipe.get("oci"), target_provider=target)
+                                                oci_config=recipe.get("oci"), target_provider=target, mount_policy=mount_policy)
+            prepared_inspection = platform_receipt.pop("_inspection", None)
             warnings.extend(platform_receipt["warnings"])
         if oci_config is not None:
             from .oci_guest import prepare_guest
             # Manual package/configuration edits may invalidate the original evidence.
-            customized = self.inspect(work)
+            customized = prepared_inspection if prepared_inspection is not None else self.inspect(work)
             preparation = prepare_guest(work, customized, oci_config.model_dump(),
                                         recipe.get("allow_network", False), log,
                                         extra_required_modules=platform_plan.get("required_modules", []) if platform_plan["requested"] else (),
-                                        platform_migration=platform_options)
+                                        platform_migration=platform_options, mount_policy=mount_policy)
+            prepared_inspection = preparation.pop("_inspection", None)
             warnings.extend(preparation["warnings"])
             if platform_plan["requested"] and preparation.get("verified_initrds"):
                 platform_receipt = preparation
@@ -630,23 +695,30 @@ class ImageEngine:
         if ssh_requested(recipe.get("ssh_access")):
             # Authentication settings are explicit user edits and must follow
             # cloud/provider preparation, which can rewrite cloud-init policy.
-            customized = self.inspect(work)
+            customized = prepared_inspection if prepared_inspection is not None else self.inspect(work)
             ssh_receipt = apply_access(work, customized, recipe["ssh_access"], log)
+            prepared_inspection = None
             warnings.extend(ssh_receipt["warnings"])
             if platform_plan["requested"] and (platform_options or {}).get("strategy") == "preserve":
                 # Re-establish the hardware preservation baseline after these
                 # explicitly requested auth edits, then enforce it at export.
                 customized = self.inspect(work)
                 platform_receipt = prepare_platform(work, customized, platform_options, recipe.get("allow_network", False), log,
-                                                    oci_config=recipe.get("oci"), target_provider=target)
+                                                    oci_config=recipe.get("oci"), target_provider=target, mount_policy=mount_policy)
+                prepared_inspection = platform_receipt.pop("_inspection", None)
         if recipe.get("sparsify", True):
             log("Discarding unused guest filesystem blocks")
             _run(["virt-sparsify", "--in-place", "--format", "qcow2", str(work)], log)
+            prepared_inspection = None
         _run(["qemu-img", "check", "-f", "qcow2", str(work)], log)
         # Reinspection verifies the root filesystem and mounts libguestfs recognizes;
         # it is not a complete fstab validator or a substitute for a boot test.
-        log("Inspecting the customized guest")
-        result_inspection = self.inspect(work)
+        if prepared_inspection is None:
+            log("Inspecting the customized guest")
+            result_inspection = self.inspect(work)
+        else:
+            log("Using the final inspected guest state; no disk changes since preparation")
+            result_inspection = prepared_inspection
         if normalize_arch(result_inspection.get("os", {}).get("arch")) != normalize_arch(inspection["os"]["arch"]):
             raise EngineError("Export changed or lost the guest CPU architecture; architecture conversion is unsupported.")
         if inspection.get("kernels") and not result_inspection.get("kernels"):
@@ -693,12 +765,20 @@ class ImageEngine:
         platform_result = None
         if platform_plan["requested"]:
             platform_result = verify_platform(result_inspection, platform_options, oci_config=recipe.get("oci"),
-                                              target_provider=target, receipt=platform_receipt)
+                                              target_provider=target, receipt=platform_receipt, mount_policy=mount_policy)
             if not platform_result["ready"]:
                 raise EngineError("Final hardware compatibility verification failed: " + " ".join(platform_result["blockers"]))
         ssh_result = verify_access(work, ssh_receipt)
         if ssh_result is not None and not ssh_result["ready"]:
             raise EngineError("Final SSH access verification failed: " + " ".join(ssh_result["blockers"]))
+        mount_result = verify_mounts(work, mount_receipt)
+        if not mount_result["ready"]:
+            raise EngineError("Final mount verification failed: " + " ".join(mount_result["blockers"]))
+        boot_mount_result = verify_mount_boot_references(result_inspection, mount_receipt)
+        if not boot_mount_result["ready"]:
+            raise EngineError("Final boot mount verification failed: " + " ".join(boot_mount_result["blockers"]))
+        mount_result.update(policy=mount_policy, changes=mount_receipt.get("changes", []),
+                            uuid_map=mount_receipt.get("uuid_map", []), boot_references=boot_mount_result)
         filenames = {"qcow2": "image.qcow2", "raw": "image.raw", "vhd": "image.vhd", "gcp": "image.tar.gz"}
         output = destination_dir / filenames[final_format]
         conversion = destination_dir / "disk.raw" if final_format == "gcp" else output
@@ -736,4 +816,5 @@ class ImageEngine:
                 "virtual_size": virtual_size, "sha256": digest.hexdigest(), "warnings": warnings,
                 "boot": result_inspection.get("boot"),
                 "storage_rebuild": storage_result,
-                "platform_migration": platform_result, "ssh_access": ssh_result}
+                "platform_migration": platform_result, "ssh_access": ssh_result,
+                "mount_reconciliation": mount_result}

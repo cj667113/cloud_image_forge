@@ -10,7 +10,8 @@ from unittest.mock import Mock, patch
 from forge.engine import EngineError, _validate_recipe
 from forge.oci import OciConfig
 from forge.oci_guest import (MODULE_CONFIG, _initramfs_script, _network_evidence,
-                             _network_files, inspect_guest, plan_guest, prepare_guest)
+                             _network_files, _oracle_datasource_selected, _cloud_units, _tool_file,
+                             CLOUD_CONFIG, inspect_guest, plan_guest, prepare_guest, _iscsi_module_directory)
 
 
 VERSION = "6.12.0-204.92.4.4.3.el9uek.x86_64"
@@ -48,6 +49,24 @@ def arm_inspected():
 
 
 class PlanTests(unittest.TestCase):
+    def test_ubuntu_dracut_wrapper_uses_archived_generator_evidence(self):
+        image = inspected()
+        image["os"]["distro"] = "ubuntu"
+        image["oci_evidence"]["tools"].update({"update-initramfs": True, "update-grub": True})
+        image["platform"] = {"kernels": {VERSION: {"initrd": image["oci_evidence"]["kernels"][VERSION]["initrd"],
+                                                  "portability": {"readable": True, "dracut_modules": ["systemd", "base"]}}}}
+        result = plan_guest(image, config())
+        self.assertEqual(result["blockers"], [])
+        self.assertEqual(result["initramfs_backend"], "dracut")
+        image["platform"]["kernels"][VERSION]["initrd"] = "/boot/other.img"
+        self.assertEqual(plan_guest(image, config())["initramfs_backend"], "initramfs-tools")
+        image["platform"]["kernels"][VERSION]["initrd"] = image["oci_evidence"]["kernels"][VERSION]["initrd"]
+        image["platform"]["kernels"][VERSION]["portability"]["readable"] = False
+        self.assertEqual(plan_guest(image, config())["initramfs_backend"], "initramfs-tools")
+        image["platform"]["kernels"][VERSION]["portability"]["readable"] = True
+        image["platform"]["kernels"][VERSION]["portability"]["dracut_modules"] = []
+        self.assertEqual(plan_guest(image, config())["initramfs_backend"], "initramfs-tools")
+
     def test_arm_validate_only_is_readonly_and_preparation_requires_native_worker(self):
         image = arm_inspected()
         with patch("forge.engine._guest") as guest, patch("forge.engine._run") as run:
@@ -78,15 +97,38 @@ class PlanTests(unittest.TestCase):
         image["oci_evidence"]["serial_device"] = "ttyS0"
         self.assertTrue(any("Serial-console" in error for error in plan_guest(image, profile)["blockers"]))
 
-    def test_arm_does_not_advertise_bios_sev_or_unvalidated_hardware_profiles(self):
+    def test_arm_does_not_advertise_bios_sev_or_unverified_hardware_profiles(self):
         for key, selected, expected in (("Compute.Firmware", "BIOS", "BIOS"),
                                         ("Compute.AMD_SecureEncryptedVirtualization", True, "AMD SEV"),
-                                        ("Storage.BootVolumeType", "ISCSI", "ARM64 OCI"),
-                                        ("Network.AttachmentType", "VFIO", "ARM64 OCI")):
+                                        ("Storage.BootVolumeType", "ISCSI", "CONFIG_ACPI"),
+                                        ("Network.AttachmentType", "VFIO", "explicitly selected")):
             with self.subTest(key=key):
                 profile = config(prepare=False)
                 profile["capabilities"][key] = {"default_value": selected}
                 self.assertTrue(any(expected in error for error in plan_guest(arm_inspected(), profile)["blockers"]))
+
+    def test_arm_hardware_profile_retains_driver_and_discovery_checks(self):
+        image, profile = arm_inspected(), config(prepare=False)
+        profile["capabilities"]["Storage.BootVolumeType"] = {"default_value": "ISCSI"}
+        profile["capabilities"]["Network.AttachmentType"] = {"default_value": "VFIO"}
+        kernel = next(iter(image["oci_evidence"]["kernels"].values()))
+        kernel["config"].update(CONFIG_ACPI="y", CONFIG_PCI="y")
+        image["oci_evidence"]["iscsi_boot_configured"] = True
+        result = plan_guest(image, profile, platform_nic_driver="mlx5_core")
+        self.assertEqual(result["blockers"], [])
+        kernel["modules"].remove("mlx5_core")
+        self.assertTrue(any("NIC driver" in item for item in plan_guest(image, profile, platform_nic_driver="mlx5_core")["blockers"]))
+
+    def test_auto_hardware_network_verifies_all_common_drivers(self):
+        image, profile = arm_inspected(), config(prepare=False)
+        profile["capabilities"]["Network.AttachmentType"] = {"default_value": "VFIO"}
+        kernel = next(iter(image["oci_evidence"]["kernels"].values()))
+        kernel["config"]["CONFIG_PCI"] = "y"
+        result = plan_guest(image, profile, platform_nic_driver="auto")
+        self.assertEqual(result["blockers"], [])
+        self.assertTrue({"ixgbe", "mlx5_core", "bnxt_en"} <= set(result["required_modules"]))
+        kernel["initrd_modules"].remove("ixgbe")
+        self.assertTrue(any("ixgbe" in error for error in plan_guest(image, profile, platform_nic_driver="auto")["blockers"]))
 
     def test_validate_only_reuses_verified_bounded_archive_for_the_same_initrd(self):
         image, profile = inspected(), config(prepare=False)
@@ -301,6 +343,68 @@ class FakeGuest:
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_installed_iscsi_module_relocation_is_unique_and_bounded(self):
+        g = Mock()
+        for name in ("74iscsi", "95iscsi"):
+            directory = "/usr/lib/dracut/modules.d/" + name
+            g.is_dir.side_effect = lambda path: path == directory
+            self.assertEqual(_iscsi_module_directory(g), directory)
+        g.is_dir.side_effect = lambda path: True
+        self.assertIsNone(_iscsi_module_directory(g))
+        g.is_dir.side_effect = lambda path: False
+        self.assertIsNone(_iscsi_module_directory(g))
+
+    def test_netplan_package_symlink_is_a_tool_and_stale_renderers_are_inventory(self):
+        class SymlinkGuest(FakeGuest):
+            def is_file(self, path, followsymlinks=False):
+                return path in self.files or path == "/usr/sbin/netplan" and followsymlinks
+        g = SymlinkGuest({"/etc/netplan/old.yaml": "network:\n  ethernets:\n    bound:\n      match:\n        macaddress: 00:11:22:33:44:55\n",
+                          "/etc/systemd/network/90-cloud-image-forge-oci.network": next(iter(_network_files("networkd").values())),
+                          "/etc/systemd/system/multi-user.target.wants/systemd-networkd.service": ""})
+        self.assertTrue(_tool_file(g, "/usr/sbin/netplan"))
+        backend, ready, paths = _network_evidence(g, {"networkctl": True})
+        self.assertEqual(backend, "networkd")
+        self.assertFalse(ready)
+        self.assertIn("/etc/netplan/old.yaml", paths)
+
+    def test_effective_cloud_datasource_respects_installer_and_later_overrides(self):
+        g = FakeGuest({"/etc/cloud/cloud.cfg.d/99-cloud-image-forge-oci.cfg": "datasource_list: [Oracle]\n",
+                       "/etc/cloud/cloud.cfg.d/99-installer.cfg": "datasource_list: [None]\n"})
+        self.assertFalse(_oracle_datasource_selected(g))
+        g.files[CLOUD_CONFIG] = "datasource_list: [Oracle]\n"
+        self.assertTrue(_oracle_datasource_selected(g))
+        g.files["/etc/cloud/cloud.cfg.d/zzz-custom.cfg"] = "datasource_list: [NoCloud]\n"
+        self.assertFalse(_oracle_datasource_selected(g))
+        g.files["/etc/cloud/cloud.cfg.d/zzz-custom.cfg"] = "merge_how: [custom]\n"
+        self.assertFalse(_oracle_datasource_selected(g))
+        for text in ("  datasource_list: [NoCloud]\n", "{datasource_list: [NoCloud]}\n",
+                     "'datasource_list': [NoCloud]\n", "  merge_how: [custom]\n", "{'merge_type': custom}\n"):
+            with self.subTest(text=text):
+                g.files["/etc/cloud/cloud.cfg.d/zzz-custom.cfg"] = text
+                self.assertFalse(_oracle_datasource_selected(g))
+
+    def test_cloud_datasource_requires_paired_literal_quotes(self):
+        for value in ("[Oracle\"]", "['Oracle\"]", "[Oracle, 'None\"]"):
+            with self.subTest(value=value):
+                self.assertFalse(_oracle_datasource_selected(FakeGuest({CLOUD_CONFIG: "datasource_list: " + value})))
+        for value in ("[Oracle]", "['Oracle']", '["Oracle", "None"]'):
+            with self.subTest(value=value):
+                self.assertTrue(_oracle_datasource_selected(FakeGuest({CLOUD_CONFIG: "datasource_list: " + value})))
+
+    def test_modern_cloud_init_stages_and_disable_marker_are_verified(self):
+        units = ["cloud-init-main.service", "cloud-init-local.service", "cloud-init-network.service", "cloud-config.service", "cloud-final.service"]
+        files = {"/usr/bin/cloud-init": "binary", "/usr/lib/python3/dist-packages/cloudinit/sources/DataSourceOracle.py": "source",
+                 CLOUD_CONFIG: "datasource_list: [Oracle]\n"}
+        for unit in units:
+            files["/usr/lib/systemd/system/" + unit] = "[Install]\nWantedBy=cloud-init.target\n"
+            files["/etc/systemd/system/cloud-init.target.wants/" + unit] = ""
+        g = FakeGuest(files)
+        self.assertEqual(_cloud_units(g), units)
+        result = inspect_guest(g, "/dev/sda1", [], [])
+        self.assertTrue(result["cloud_init_ready"])
+        g.files["/etc/cloud/cloud-init.disabled"] = ""
+        self.assertFalse(inspect_guest(g, "/dev/sda1", [], [])["cloud_init_ready"])
+
     def test_arm_inspection_retains_kernel_architecture_and_serial_evidence(self):
         boot = {"supported_firmware": ["UEFI_64"], "efi_loaders": [
             {"path": "/EFI/BOOT/BOOTAA64.EFI", "architecture": "aarch64"}]}
@@ -375,6 +479,29 @@ class EvidenceTests(unittest.TestCase):
 
 
 class PreparationTests(unittest.TestCase):
+    def test_modern_cloud_init_preparation_removes_marker_and_uses_installed_stage_names(self):
+        image = inspected()
+        units = ["cloud-init-main.service", "cloud-init-local.service", "cloud-init-network.service", "cloud-config.service", "cloud-final.service"]
+        image["oci_evidence"]["cloud_init_units"] = units
+        profile = config(configure_network=False, configure_serial_console=False)
+        g = Mock()
+        g.is_symlink.return_value = False
+        g.is_file.side_effect = lambda path: path == "/etc/cloud/cloud-init.disabled"
+        g.filesize.return_value = 0
+        g.read_file.return_value = b""
+        @contextmanager
+        def guest(*args, **kwargs):
+            yield g
+        with patch("forge.engine._guest", guest), patch("forge.engine._mount"), patch("forge.engine._roots", return_value="/dev/sda1"), \
+                patch("forge.engine._run_guest_script") as run, patch("forge.engine.ImageEngine.inspect", return_value=deepcopy(image)):
+            prepare_guest(Path("/tmp/test.qcow2"), image, profile, False, lambda _: None, mount_policy="preserve")
+        commands = run.call_args.args[1]
+        self.assertIn("cloud-init-main.service", commands)
+        self.assertIn("cloud-init-network.service", commands)
+        self.assertNotIn(" cloud-init.service", commands)
+        g.rm.assert_called_once_with("/etc/cloud/cloud-init.disabled")
+        self.assertTrue(any(call.args[0] == CLOUD_CONFIG for call in g.write.call_args_list))
+
     def test_arm_serial_commands_use_pl011_and_never_x86_console(self):
         image = arm_inspected()
         profile = config(configure_network=False, configure_cloud_init=False)
@@ -386,9 +513,9 @@ class PreparationTests(unittest.TestCase):
             yield g
         with patch("forge.architecture.worker_arch", return_value="aarch64"), patch("forge.engine._guest", guest), \
                 patch("forge.engine._mount"), patch("forge.engine._roots", return_value="/dev/sda1"), \
-                patch("forge.engine._run") as run, patch("forge.engine.ImageEngine.inspect", return_value=deepcopy(image)):
+                patch("forge.engine._run_guest_script") as run, patch("forge.engine.ImageEngine.inspect", return_value=deepcopy(image)):
             result = prepare_guest(Path("/tmp/arm.qcow2"), image, profile, False, lambda _: None)
-        commands = " ".join(run.call_args.args[0])
+        commands = run.call_args.args[1]
         self.assertIn("console=ttyAMA0,115200n8", commands)
         self.assertIn("serial-getty@ttyAMA0.service", commands)
         self.assertNotIn("ttyS0", commands)
@@ -414,15 +541,16 @@ class PreparationTests(unittest.TestCase):
             yield g
 
         with patch("forge.engine._guest", guest), patch("forge.engine._mount"), \
-                patch("forge.engine._roots", return_value="/dev/sda1"), patch("forge.engine._run") as run, \
+                patch("forge.engine._roots", return_value="/dev/sda1"), patch("forge.engine._run_guest_script") as run, \
                 patch("forge.engine.ImageEngine.inspect", return_value=after):
             result = prepare_guest(Path("/tmp/working.qcow2"), image, profile, False, lambda _: None,
                                    extra_required_modules=["ixgbe"])
         self.assertIn("ixgbe", result["required_modules"])
-        self.assertIn("Required driver ixgbe absent", " ".join(run.call_args.args[0]))
+        self.assertIn("Required driver ixgbe absent", run.call_args.args[1])
         receipt = result["verified_initrds"][VERSION]
         self.assertIn("ixgbe", receipt["modules"])
         self.assertEqual(receipt["sha256"], "b" * 64)
+        self.assertIs(result["_inspection"], after)
         self.assertEqual(image["oci_evidence"], before["oci_evidence"])
 
     def test_additional_driver_must_be_installed_before_mutation(self):
@@ -473,9 +601,11 @@ class PreparationTests(unittest.TestCase):
             self.assertIn("--no-network", run.call_args.args[0])
 
     def test_preexisting_verified_guest_can_skip_mutation(self):
+        source = inspected()
         with patch("forge.engine._guest") as guest, patch("forge.engine._run") as run:
-            plan = prepare_guest(Path("/tmp/working.qcow2"), inspected(), config(prepare=False), False, lambda _: None)
+            plan = prepare_guest(Path("/tmp/working.qcow2"), source, config(prepare=False), False, lambda _: None)
             self.assertEqual(plan["blockers"], [])
+            self.assertIs(plan["_inspection"], source)
             guest.assert_not_called()
             run.assert_not_called()
 

@@ -26,8 +26,10 @@ MODULE_CONFIG = {
     "bnxt_en": "CONFIG_BNXT",
     "amba_pl011": "CONFIG_SERIAL_AMBA_PL011",
 }
+HARDWARE_NIC_DRIVERS = frozenset({"ixgbe", "ixgbevf", "i40e", "iavf", "mlx4_en", "mlx5_core", "bnxt_en"})
 ARCH_CONFIG = {"CONFIG_ARM64", "CONFIG_X86_64", "CONFIG_EFI", "CONFIG_EFI_STUB",
-               "CONFIG_SERIAL_AMBA_PL011", "CONFIG_SERIAL_AMBA_PL011_CONSOLE"}
+               "CONFIG_SERIAL_AMBA_PL011", "CONFIG_SERIAL_AMBA_PL011_CONSOLE",
+               "CONFIG_ACPI", "CONFIG_PCI"}
 STORAGE_DRIVERS = {"PARAVIRTUALIZED": {"virtio_pci", "virtio_blk", "virtio_scsi", "sd_mod"},
                    "SCSI": {"sym53c8xx", "sd_mod"}, "IDE": {"ata_piix", "sd_mod"},
                    "ISCSI": {"iscsi_tcp", "sd_mod"}}
@@ -40,6 +42,7 @@ NETWORK_PATTERNS = {"NetworkManager": ("/etc/NetworkManager/system-connections/*
                     "networkd": ("/etc/systemd/network/*.network",)}
 BACKUP_ROOT = "/var/lib/cloud-image-forge/oci-backups"
 PROFILE = "/var/lib/cloud-image-forge/oci-preparation.json"
+CLOUD_CONFIG = "/etc/cloud/cloud.cfg.d/zz-cloud-image-forge-oci.cfg"
 SYSCTL_DISABLE = re.compile(r"^(\s*net\.ipv6\.conf\.[A-Za-z0-9_-]+\.disable_ipv6\s*=\s*)1\b", re.M)
 
 
@@ -81,6 +84,52 @@ def _serial_device(architecture):
     return "ttyAMA0" if _architecture(architecture) == "aarch64" else "ttyS0"
 
 
+def verified_nic_bundle(kernels):
+    """All supported NIC drivers present in every kernel, never a hardware guess."""
+    if not kernels:
+        return []
+    common = set(HARDWARE_NIC_DRIVERS)
+    for kernel in kernels.values():
+        common &= set(kernel.get("modules", [])) | set(kernel.get("builtin", []))
+    return sorted(common)
+
+
+def _select_initramfs_backend(tools, kernels, *, rpm=False, iscsi=False):
+    # Ubuntu 26.04 ships a dracut-compatible update-initramfs command. The
+    # command's name alone therefore cannot establish initramfs-tools usage.
+    archived_dracut = bool(kernels) and all(
+        kernel.get("initramfs_backend") == "dracut" or
+        (kernel.get("portability", {}).get("readable") is True
+         and bool(kernel.get("portability", {}).get("dracut_modules")))
+        for kernel in kernels.values())
+    return ("dracut" if tools.get("dracut") and (rpm or iscsi or archived_dracut) else
+            "initramfs-tools" if tools.get("update-initramfs") else
+            "dracut" if tools.get("dracut") else None)
+
+
+def _iscsi_module_directory(g):
+    # dracut-ng relocated the unchanged installed module from 95 to 74.
+    # Refuse competing copies rather than guess which implementation is active.
+    paths = ["/usr/lib/dracut/modules.d/" + name for name in ("74iscsi", "95iscsi")
+             if g.is_dir("/usr/lib/dracut/modules.d/" + name)]
+    return paths[0] if len(paths) == 1 else None
+
+
+def _hardware_architecture_errors(inspection, kernels, *, iscsi=False, hardware_network=False):
+    """ARM firmware discovery uses ACPI iBFT, not the x86 legacy-memory scan.
+
+    Linux CONFIG_ISCSI_IBFT depends on ACPI/SCSI; only ISCSI_IBFT_FIND is
+    x86-specific. Physical PCI NICs still need PCI support and a selected driver.
+    This proves kernel prerequisites, never that destination firmware has iBFT.
+    """
+    if _architecture(inspection.get("os", {}).get("arch")) != "aarch64":
+        return []
+    required = ({"CONFIG_ACPI"} if iscsi else set()) | ({"CONFIG_PCI"} if hardware_network else set())
+    return [f"Kernel {version}: ARM64 hardware preparation requires {key}=y."
+            for version, kernel in kernels.items() for key in sorted(required)
+            if kernel.get("config", {}).get(key) != "y"]
+
+
 def _read(g, path, limit=4 * 1024 * 1024):
     try:
         if g.is_file(path) and g.filesize(path) <= limit:
@@ -96,6 +145,49 @@ def _glob(g, pattern):
         return g.glob_expand(pattern)
     except RuntimeError:
         return []
+
+
+def _tool_file(g, path):
+    # Distribution commands such as Ubuntu netplan are regular executables
+    # reached through a package-owned symlink. No command is executed here.
+    try:
+        return bool(g.is_file(path, followsymlinks=True))
+    except TypeError:
+        return bool(g.is_file(path))
+
+
+def _cloud_units(g):
+    def present(name):
+        return any(_tool_file(g, directory + "/" + name) for directory in ("/usr/lib/systemd/system", "/lib/systemd/system"))
+    network = "cloud-init-network.service" if present("cloud-init-network.service") else "cloud-init.service"
+    units = ["cloud-init-local.service", network, "cloud-config.service", "cloud-final.service"]
+    if not all(present(unit) for unit in units):
+        return []
+    if present("cloud-init-main.service"):
+        units.insert(0, "cloud-init-main.service")
+    return units
+
+
+def _oracle_datasource_selected(g):
+    """Recognize a literal final Oracle-only datasource policy in file order.
+
+    No YAML tags, scripts or arbitrary configuration are evaluated. Unsupported
+    merge directives and nonliteral datasource lists remain unverified.
+    """
+    selected, merge_override = False, False
+    for path in ["/etc/cloud/cloud.cfg"] + sorted(_glob(g, "/etc/cloud/cloud.cfg.d/*.cfg")):
+        lines = [line for line in _read(g, path).splitlines() if not line.lstrip().startswith("#")]
+        declarations = [line for line in lines if re.match(r"^[\"']?datasource_list(?:[\"']?\s*:|\b)", line)]
+        occurrences = [line for line in lines if re.search(r"\bdatasource_list[\"']?\s*:", line.split("#", 1)[0])]
+        if len(occurrences) != len(declarations):
+            # Indented YAML roots and flow maps are valid YAML, but this
+            # deliberately narrow reader cannot establish their precedence.
+            selected = False
+        if declarations:
+            match = re.fullmatch(r"datasource_list:\s*\[\s*(?P<oracle_quote>['\"]?)Oracle(?P=oracle_quote)\s*(?:,\s*(?P<none_quote>['\"]?)None(?P=none_quote)\s*)?\]\s*", declarations[-1].split("#", 1)[0])
+            selected = len(occurrences) == len(declarations) == 1 and match is not None
+        merge_override |= any(re.search(r"(?:\bmerge_how[\"']?|\bmerge_type[\"']?|<<)\s*:", line.split("#", 1)[0]) for line in lines)
+    return selected and not merge_override
 
 
 def _module_names(paths, guest=None, version=None):
@@ -128,7 +220,10 @@ def _enabled(g, name):
 
 def _network_evidence(g, tools):
     backend = "netplan" if tools.get("netplan") else "NetworkManager" if tools.get("NetworkManager") else "networkd" if tools.get("networkctl") else None
-    texts = {path: _read(g, path) for pattern in NETWORK_PATTERNS.get(backend, ()) for path in _glob(g, pattern)
+    all_paths = {path for patterns in NETWORK_PATTERNS.values() for pattern in patterns for path in _glob(g, pattern)
+                 if not path.endswith("ifcfg-lo")}
+    selected_paths = {path for pattern in NETWORK_PATTERNS.get(backend, ()) for path in _glob(g, pattern)}
+    texts = {path: _read(g, path) for path in sorted(selected_paths)
              if not path.endswith("ifcfg-lo")}
     ready = False
     if backend == "NetworkManager":
@@ -160,7 +255,10 @@ def _network_evidence(g, tools):
     elif backend == "networkd":
         text = "\n".join(texts.values())
         ready = len(texts) == 1 and bool(re.search(r"^DHCP=(yes|true)\s*$", text, re.M) and re.search(r"^IPv6AcceptRA=(yes|true)\s*$", text, re.M)) and not re.search(r"^(MACAddress|Address)=", text, re.M) and _enabled(g, "systemd-networkd.service")
-    return backend, ready, list(texts)
+    # Explicit preparation backs up/removes all persistent renderer profiles,
+    # including stale netplan input that would otherwise regenerate NIC binds.
+    ready = ready and not (all_paths - set(texts))
+    return backend, ready, sorted(all_paths)
 
 
 def inspect_guest(g, root: str, partitions: list, kernels: list, boot: dict | None = None,
@@ -180,7 +278,7 @@ def inspect_guest(g, root: str, partitions: list, kernels: list, boot: dict | No
                 "bios_evidence": boot.get("bios_evidence", []),
                 "partition_table": boot.get("partition_table", "unknown"),
                 "boot_tested": False}
-    tools = {name: any(g.is_file(f"{directory}/{name}") for directory in ("/usr/sbin", "/usr/bin", "/sbin", "/bin")) for name in TOOL_NAMES}
+    tools = {name: any(_tool_file(g, f"{directory}/{name}") for directory in ("/usr/sbin", "/usr/bin", "/sbin", "/bin")) for name in TOOL_NAMES}
     support = {}
     for kernel in kernels:
         version = kernel.removeprefix("/boot/vmlinuz-")
@@ -192,16 +290,20 @@ def inspect_guest(g, root: str, partitions: list, kernels: list, boot: dict | No
         builtin = set(_module_names(_read(g, f"/lib/modules/{version}/modules.builtin").splitlines()))
         builtin.update(name for name, key in MODULE_CONFIG.items() if config.get(key) == "y")
         initrd = next((p for p in (f"/boot/initramfs-{version}.img", f"/boot/initrd.img-{version}", f"/boot/initrd-{version}") if g.is_file(p)), None)
-        initrd_modules = None
+        initrd_modules, initramfs_backend = None, None
         if initrd:
             try:
-                initrd_modules = _module_names(g.initrd_list(initrd))
+                members = g.initrd_list(initrd)
+                initrd_modules = _module_names(members)
+                names = {name.removeprefix("./").lstrip("/") for name in members}
+                if names.intersection({"usr/lib/dracut/modules.txt", "lib/dracut/modules.txt"}):
+                    initramfs_backend = "dracut"
             except RuntimeError:
                 # Older libguestfs cannot inspect every concatenated/compressed initrd.
                 pass
         support[version] = {"modules": modules, "builtin": sorted(builtin), "config": config,
                             "architecture": _kernel_architecture(config),
-                            "initrd": initrd, "initrd_modules": initrd_modules}
+                            "initrd": initrd, "initrd_modules": initrd_modules, "initramfs_backend": initramfs_backend}
     boot_text = _read(g, "/etc/default/grub") + "\n" + "\n".join(_read(g, path) for path in _glob(g, "/boot/loader/entries/*.conf"))
     boot_text = "\n".join(line for line in boot_text.splitlines() if not line.lstrip().startswith("#"))
     blacklisted = set()
@@ -217,15 +319,19 @@ def inspect_guest(g, root: str, partitions: list, kernels: list, boot: dict | No
             if re.search(r'SYMLINK\s*\+?=\s*"[^"\n]*oracleoci/', active):
                 naming.append(path)
     datasource = any(_glob(g, pattern) for pattern in ("/usr/lib/python*/site-packages/cloudinit/sources/DataSourceOracle.py", "/usr/lib/python*/dist-packages/cloudinit/sources/DataSourceOracle.py"))
-    cloud_text = _read(g, "/etc/cloud/cloud.cfg") + "\n" + "\n".join(_read(g, path) for path in _glob(g, "/etc/cloud/cloud.cfg.d/*.cfg"))
-    cloud_ready = tools.get("cloud-init") and datasource and bool(re.search(r"datasource_list:\s*\[\s*Oracle\b", cloud_text)) and not g.is_file("/etc/cloud/cloud-init.disabled") and "cloud-init=disabled" not in boot_text
+    cloud_units = _cloud_units(g)
+    cloud_units_ready = bool(cloud_units) and all(_enabled(g, unit) and not g.is_symlink("/etc/systemd/system/" + unit) for unit in cloud_units)
+    cloud_ready = (tools.get("cloud-init") and datasource and _oracle_datasource_selected(g) and cloud_units_ready
+                   and not (g.is_file("/etc/cloud/cloud-init.disabled") or g.is_symlink("/etc/cloud/cloud-init.disabled"))
+                   and "cloud-init=disabled" not in boot_text)
     backend, network_ready, network_files = _network_evidence(g, tools)
     ipv6_files = [path for path in ["/etc/sysctl.conf"] + _glob(g, "/etc/sysctl.d/*.conf") if SYSCTL_DISABLE.search(_read(g, path))]
     return {"version": 1, "architecture": architecture, "firmware": firmware, "kernels": support, "tools": tools,
             "network_backend": backend, "network_ready": bool(network_ready), "network_files": network_files,
             "oracle_datasource": bool(datasource), "cloud_init_ready": bool(cloud_ready),
+            "cloud_init_units": cloud_units, "cloud_init_units_ready": cloud_units_ready,
             "consistent_naming_rules": sorted(set(naming)), "blacklisted_modules": sorted(blacklisted),
-            "iscsi_boot_configured": any(arg in boot_text for arg in ("rd.iscsi.firmware=1", "rd.iscsi.ibft=1", "ip=ibft")) and g.is_dir("/usr/lib/dracut/modules.d/95iscsi"),
+            "iscsi_boot_configured": any(arg in boot_text for arg in ("rd.iscsi.firmware=1", "rd.iscsi.ibft=1", "ip=ibft")) and bool(_iscsi_module_directory(g)),
             "os_version": {"major": g.inspect_get_major_version(root), "minor": g.inspect_get_minor_version(root)},
             "ipv6_disable_files": ipv6_files, "boot_arguments": boot_text[:65536],
             "serial_device": serial,
@@ -278,9 +384,14 @@ def plan_guest(inspection: dict, config: dict, allow_network=False, planned_firm
     if arch == "aarch64":
         if set(_values(config, "Compute.Firmware")) != {"UEFI_64"}:
             blockers.append("ARM64 OCI guests require UEFI_64; BIOS capability and BIOS migration are not supported.")
-        if (set(_values(config, "Storage.BootVolumeType")) != {"PARAVIRTUALIZED"}
-                or not set(_values(config, "Network.AttachmentType")) <= {"PARAVIRTUALIZED", "ACCELERATEDPV"}):
-            blockers.append("ARM64 OCI guest preparation currently supports VM paravirtualized boot with PV or Accelerated PV networking; ARM firmware-iSCSI and hardware NIC profiles are not validated.")
+        if (not set(_values(config, "Storage.BootVolumeType")) <= {"PARAVIRTUALIZED", "ISCSI"}
+                or not set(_values(config, "Network.AttachmentType")) <= {"PARAVIRTUALIZED", "ACCELERATEDPV", "VFIO"}):
+            blockers.append("ARM64 OCI profiles require UEFI with paravirtualized or firmware-iSCSI boot and PV, Accelerated PV or explicitly selected hardware networking.")
+        hardware_network = "VFIO" in _values(config, "Network.AttachmentType")
+        blockers.extend(_hardware_architecture_errors(inspection, kernels,
+                        iscsi="ISCSI" in _values(config, "Storage.BootVolumeType"), hardware_network=hardware_network))
+        if hardware_network and platform_nic_driver is None:
+            blockers.append("ARM64 hardware networking requires an explicitly selected target NIC driver in the hardware profile; installed drivers do not identify destination hardware.")
     distro = inspection.get("os", {}).get("distro", "")
     rpm = distro in {"oraclelinux", "rhel", "centos", "rocky", "almalinux", "fedora"}
     deb = distro in {"ubuntu", "debian"}
@@ -307,15 +418,17 @@ def plan_guest(inspection: dict, config: dict, allow_network=False, planned_firm
         elif kind == "E1000":
             required.add("e1000")
         elif kind == "VFIO":
-            if platform_nic_driver is not None and platform_nic_driver not in {"ixgbe", "ixgbevf", "i40e", "iavf", "mlx4_en", "mlx5_core", "bnxt_en"}:
+            if platform_nic_driver is not None and platform_nic_driver not in HARDWARE_NIC_DRIVERS | {"auto"}:
                 raise ValueError("Unsupported selected hardware NIC driver")
-            common = {platform_nic_driver} if platform_nic_driver else {"ixgbevf", "iavf", "mlx5_core"}
+            common = (set(verified_nic_bundle(kernels)) if platform_nic_driver == "auto" else
+                      {platform_nic_driver} if platform_nic_driver else {"ixgbevf", "iavf", "mlx5_core"})
             for kernel in kernels.values():
                 common &= {module for module in common if _supported(kernel, module)}
             if not common:
                 blockers.append("Hardware networking needs the selected physical NIC driver across every kernel." if platform_nic_driver else "VFIO networking needs an installed physical VF driver (ixgbevf, iavf or mlx5_core) across the selected kernels; the target shape's NIC must match it.")
             required.update(common)
-            warnings.append(("The explicitly selected hardware NIC driver must match the destination device; no offline check proves the target hardware. " if platform_nic_driver else "VFIO exposes a hardware VF: verify the selected shape's NIC against the inspected VF drivers. ")
+            warnings.append(("Automatic NIC bundle: " + ", ".join(sorted(common)) + ". The destination NIC remains unverified. " if platform_nic_driver == "auto" else
+                             "The explicitly selected hardware NIC driver must match the destination device; no offline check proves the target hardware. " if platform_nic_driver else "VFIO exposes a hardware VF: verify the selected shape's NIC against the inspected VF drivers. ")
                             + "vfio-pci is a host passthrough driver, not a guest Ethernet driver.")
         else:
             blockers.append(f"Network.AttachmentType={kind}: no validated guest driver adapter is available.")
@@ -374,7 +487,12 @@ def plan_guest(inspection: dict, config: dict, allow_network=False, planned_firm
     if _flag(config, "Storage.ParaVirtualization.EncryptionInTransit"):
         warnings.append("Paravirtualized encryption-in-transit is an OCI attachment property. Confirm this custom image and target shape are supported by OCI; the exported disk is not encrypted by this setting.")
     warnings.append("Paravirtualized attachment version is applied by OCI. Installed VirtIO drivers are checked; the platform must offer the requested version.")
-    initramfs = "dracut" if tools.get("dracut") and (rpm or iscsi_boot) else "initramfs-tools" if tools.get("update-initramfs") else "dracut" if tools.get("dracut") else None
+    backend_kernels = {}
+    for version, kernel in kernels.items():
+        archived = inspection.get("platform", {}).get("kernels", {}).get(version, {})
+        backend_kernels[version] = {**kernel, "portability": archived.get("portability", {})
+                                   if archived.get("initrd") == kernel.get("initrd") else {}}
+    initramfs = _select_initramfs_backend(tools, backend_kernels, rpm=rpm, iscsi=iscsi_boot)
     if iscsi_boot and initramfs != "dracut":
         blockers.append("Firmware-discovered iSCSI boot preparation requires the installed dracut initramfs framework.")
     if prepare:
@@ -406,6 +524,8 @@ def plan_guest(inspection: dict, config: dict, allow_network=False, planned_firm
         need_tool("cloud-init", "cloud-init" if rpm or deb else None)
         if tools.get("cloud-init") and not evidence.get("oracle_datasource"):
             blockers.append("Installed cloud-init lacks the Oracle datasource. Upgrade cloud-init before preparing this image.")
+        if tools.get("cloud-init") and "cloud_init_units" in evidence and not evidence["cloud_init_units"]:
+            blockers.append("The installed cloud-init systemd stages are incomplete; repair the cloud-init package before preparation.")
         if "cloud-init=disabled" in evidence.get("boot_arguments", ""):
             blockers.append("Remove cloud-init=disabled from guest boot parameters before enabling OCI cloud-init preparation.")
         if prepare:
@@ -505,22 +625,23 @@ def _initramfs_script(inspection, plan):
 
 
 def prepare_guest(work: Path, inspection: dict, config: dict, allow_network: bool, log,
-                  *, extra_required_modules=(), platform_migration=None) -> dict:
-    from .engine import EngineError, ImageEngine, _grub_assignment, _guest, _mount, _roots, _run
+                  *, extra_required_modules=(), platform_migration=None, mount_policy="auto") -> dict:
+    from .engine import EngineError, ImageEngine, _grub_assignment, _guest, _mount, _roots, _run, _run_guest_script
     from .oci import OciConfig, compatibility_plan
 
     model = OciConfig.model_validate(config)
-    plan = compatibility_plan(inspection, model, allow_network, platform_migration=platform_migration)
+    plan = compatibility_plan(inspection, model, allow_network, platform_migration=platform_migration, mount_policy=mount_policy)
     if plan["blockers"]:
         raise EngineError("OCI preparation blocked: " + " ".join(plan["blockers"]))
     if not config.get("guest", {}).get("prepare", True):
+        plan["_inspection"] = inspection
         return plan
     for change in plan["changes"]:
         log("OCI: " + change)
     if plan["packages"]:
         _run(["virt-customize", "--format", "qcow2", "-a", str(work), "--network", "--install", ",".join(plan["packages"])], log)
         inspection = ImageEngine().inspect(work)
-        plan = compatibility_plan(inspection, model, allow_network=False, platform_migration=platform_migration)
+        plan = compatibility_plan(inspection, model, allow_network=False, platform_migration=platform_migration, mount_policy=mount_policy)
         if plan["blockers"]:
             raise EngineError("OCI prerequisites still missing after package installation: " + " ".join(plan["blockers"]))
     if extra_required_modules:
@@ -574,11 +695,13 @@ def prepare_guest(work: Path, inspection: dict, config: dict, allow_network: boo
             if g.is_file("/etc/cloud/cloud-init.disabled"):
                 _backup(g, "/etc/cloud/cloud-init.disabled")
                 g.rm("/etc/cloud/cloud-init.disabled")
-            commands += ["cloud-init clean", "systemctl --root=/ unmask cloud-init-local.service cloud-init.service cloud-config.service cloud-final.service", "systemctl --root=/ enable cloud-init-local.service cloud-init.service cloud-config.service cloud-final.service"]
+            cloud_units = evidence.get("cloud_init_units") or ["cloud-init-local.service", "cloud-init.service", "cloud-config.service", "cloud-final.service"]
+            unit_arguments = " ".join(shlex.quote(unit) for unit in cloud_units)
+            commands += ["cloud-init clean", "systemctl --root=/ unmask " + unit_arguments, "systemctl --root=/ enable " + unit_arguments]
         if guest.get("configure_network", True):
             cloud_config += "network:\n  config: disabled\n"
         if guest.get("configure_network", True) or guest.get("configure_cloud_init", True):
-            _write(g, "/etc/cloud/cloud.cfg.d/99-cloud-image-forge-oci.cfg", cloud_config)
+            _write(g, CLOUD_CONFIG, cloud_config)
         if plan["multipath"]:
             _write(g, "/etc/multipath/conf.d/90-cloud-image-forge-oci.conf", "defaults {\n    find_multipaths yes\n    user_friendly_names no\n}\n")
             commands += ["multipath -t >/dev/null", "systemctl --root=/ enable multipathd.service"]
@@ -599,11 +722,7 @@ def prepare_guest(work: Path, inspection: dict, config: dict, allow_network: boo
             commands += ["update-grub" if evidence["tools"].get("update-grub") else "grub2-mkconfig -o /boot/grub2/grub.cfg", f"systemctl --root=/ enable serial-getty@{serial}.service"]
         _write(g, PROFILE, json.dumps({"capabilities": config["capabilities"], "required_modules": plan["required_modules"], "kernel_versions": list(evidence["kernels"])}, indent=2) + "\n")
     commands.append(_initramfs_script(inspection, plan))
-    command = ["virt-customize", "--format", "qcow2", "-a", str(work), "--no-network"]
-    for script in commands:
-        command += ["--run-command", script]
-    command += ["--selinux-relabel"]
-    _run(command, log)
+    _run_guest_script(work, "set -eu\n" + "\n".join(commands), log)
     # Check the actual written files and enabled services, not the provenance marker.
     after = ImageEngine().inspect(work)
     after_kernels = after.get("oci_evidence", {}).get("kernels", {})
@@ -622,7 +741,7 @@ def prepare_guest(work: Path, inspection: dict, config: dict, allow_network: boo
     final_model = model.model_copy(deep=True)
     final_model.guest.prepare = False
     final = compatibility_plan(after, final_model, allow_network=False, platform_migration=platform_migration,
-                               project_platform=False)
+                               project_platform=False, mount_policy=mount_policy)
     if final["blockers"]:
         raise EngineError("OCI guest verification failed after preparation: " + " ".join(final["blockers"]))
     if extra_required_modules:
@@ -641,4 +760,5 @@ def prepare_guest(work: Path, inspection: dict, config: dict, allow_network: boo
             for version, kernel in after.get("platform", {}).get("kernels", {}).items()
         }
     log("OCI guest preparation completed; actual configuration and rebuilt initramfs driver inclusion verified")
+    plan["_inspection"] = after
     return plan

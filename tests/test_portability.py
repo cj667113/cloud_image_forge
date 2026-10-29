@@ -77,11 +77,22 @@ def test_observed_generic_oci_existing_configuration_passes_without_rewrites():
     assert source == before
 
 
-def test_preserve_allows_same_machine_type_and_reconfigure_retains_old_rule():
+def test_preserve_and_reconfigure_allow_same_machine_type():
     assert plan_platform(image(), options(source="vm"))["ready"]
     result = plan_platform(image(), options(strategy="reconfigure", source="vm"))
-    assert not result["ready"]
-    assert any("distinct" in error for error in result["blockers"])
+    assert not any("distinct" in error for error in result["blockers"])
+
+
+def test_prepared_generated_lvm_and_uuid_roots_remain_preservable():
+    source = image()
+    evidence = source["platform"]
+    evidence["generated_grub"]["/boot/grub2/grub.cfg"] = (
+        f"linux /vmlinuz-{KERNEL} root=/dev/mapper/ocivolume-root root=UUID={ROOT_UUID} ro\n"
+        f"initrd /initramfs-{KERNEL}.img\n")
+    assert plan_platform(source, options(source="vm"))["ready"]
+    evidence["generated_grub"]["/boot/grub2/grub.cfg"] = evidence["generated_grub"]["/boot/grub2/grub.cfg"].replace(
+        "root=/dev/mapper/ocivolume-root", "root=/dev/sda1")
+    assert not plan_platform(source, options(source="vm"))["ready"]
 
 
 def arm_image():
@@ -131,7 +142,7 @@ def test_arm_preservation_missing_or_conflicting_evidence_fails_closed(mutation,
     assert any(expected in error for error in result["blockers"])
 
 
-def test_arm_preservation_blocks_foreign_kernel_and_unvalidated_hardware_target():
+def test_arm_preservation_blocks_foreign_kernel_and_unverified_hardware_target():
     source = arm_image()
     foreign = deepcopy(next(iter(source["platform"]["kernels"].values())))
     foreign["config"] = {"CONFIG_X86_64": "y"}
@@ -139,7 +150,27 @@ def test_arm_preservation_blocks_foreign_kernel_and_unvalidated_hardware_target(
     assert any("targets x86_64" in error for error in plan_platform(source, options())["blockers"])
     result = plan_platform(arm_image(), options(target="bare_metal", boot_attachment="iscsi", network_attachment="vfio"))
     assert not result["ready"]
-    assert any("ARM bare-metal" in error for error in result["blockers"])
+    assert any("CONFIG_ACPI" in error for error in result["blockers"])
+
+
+def test_arm_hardware_preservation_uses_existing_firmware_discovery_evidence():
+    source = arm_image()
+    for kernel in source["platform"]["kernels"].values():
+        kernel["config"].update(CONFIG_ACPI="y", CONFIG_PCI="y")
+    profile = options(target="bare_metal", boot_attachment="iscsi", network_attachment="vfio", nic_driver="mlx5_core")
+    result = plan_platform(source, profile)
+    # Local-root-only evidence cannot pass a mandatory firmware-iSCSI target.
+    assert not result["ready"]
+    assert not any("ARM bare-metal" in error or "CONFIG_ACPI" in error for error in result["blockers"])
+    assert any("firmware" in error.lower() for error in result["blockers"])
+    source["platform"]["boot_files"]["/boot/loader/entries/test.conf"] = source["platform"]["boot_files"]["/boot/loader/entries/test.conf"].replace(
+        " ro\n", " ro netroot=iscsi rd.iscsi.firmware=1\n")
+    result = plan_platform(source, profile)
+    assert result["ready"], result["blockers"]
+    assert result["experimental"] and not result["provider_supported"]
+    assert result["portability"]["root_transport"] == "optional_firmware_iscsi"
+    next(iter(source["platform"]["kernels"].values()))["initrd_iscsi_userspace"] = False
+    assert not plan_platform(source, profile)["ready"]
 
 
 @pytest.mark.parametrize("network,mode,shape", [
@@ -398,6 +429,19 @@ def test_archive_proof_reads_real_hook_instead_of_installed_package_or_comments(
     assert not inspect_archive(ArchiveGuest(HOOK.replace(" || ", " && ")), "/boot/initramfs.img")["iscsi_local_root_completion"]
 
 
+def test_archive_mount_references_are_bounded_and_omit_credentials():
+    guest = ArchiveGuest()
+    guest.files["etc/fstab"] = "# copied configuration\nUUID=old-root / ext4 defaults 0 1\n//server/share /mnt/share cifs password=not-for-output 0 0\n"
+    result = inspect_archive(guest, "/boot/initramfs.img")
+    assert result["readable"] and result["embedded_fstab_present"]
+    assert result["embedded_mounts"][0] == {"source": "UUID=old-root", "mountpoint": "/", "filesystem": "ext4"}
+    assert "not-for-output" not in json.dumps(result)
+    guest.files["etc/fstab"] = "UUID=bad / ext4\n"
+    assert not inspect_archive(guest, "/boot/initramfs.img")["readable"]
+    guest.files["etc/fstab"] = r"UUID=bad /\012 ext4 defaults" + "\n"
+    assert not inspect_archive(guest, "/boot/initramfs.img")["readable"]
+
+
 def test_archive_read_error_and_unsafe_members_fail_closed():
     g = ArchiveGuest()
     with patch.object(g, "initrd_cat", side_effect=RuntimeError("unsupported compression")):
@@ -435,6 +479,7 @@ def test_preservation_does_not_open_writable_guest_or_execute_commands_and_recor
         run.assert_not_called()
         assert hashlib.sha256(path.read_bytes()).hexdigest() == before
     assert result["preserved_files"] == source["platform"]["portability"]["hashes"]
+    assert result["_inspection"] is source
     assert verify_platform(source, options(), receipt=result)["ready"]
     changed = deepcopy(source)
     changed["platform"]["portability"]["hashes"]["/etc/fstab"] = "sha256:" + "c" * 64
@@ -459,3 +504,13 @@ def test_older_inspection_requests_refresh_and_preserve_rejects_write_toggles():
     del source["platform"]["portability"]
     assert any("Refresh inspection" in item for item in plan_platform(source, options())["blockers"])
     assert not plan_platform(image(), options(configure_network=True))["ready"]
+
+
+def test_dracut110_var_hook_is_verified_and_conflicting_legacy_hook_blocks():
+    guest = ArchiveGuest()
+    old = "usr/lib/dracut/hooks/cmdline/90-parse-iscsiroot.sh"
+    new = "var/lib/dracut/hooks/cmdline/90-parse-iscsiroot.sh"
+    guest.files[new] = guest.files.pop(old)
+    assert inspect_archive(guest, "/boot/initramfs.img")["iscsi_local_root_completion"]
+    guest.files[old] = HOOK.replace(" || ", " && ")
+    assert not inspect_archive(guest, "/boot/initramfs.img")["iscsi_local_root_completion"]

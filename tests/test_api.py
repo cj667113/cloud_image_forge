@@ -66,6 +66,37 @@ def imported(client):
     return payload["image_id"]
 
 
+def test_destination_resolution_uses_architecture_without_queueing_jobs(client):
+    from forge.models import PlatformMigration
+    image_id = imported(client)
+    catalog = client.get("/api/destinations/catalog")
+    assert catalog.status_code == 200
+    assert any(p["id"] == "oci:BM.Standard.A1.160" for p in catalog.json()["profiles"])
+    before = client.get("/api/jobs").json()
+    response = client.post(f"/api/images/{image_id}/destination/resolve", json={"profile_id": "oci:VM.Standard.E5.Flex"})
+    assert response.status_code == 200
+    result = response.json()
+    assert result["platform_migration"]["source"] == "unknown"
+    options = PlatformMigration.model_validate(result["platform_migration"])
+    assert options.target == "vm" and options.strategy == "reconfigure"
+    mismatch = client.post(f"/api/images/{image_id}/destination/resolve", json={"profile_id": "oci:VM.Standard.A1.Flex"}).json()
+    assert not mismatch["ready"] and any("aarch64" in error for error in mismatch["blockers"])
+    assert client.get("/api/jobs").json() == before
+
+
+def test_mount_policy_and_same_type_hardware_preparation_are_strict():
+    from pydantic import ValidationError
+    from forge.models import Recipe, PlatformMigration, PlatformPlanRequest, OciPlanRequest, StoragePlanRequest
+    assert Recipe().mount_policy == "auto"
+    assert Recipe(mount_policy="preserve").mount_policy == "preserve"
+    with pytest.raises(ValidationError):
+        Recipe(mount_policy="guess")
+    profile = PlatformMigration(enabled=True, source="vm", target="vm", nic_driver="auto")
+    assert PlatformPlanRequest(platform_migration=profile, mount_policy="preserve").mount_policy == "preserve"
+    assert OciPlanRequest(oci={}, mount_policy="preserve").mount_policy == "preserve"
+    assert StoragePlanRequest(storage_rebuild={}, mount_policy="preserve").mount_policy == "preserve"
+
+
 def test_import_build_download_persist_and_preserve_source(client, tmp_path):
     image_id = imported(client)
     detail = client.get(f"/api/images/{image_id}").json()

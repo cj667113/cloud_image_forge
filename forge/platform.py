@@ -16,7 +16,7 @@ import shlex
 from uuid import uuid4
 
 from .oci_guest import MODULE_CONFIG as OCI_MODULE_CONFIG
-from .oci_guest import ARCH_CONFIG, _architecture_errors, _glob, _kernel_architecture, _network_files, _read, _serial_device
+from .oci_guest import ARCH_CONFIG, HARDWARE_NIC_DRIVERS, verified_nic_bundle, _architecture_errors, _hardware_architecture_errors, _glob, _kernel_architecture, _network_files, _read, _serial_device, _select_initramfs_backend, _iscsi_module_directory
 from .architecture import normalize_arch, execution_blocker
 
 
@@ -25,7 +25,7 @@ MODULE_CONFIG = {**OCI_MODULE_CONFIG, "nvme": "CONFIG_BLK_DEV_NVME", "nvme_core"
                  "dm_mod": "CONFIG_BLK_DEV_DM", "xfs": "CONFIG_XFS_FS", "ext4": "CONFIG_EXT4_FS",
                  "ixgbe": "CONFIG_IXGBE", "i40e": "CONFIG_I40E", "mlx4_en": "CONFIG_MLX4_EN",
                  "bnxt_en": "CONFIG_BNXT"}
-NIC_DRIVERS = {"ixgbe", "ixgbevf", "i40e", "iavf", "mlx4_en", "mlx5_core", "bnxt_en"}
+NIC_DRIVERS = set(HARDWARE_NIC_DRIVERS)
 PV_DRIVERS = {"virtio_pci", "virtio_blk", "virtio_scsi", "sd_mod"}
 RPM_DISTROS = {"oraclelinux", "rhel", "centos", "rocky", "almalinux", "fedora"}
 DEB_DISTROS = {"debian", "ubuntu"}
@@ -57,7 +57,7 @@ def _iscsi_archive_ready(g, path, members):
     names = {name.lstrip("./") for name in members}
     root = next((name for name in ("usr/sbin/iscsiroot", "sbin/iscsiroot") if name in names), None)
     modules = next((name for name in ("usr/lib/dracut/modules.txt", "lib/dracut/modules.txt") if name in names), None)
-    hook = any(re.fullmatch(r"(?:usr/)?lib/dracut/hooks/cmdline/[0-9]+-parse-iscsiroot\.sh", name) for name in names)
+    hook = any(re.fullmatch(r"(?:(?:usr|var)/)?lib/dracut/hooks/cmdline/[0-9]+-parse-iscsiroot\.sh", name) for name in names)
     if not root or not modules or not hook:
         return False
     try:
@@ -99,7 +99,7 @@ complete toolchain; merely finding an unused helper is insufficient.
         f"forge_iscsi_modules=$(lsinitrd -m {quoted})",
         "printf '%s\\n' \"$forge_iscsi_modules\" | grep -Eq '^[[:space:]]*iscsi[[:space:]]*$' || forge_iscsi_fail 'iscsi dracut module missing'",
         "printf '%s\\n' \"$forge_iscsi_modules\" | grep -Eq '^[[:space:]]*network(-manager|-legacy)?[[:space:]]*$' || forge_iscsi_fail 'network dracut module missing'",
-        "forge_iscsi_has '(^|[[:space:]])(usr/)?lib/dracut/hooks/cmdline/[0-9]+-parse-iscsiroot\\.sh([[:space:]]|$)' || forge_iscsi_fail 'iSCSI cmdline hook missing'",
+        "forge_iscsi_has '(^|[[:space:]])(usr/|var/)?lib/dracut/hooks/cmdline/[0-9]+-parse-iscsiroot\\.sh([[:space:]]|$)' || forge_iscsi_fail 'iSCSI cmdline hook missing'",
         "if forge_iscsi_has '(^|[[:space:]])usr/sbin/iscsiroot([[:space:]]|$)'; then forge_iscsi_root_path=usr/sbin/iscsiroot; elif forge_iscsi_has '(^|[[:space:]])sbin/iscsiroot([[:space:]]|$)'; then forge_iscsi_root_path=sbin/iscsiroot; else forge_iscsi_fail 'iSCSI root hook missing'; fi",
         f"forge_iscsi_root=$(lsinitrd -f \"$forge_iscsi_root_path\" {quoted})",
         "forge_iscsi_root=$(printf '%s\\n' \"$forge_iscsi_root\" | sed '/^[[:space:]]*#/d')",
@@ -129,67 +129,12 @@ def _module_inventory(g, version, text, installed=False):
     return names
 
 
-def _fstab_evidence(g, partitions):
-    text = _read(g, "/etc/fstab")
-    errors, entries = [], []
-    by_mount = {p.get("mountpoint"): p for p in partitions if p.get("mountpoint")}
-    by_device = {p["device"]: p for p in partitions}
-    uuids = {}
-    for p in partitions:
-        if p.get("uuid"):
-            uuids.setdefault(p["uuid"].lower(), []).append(p)
-    if not text:
-        errors.append("A readable, nonempty /etc/fstab is required for stable mount preparation.")
-    for number, line in enumerate(text.splitlines(), 1):
-        fields = line.split("#", 1)[0].split()
-        if not fields:
-            continue
-        if not 4 <= len(fields) <= 6:
-            errors.append(f"fstab line {number} must contain 4–6 fields.")
-            continue
-        source, mount, fs, opts = fields[:4]
-        options = set(opts.split(","))
-        optional = mount != "/" and bool(options & {"nofail", "noauto", "_netdev"})
-        entry = {"line": number, "source": source, "mountpoint": mount,
-                 "filesystem": fs, "options": opts, "optional": optional}
-        local = source.startswith(("/dev/", "UUID=", "LABEL=", "PARTUUID=", "PARTLABEL="))
-        if "bind" in options or "rbind" in options or not local:
-            entry["preserve"] = True
-            if mount == "/":
-                errors.append("Root fstab entry must identify a local filesystem on the imported disk.")
-            entries.append(entry)
-            continue
-        partition = None
-        if source.startswith("UUID="):
-            matches = uuids.get(source[5:].strip("\"'").lower(), [])
-            if len(matches) == 1:
-                partition = matches[0]
-        elif source.startswith("LABEL="):
-            try:
-                partition = by_device.get(g.findfs_label(source[6:].strip("\"'")))
-            except RuntimeError:
-                pass
-        else:
-            # libguestfs has already mounted and inspected this filesystem.
-            partition = by_device.get(source) or by_mount.get(mount)
-        if partition is None:
-            if not optional:
-                errors.append(f"fstab line {number}: required {mount} cannot be resolved to the imported disk.")
-            entry["preserve"] = True
-        else:
-            identity = partition.get("uuid") or ""
-            if not UUID.fullmatch(identity) or len(uuids.get(identity.lower(), [])) != 1:
-                errors.append(f"fstab line {number}: {mount} needs a unique, usable filesystem UUID.")
-            elif mount in by_mount and by_mount[mount]["device"] != partition["device"]:
-                errors.append(f"fstab line {number}: filesystem identity disagrees with the mounted {mount}.")
-            else:
-                entry.update({"uuid": identity, "device": partition["device"], "replacement": "UUID=" + identity})
-        entries.append(entry)
-    roots = [item for item in entries if item["mountpoint"] == "/"]
-    if len(roots) != 1 or not roots[0].get("uuid"):
-        errors.append("Exactly one root fstab entry with a unique filesystem UUID is required.")
-    return {"entries": entries, "errors": errors, "sha256": hashlib.sha256(text.encode()).hexdigest(),
-            "root_uuid": roots[0].get("uuid") if len(roots) == 1 else None}
+def _fstab_evidence(g, root, partitions=None):
+    # Root is inspect_os's independently identified operating-system root.
+    # The shared inspector reads actual mounted devices and current UUIDs;
+    # fstab-derived partition mountpoint hints cannot repair stale references.
+    from .storage import inspect_mount_references
+    return inspect_mount_references(g, root, partitions)
 
 
 def _inspect_boot_environment(g):
@@ -337,7 +282,8 @@ def _inspect_platform(g, root, partitions, kernels, oci_evidence=None):
                                  if (match := re.search(r"/([A-Za-z0-9_-]+)\.ko(?:\.(?:xz|gz|zst))?$", "/" + name))})
                 iscsi_userspace = _iscsi_archive_ready(parsed, initrd, members)
                 archive = inspect_archive(parsed, initrd, members)
-                archive["decoder"] = "bounded_newc_gzip"
+                archive["decoder"] = "bounded_newc"
+                archive["formats"] = list(getattr(parsed, "formats", []))
                 digest = parsed.sha256
             except (RuntimeError, ValueError, OSError, AttributeError) as exc:
                 archive["readable"] = False
@@ -365,14 +311,15 @@ def _inspect_platform(g, root, partitions, kernels, oci_evidence=None):
             persistent.append(path)
     environment, environment_errors, environment_paths = _inspect_boot_environment(g)
     generated, generated_errors = _generated_grub_evidence(g, partitions)
-    result = {"version": 1, "kernels": inventory, "tools": tools, "fstab": _fstab_evidence(g, partitions),
+    iscsi_directory = _iscsi_module_directory(g)
+    result = {"version": 1, "kernels": inventory, "tools": tools, "fstab": _fstab_evidence(g, root, partitions),
             "boot_files": boot_files, "persistent_network_files": persistent,
             "generated_grub": generated, "generated_grub_errors": generated_errors,
             "boot_environment": environment, "boot_environment_errors": environment_errors,
             "boot_environment_paths": environment_paths,
             "dracut_modules": sorted({re.sub(r"^\d+", "", PurePosixPath(p).name)
                                       for p in _glob(g, "/usr/lib/dracut/modules.d/*")}),
-            "iscsi_userspace_backend": _iscsi_backend(_read(g, "/usr/lib/dracut/modules.d/95iscsi/iscsiroot.sh")),
+            "iscsi_userspace_backend": _iscsi_backend(_read(g, iscsi_directory + "/iscsiroot.sh")) if iscsi_directory else None,
             "network_backend": base.get("network_backend"), "network_ready": base.get("network_ready", False),
             "network_files": base.get("network_files", []), "serial_console_ready": base.get("serial_console_ready", False),
             "serial_device": base.get("serial_device"),
@@ -489,11 +436,11 @@ def _plan_preserve(inspection, options, plan, oci_config, target_provider, boot_
     from .portability import assess_portability
     blockers, warnings = plan["blockers"], plan["warnings"]
     target, network, boot = options.get("target"), options.get("network_attachment"), options.get("boot_attachment")
-    if options.get("source") not in {"vm", "bare_metal"} or target not in {"vm", "bare_metal"}:
-        blockers.append("Select valid source and target machine types; the prior machine is not inferred from disk contents.")
+    if options.get("source") not in {"unknown", "vm", "bare_metal"} or target not in {"vm", "bare_metal"}:
+        blockers.append("Select a valid target machine type; source may remain unknown because prior hardware is not inferred from disk contents.")
     if boot not in {"paravirtualized", "iscsi"} or network not in {"paravirtualized", "accelerated", "vfio"}:
         blockers.append("Select a supported target boot and network attachment profile.")
-    if network == "vfio" and options.get("nic_driver") not in NIC_DRIVERS:
+    if network == "vfio" and options.get("nic_driver") not in NIC_DRIVERS | {"auto"}:
         blockers.append("Select the actual target physical/VF NIC driver to validate existing coverage.")
     if target == "bare_metal" and (boot != "iscsi" or network != "vfio"):
         blockers.append("The supported bare-metal assessment profile uses firmware iSCSI boot and a selected hardware NIC.")
@@ -511,6 +458,7 @@ def _plan_preserve(inspection, options, plan, oci_config, target_provider, boot_
     assessment = assess_portability(inspection, options, target_provider)
     plan["portability"] = assessment
     plan["required_modules"] = assessment.get("required_modules", [])
+    plan["nic_drivers"] = assessment.get("nic_drivers", [])
     blockers.extend(assessment["blockers"])
     warnings.extend(assessment["warnings"])
     plan["actions"] = ["Validate existing target boot prerequisites and retain boot, initramfs, mount and network configuration without rewriting."]
@@ -547,7 +495,7 @@ def _plan_preserve(inspection, options, plan, oci_config, target_provider, boot_
     return plan
 
 
-def plan_platform(inspection, options, allow_network=False, oci_config=None, target_provider="oci", boot_migration=None):
+def plan_platform(inspection, options, allow_network=False, oci_config=None, target_provider="oci", boot_migration=None, *, mount_policy="auto"):
     options = _dict(options)
     requested = options.get("enabled", False)
     plan = {"requested": bool(requested), "ready": True, "source": options.get("source"), "target": options.get("target"),
@@ -555,14 +503,13 @@ def plan_platform(inspection, options, allow_network=False, oci_config=None, tar
             "actions": [], "blockers": [], "warnings": [], "required_modules": [], "packages": [],
             "effective_firmware": None, "provider_supported": options.get("target") != "bare_metal",
             "experimental": options.get("target") == "bare_metal", "boot_tested": False, "sources": SOURCES,
-            "fstab_changes": [], "network_backend": None, "initramfs_backend": None}
+            "fstab_changes": [], "network_backend": None, "initramfs_backend": None, "mount_policy": mount_policy}
     if not requested:
         return plan
     arch = normalize_arch(inspection.get("os", {}).get("arch"))
     plan.update(architecture=arch, serial_device=_serial_device(arch))
-    if arch == "aarch64" and (options.get("target") != "vm" or options.get("boot_attachment") != "paravirtualized"
-                               or options.get("network_attachment") not in {"paravirtualized", "accelerated"}):
-        plan["blockers"].append("ARM64 hardware profiles currently support UEFI VMs with paravirtualized boot and PV or Accelerated PV networking; ARM bare-metal, firmware-iSCSI and hardware NIC preparation are not validated.")
+    if mount_policy not in {"auto", "preserve"}:
+        plan["blockers"].append("Mount policy must be auto or preserve.")
     if plan["strategy"] == "preserve":
         return _plan_preserve(inspection, options, plan, oci_config, target_provider, boot_migration, allow_network)
     if plan["strategy"] != "reconfigure":
@@ -570,17 +517,17 @@ def plan_platform(inspection, options, allow_network=False, oci_config=None, tar
     blockers, warnings, actions = plan["blockers"], plan["warnings"], plan["actions"]
     source, target = options.get("source"), options.get("target")
     boot, network, nic = options.get("boot_attachment"), options.get("network_attachment"), options.get("nic_driver")
-    if source not in {"vm", "bare_metal"} or target not in {"vm", "bare_metal"} or source == target:
-        blockers.append("Select distinct VM and bare-metal source and destination platforms.")
+    if source not in {"unknown", "vm", "bare_metal"} or target not in {"vm", "bare_metal"}:
+        blockers.append("Select a valid VM or bare-metal destination; source may remain unknown.")
     if boot not in {"paravirtualized", "iscsi"} or network not in {"paravirtualized", "accelerated", "vfio"}:
         blockers.append("Select a supported boot and network attachment profile.")
-    if (target == "bare_metal" or network == "vfio") and nic not in NIC_DRIVERS:
+    if (target == "bare_metal" or network == "vfio") and nic not in NIC_DRIVERS | {"auto"}:
         blockers.append("Select the actual target physical/VF NIC driver; hardware cannot be inferred from an imported disk.")
     if target == "bare_metal":
         if boot != "iscsi" or network != "vfio":
             blockers.append("Experimental bare-metal preparation requires iSCSI boot and hardware/VFIO networking.")
         warnings.append("OCI documentation does not support bringing your own image to bare-metal instances. This export is experimental offline hardware preparation, not an OCI-supported bare-metal image.")
-        warnings.append("The chosen NIC and NVMe/AHCI controller profile must match the target machine; driver presence does not prove hardware or firmware compatibility.")
+        warnings.append("The chosen NIC and boot-controller profile must match the target machine; driver presence does not prove hardware or firmware compatibility.")
     if target_provider not in {"oci", "generic"}:
         blockers.append("This platform migration profile is limited to OCI or generic exports.")
     blocker = execution_blocker(arch)
@@ -592,7 +539,16 @@ def plan_platform(inspection, options, allow_network=False, oci_config=None, tar
     blockers.extend(evidence.get("errors", []))
     blockers.extend(evidence.get("boot_environment_errors", []))
     kernels, tools = evidence.get("kernels", {}), evidence.get("tools", {})
+    nic_modules = verified_nic_bundle(kernels) if nic == "auto" else [nic] if nic in NIC_DRIVERS else []
+    plan["nic_drivers"] = nic_modules if network == "vfio" else []
+    if network == "vfio" and nic == "auto":
+        if not nic_modules:
+            blockers.append("No supported physical NIC driver is present across every installed kernel for the automatic bundle.")
+        else:
+            actions.append("Include and verify the automatic NIC driver bundle in every initramfs: " + ", ".join(nic_modules) + ".")
+        warnings.append("The automatic NIC bundle covers verified installed drivers; the destination NIC remains unverified and still needs a target boot test.")
     blockers.extend(_architecture_errors(inspection, kernels, serial=options.get("configure_serial_console", True)))
+    blockers.extend(_hardware_architecture_errors(inspection, kernels, iscsi=boot == "iscsi", hardware_network=network == "vfio"))
     available, firmware, planned = _firmware(inspection, options, boot_migration, allow_network)
     selected_firmware = _dict(oci_config).get("capabilities", {}).get("Compute.Firmware", {}).get("default_value")
     if target == "vm" and selected_firmware in available:
@@ -602,11 +558,11 @@ def plan_platform(inspection, options, allow_network=False, oci_config=None, tar
         blockers.append("A detected boot chain is required; bare-metal preparation needs UEFI. Enable eligible BIOS-to-UEFI migration or import a compatible image.")
     # This profile discovers its boot target from firmware, not an explicit IQN.
     required = set(PV_DRIVERS if boot == "paravirtualized" else {"iscsi_tcp", "iscsi_ibft", "sd_mod"})
-    required.update({"virtio_pci", "virtio_net"} if network in {"paravirtualized", "accelerated"} else {nic} if nic in NIC_DRIVERS else set())
+    required.update({"virtio_pci", "virtio_net"} if network in {"paravirtualized", "accelerated"} else set(nic_modules))
     if network == "accelerated":
         actions.append("Prepare AcceleratedPV guest-facing VirtIO network drivers (virtio_net and virtio_pci) in every initramfs.")
         warnings.append("AcceleratedPV is a distinct OCI networking type. Existing native-architecture VirtIO coverage is checked; a compatible shape/image and target launch validation are still required.")
-    if target == "bare_metal":
+    if target == "bare_metal" and arch == "x86_64":
         required.update({"nvme", "nvme_core", "ahci"})
     plan["required_modules"] = sorted(required)
     if not kernels:
@@ -625,7 +581,7 @@ def plan_platform(inspection, options, allow_network=False, oci_config=None, tar
     rpm, deb = distro in RPM_DISTROS, distro in DEB_DISTROS
     if not (rpm or deb):
         blockers.append("Automatic preparation supports systemd Debian/Ubuntu and Enterprise Linux/Fedora guests.")
-    backend = "dracut" if tools.get("dracut") and (rpm or boot == "iscsi") else "initramfs-tools" if tools.get("update-initramfs") else "dracut" if tools.get("dracut") else None
+    backend = _select_initramfs_backend(tools, kernels, rpm=rpm, iscsi=boot == "iscsi")
     plan["initramfs_backend"] = backend
     if backend == "initramfs-tools":
         for version, kernel in kernels.items():
@@ -660,17 +616,19 @@ def plan_platform(inspection, options, allow_network=False, oci_config=None, tar
             need("iscsi-iname", "iscsi-initiator-utils" if rpm else "open-iscsi")
         elif iscsi_backend == "iscsistart":
             need("iscsistart", "iscsi-initiator-utils" if rpm else "open-iscsi")
-        elif not (rpm and options.get("install_packages") and allow_network and "iscsi" not in evidence.get("dracut_modules", [])):
+        elif not ((rpm or deb) and options.get("install_packages") and allow_network and "iscsi" not in evidence.get("dracut_modules", [])):
             blockers.append("Installed dracut firmware iSCSI discovery handler is not recognized; inspect or update the guest dracut package before migration.")
         plan["iscsi_userspace_backend"] = iscsi_backend
         modules = set(evidence.get("dracut_modules", []))
-        network_module = next((name for name in ("network-manager", "network-legacy", "network") if name in modules), None)
+        network_module = ("network-manager" if "network-manager" in modules and tools.get("NetworkManager") else
+                          "network" if "network" in modules else
+                          "network-legacy" if "network-legacy" in modules else None)
         plan["dracut_network_module"] = network_module
         if "iscsi" not in modules or not network_module:
-            if rpm and options.get("install_packages") and allow_network:
+            if (rpm or deb) and options.get("install_packages") and allow_network:
                 packages.add("dracut-network")
             else:
-                blockers.append("The dracut iSCSI and network modules must be installed (dracut-network on Enterprise Linux).")
+                blockers.append("The dracut iSCSI and network modules must be installed (dracut-network on Enterprise Linux, Debian and Ubuntu).")
         actions.append("Prepare firmware-discovered iSCSI boot with netroot=iscsi, rd.iscsi.firmware=1 and rd.neednet=1; rebuild and verify the iSCSI userspace in every initramfs.")
         warnings.append("The target firmware must supply valid iBFT/iSCSI boot parameters. This image does not invent an OCI address, IQN, credentials or initiator identity, and cannot verify firmware discovery offline.")
     else:
@@ -687,8 +645,15 @@ def plan_platform(inspection, options, allow_network=False, oci_config=None, tar
         blockers.append("A unique root filesystem UUID is required.")
     plan["fstab_changes"] = [{"line": item["line"], "mountpoint": item["mountpoint"], "from": item["source"], "to": item["replacement"]}
                              for item in fstab.get("entries", []) if item.get("replacement") and item["source"] != item["replacement"]]
-    actions += ["Use existing filesystem UUIDs for local fstab mounts and the root boot argument; retain mount options and filesystem identities.",
-                "Build generic initramfs for every non-rescue installed kernel and verify each required driver; preserve unrelated installed drivers."]
+    if mount_policy == "preserve":
+        for item in fstab.get("entries", []):
+            if item.get("reason", "").startswith("Reconciled"):
+                blockers.append(f"Preserved mount {item['mountpoint']} does not resolve through its existing reference; select automatic mount reconciliation or repair it explicitly.")
+        plan["fstab_changes"] = []
+        actions.append("Validate existing local mount references without rewriting fstab; use the actual root filesystem UUID for boot arguments.")
+    else:
+        actions.append("Use existing filesystem UUIDs for local fstab mounts and the root boot argument; retain mount options and filesystem identities.")
+    actions.append("Build generic initramfs for every non-rescue installed kernel and verify each required driver; preserve unrelated installed drivers.")
     for item in fstab.get("entries", []):
         if item.get("optional") and item.get("preserve"):
             warnings.append(f"Optional mount {item['mountpoint']} is not present in this disk and will be retained; validate it on the target.")
@@ -733,7 +698,7 @@ def plan_platform(inspection, options, allow_network=False, oci_config=None, tar
             name = shape.get("shape", "") if isinstance(shape, dict) else str(shape)
             if (target == "bare_metal" and name.startswith("VM.")) or (target == "vm" and name.startswith("BM.")):
                 blockers.append(f"OCI shape {name} conflicts with the destination platform.")
-    warnings.append("Source platform is declared by the operator, not detectable with certainty from disk contents. A target VM or hardware boot test is still required.")
+    warnings.append("Source platform remains unknown unless declared by the operator; it is not detectable with certainty from disk contents. A target VM or hardware boot test is still required.")
     plan["blockers"], plan["warnings"] = list(dict.fromkeys(blockers)), list(dict.fromkeys(warnings))
     plan["ready"] = not plan["blockers"]
     return plan
@@ -882,7 +847,20 @@ def _verify_generated_grub(evidence, plan, options):
                 for token in command[2:]:
                     words.extend(_boot_args(token, environment=evidence.get("boot_environment"))
                                  if "$" in token or "`" in token else [token])
-                if set(words) != set(_adapt_args(words, plan, options)):
+                comparable = words
+                roots = [word[5:] for word in words if word.startswith("root=")]
+                # Ubuntu's GRUB adds its own stable LVM selector before the
+                # explicit UUID from GRUB_CMDLINE_LINUX. Both first/last-root
+                # consumers must select the same independently inspected root.
+                if len(roots) > 1 and isinstance(plan.get("root_uuid"), str) and roots[-1] == "UUID=" + plan["root_uuid"]:
+                    from .portability import _resolve_root
+                    devices = evidence.get("portability", {}).get("local_devices", [])
+                    actual = [device for device in devices if device.get("mountpoint") == "/"
+                              and device.get("uuid") == plan["root_uuid"]]
+                    if (len(actual) == 1 and actual[0].get("device") == evidence.get("fstab", {}).get("root_device")
+                            and all(_resolve_root(value, devices, plan["root_uuid"]) for value in roots)):
+                        comparable = [word for word in words if not word.startswith("root=")] + ["root=UUID=" + plan["root_uuid"]]
+                if set(comparable) != set(_adapt_args(comparable, plan, options)):
                     blockers.append(f"Generated GRUB root/transport/serial arguments conflict with the prepared profile: {path}:{number} ({version}).")
                 if path == main:
                     covered.add(version)
@@ -903,9 +881,9 @@ def _verify_generated_grub(evidence, plan, options):
     return blockers
 
 
-def verify_platform(inspection, options, *, oci_config=None, target_provider="oci", receipt=None):
+def verify_platform(inspection, options, *, oci_config=None, target_provider="oci", receipt=None, mount_policy="auto"):
     options = _dict(options)
-    plan = plan_platform(inspection, options, False, oci_config, target_provider)
+    plan = plan_platform(inspection, options, False, oci_config, target_provider, mount_policy=mount_policy)
     if not plan["requested"]:
         return plan
     if options.get("strategy") == "preserve":
@@ -975,10 +953,10 @@ def verify_platform(inspection, options, *, oci_config=None, target_provider="oc
     return plan
 
 
-def prepare_platform(work: Path, inspection, options, allow_network, log, *, oci_config=None, target_provider="oci"):
-    from .engine import EngineError, ImageEngine, _guest, _mount, _roots, _run, _validate_fstab
+def prepare_platform(work: Path, inspection, options, allow_network, log, *, oci_config=None, target_provider="oci", mount_policy="auto"):
+    from .engine import EngineError, ImageEngine, _guest, _mount, _roots, _run, _run_guest_script, _validate_fstab
     options = _dict(options)
-    plan = plan_platform(inspection, options, allow_network, oci_config, target_provider)
+    plan = plan_platform(inspection, options, allow_network, oci_config, target_provider, mount_policy=mount_policy)
     if not plan["requested"]:
         return plan
     if not plan["ready"]:
@@ -987,10 +965,11 @@ def prepare_platform(work: Path, inspection, options, allow_network, log, *, oci
         # Re-read the actual working image after the user's explicit edits.
         # This branch never opens a writable guest or runs a guest command.
         current = ImageEngine().inspect(work)
-        final = verify_platform(current, options, oci_config=oci_config, target_provider=target_provider)
+        final = verify_platform(current, options, oci_config=oci_config, target_provider=target_provider, mount_policy=mount_policy)
         if not final["ready"]:
             raise EngineError("Existing hardware configuration cannot be preserved: " + " ".join(final["blockers"]))
         final["preserved_files"] = deepcopy(current["platform"]["portability"]["hashes"])
+        final["_inspection"] = current
         log("Existing hardware boot prerequisites verified; boot files, initramfs and network settings retained without rewriting")
         return final
     for action in plan["actions"]:
@@ -998,7 +977,7 @@ def prepare_platform(work: Path, inspection, options, allow_network, log, *, oci
     if plan["packages"]:
         _run(["virt-customize", "--format", "qcow2", "-a", str(work), "--network", "--install", ",".join(plan["packages"])], log)
         inspection = ImageEngine().inspect(work)
-        plan = plan_platform(inspection, options, False, oci_config, target_provider)
+        plan = plan_platform(inspection, options, False, oci_config, target_provider, mount_policy=mount_policy)
         if not plan["ready"]:
             raise EngineError("Platform prerequisites remain missing after package installation: " + " ".join(plan["blockers"]))
     evidence = inspection["platform"]
@@ -1010,7 +989,8 @@ def prepare_platform(work: Path, inspection, options, allow_network, log, *, oci
             fstab = _read(g, "/etc/fstab")
             if hashlib.sha256(fstab.encode()).hexdigest() != evidence["fstab"]["sha256"]:
                 raise ValueError("fstab changed after platform inspection.")
-            changed = _fstab_text(fstab, plan["fstab_changes"])
+            changed = ((evidence["fstab"].get("content") or _fstab_text(fstab, plan["fstab_changes"]))
+                       if mount_policy == "auto" else fstab)
             _validate_fstab(changed, g)
             if changed != fstab:
                 _write(g, "/etc/fstab", changed, backup)
@@ -1050,8 +1030,8 @@ def prepare_platform(work: Path, inspection, options, allow_network, log, *, oci
             commands.append(_initramfs_script(inspection, plan, options))
             commands.append("update-grub" if evidence["tools"].get("update-grub") else "grub2-mkconfig -o /boot/grub2/grub.cfg")
             _write(g, PROFILE, json.dumps({"options": options, "required_modules": plan["required_modules"],
-                                          "provider_supported": plan["provider_supported"], "boot_tested": False}, indent=2) + "\n", backup)
-        _run(["virt-customize", "--format", "qcow2", "-a", str(work), "--no-network", "--run-command", "\n".join(commands), "--selinux-relabel"], log)
+                                          "mount_policy": mount_policy, "provider_supported": plan["provider_supported"], "boot_tested": False}, indent=2) + "\n", backup)
+        _run_guest_script(work, "\n".join(commands), log)
         after = ImageEngine().inspect(work)
         after_kernels = after.get("platform", {}).get("kernels", {})
         if set(after_kernels) != set(evidence["kernels"]):
@@ -1064,11 +1044,12 @@ def prepare_platform(work: Path, inspection, options, allow_network, log, *, oci
                                                 "modules": sorted(set(plan["required_modules"]) - set(kernel.get("builtin", []))),
                                                 "iscsi_boot": options["boot_attachment"] == "iscsi"}
                                         for version, kernel in after_kernels.items()}}
-        final = verify_platform(after, options, oci_config=oci_config, target_provider=target_provider, receipt=receipt)
+        final = verify_platform(after, options, oci_config=oci_config, target_provider=target_provider, receipt=receipt, mount_policy=mount_policy)
         if not final["ready"]:
             raise EngineError("Platform verification failed after preparation: " + " ".join(final["blockers"]))
         final.update(receipt)
         final["backup_directory"] = backup
+        final["_inspection"] = after
         log("Platform preparation verified against resulting guest configuration and every rebuilt initramfs; target boot test remains required")
         return final
     except ValueError as exc:
