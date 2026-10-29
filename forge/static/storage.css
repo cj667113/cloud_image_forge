@@ -95,6 +95,8 @@
   #storage-studio .plan-action-row{align-items:center;flex-wrap:nowrap}
 }
 @media(max-width:360px){
+  #storage-studio .filesystem-heading,#storage-studio .filesystem-size-choice{grid-column:1/-1}
+  #storage-studio .filesystem-size-choice{justify-content:flex-start}
   #storage-studio.resizing .filesystem-size-choice:has(.filesystem-target){display:grid;grid-template-columns:minmax(0,1fr);gap:8px}
   #storage-studio.resizing .filesystem-size-choice:has(.filesystem-target) .filesystem-original{display:flex;align-items:baseline;gap:8px}
   #storage-studio.resizing .filesystem-arrow{display:none}
