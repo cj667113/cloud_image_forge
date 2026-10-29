@@ -2,6 +2,7 @@
 from contextlib import contextmanager
 from copy import deepcopy
 import io
+import os
 import hashlib
 import gzip
 from pathlib import Path
@@ -15,6 +16,16 @@ from uuid import UUID
 from forge.storage import (EFI_GUID, GIB, LINUX_GUID, LVM_GUID, LVM_PIN_ERROR, MIB, StorageError,
                            _archive_manifest, _compare_manifests, _configured_quotas, _inspect_initrd_lvm, _verify_layout,
                            inspect_storage, plan_rebuild, rebuild, verify_rebuild)
+
+
+def write_fileout(path, contents):
+    # macOS sandboxing may forbid reopening /dev/fd through the filesystem;
+    # fake the documented libguestfs FileOut API by duplicating its actual FD.
+    if str(path).startswith('/dev/fd/'):
+        with os.fdopen(os.dup(int(str(path).rsplit('/',1)[1])), 'wb') as output:
+            output.write(contents)
+    else:
+        Path(path).write_bytes(contents)
 
 
 def inspected(lvm=True):
@@ -512,7 +523,7 @@ class ExecutorTests(unittest.TestCase):
                     selected = root / "corrupt.tar.gz"
                     make_archive(selected, contents=b"bad restore")
                 with gzip.open(selected, "rb") as payload:
-                    Path(output).write_bytes(payload.read())
+                    write_fileout(output, payload.read())
             g.tar_out.side_effect = tar_out
             if fail_restore:
                 g.tar_in.side_effect = RuntimeError("restore failed")

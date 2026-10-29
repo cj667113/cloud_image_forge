@@ -15,6 +15,8 @@ from pathlib import Path, PurePosixPath
 import re
 import shlex
 import shutil
+import subprocess
+import sys
 import tarfile
 import tempfile
 from uuid import UUID
@@ -30,6 +32,24 @@ FILESYSTEMS = {"xfs", "ext2", "ext3", "ext4"}
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,126}\Z")
 ARCHIVE_OPTIONS = {"compress": "gzip", "xattrs": True, "selinux": True, "acls": True}
 ARCHIVE_METADATA = {key: value for key, value in ARCHIVE_OPTIONS.items() if key != "compress"}
+_GZIP_EXPORT = '''import gzip, resource, signal, sys
+limit, seconds = map(int, sys.argv[1:])
+resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+signal.alarm(seconds)
+count = 0
+try:
+    with gzip.GzipFile(filename="", mode="wb", fileobj=sys.stdout.buffer, compresslevel=6, mtime=0) as output:
+        while chunk := sys.stdin.buffer.read(4 * 1024 * 1024):
+            count += len(chunk)
+            if count > limit:
+                raise ValueError("Raw archive exceeds workspace")
+            output.write(chunk)
+    sys.stdout.buffer.flush()
+    sys.stderr.write("OK " + str(count) + "\\n")
+except Exception as error:
+    sys.stderr.write("ERROR " + type(error).__name__ + "\\n")
+    sys.exit(1)
+'''
 QUOTA_OPTIONS = {"quota", "qnoenforce", "uquota", "usrquota", "uqnoenforce", "gquota", "grpquota",
                  "gqnoenforce", "pquota", "prjquota", "pqnoenforce", "usrjquota", "grpjquota", "jqfmt"}
 LVM_PIN_ERROR = "Boot or mount configuration pins internal LVM UUIDs; this workflow preserves names and filesystem UUIDs only"
@@ -1124,6 +1144,10 @@ def plan_rebuild(inspection: dict, options: dict | None, disk_size_gib=None, *, 
         errors.append("Non-default GPT attribute flags require a dedicated migration")
     for part in parts:
         try:
+            _gpt_name_token(part.get("name", ""))
+        except StorageError as exc:
+            errors.append(f"Partition {part.get('device')}: {exc}")
+        try:
             UUID(bytes_le=bytes.fromhex(part["partition_guid"]))
         except (KeyError, ValueError, TypeError):
             errors.append(f"Partition {part.get('device')} lacks a valid GPT identity")
@@ -1421,12 +1445,20 @@ def _raw_gpt_names(g):
     return names
 
 
+def _gpt_name_token(name):
+    # Parted parses each argv as command text, including spaces and quotes.
+    # Its machine output also escapes backslashes, and the appliance locale
+    # cannot reliably round-trip non-ASCII names. Reject those before writing.
+    if (not isinstance(name, str) or len(name) > 36
+            or any(not 32 <= ord(char) <= 126 or char == "\\" for char in name)):
+        raise StorageError("GPT name preservation requires at most 36 printable ASCII characters without backslashes on this worker")
+    return '"' + name.replace('"', '\\"') + '"'
+
+
 def _set_gpt_name(g, number, name):
-    g.part_set_name("/dev/sda", number, name)
-    if name == "" and g.part_get_name("/dev/sda", number) != "":
-        # Bookworm Parted parses its own quoting: an empty argv is a no-op,
-        # while the literal quoted-empty token clears the logical GPT name.
-        g.part_set_name("/dev/sda", number, "''")
+    # Quoting is for Parted's parser, not a shell. Never try raw input first:
+    # an unquoted name could be split into multiple Parted command words.
+    g.part_set_name("/dev/sda", number, _gpt_name_token(name))
     if g.part_get_name("/dev/sda", number) != name or _raw_gpt_names(g).get(number) != name:
         raise StorageError("The worker could not preserve the exact GPT partition name")
 
@@ -1437,29 +1469,54 @@ def _archive_space(folder, size):
 
 
 def _export_archive(g, archive, capacity):
-    """Transport raw tar from the appliance; gzip on the native worker CPU."""
+    """Stream raw tar into a size-limited gzip child on the native worker CPU."""
     archive = Path(archive)
     _archive_space(archive.parent, capacity)
-    raw = None
+    limit = shutil.disk_usage(archive.parent).free - 512 * MIB
+    timeout = max(1, int(os.getenv("FORGE_COMMAND_TIMEOUT", "7200")))
+    process = None
     created = False
     try:
-        with tempfile.NamedTemporaryFile(prefix="raw-", suffix=".tar", dir=archive.parent, delete=False) as stream:
-            raw = Path(stream.name)
-        g.tar_out("/", str(raw), numericowner=True, **ARCHIVE_METADATA)
-        size = raw.stat().st_size
-        _archive_space(archive.parent, size)
-        with archive.open("xb") as output:
+        with os.fdopen(os.open(archive, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as output:
             created = True
-            with raw.open("rb") as source, gzip.GzipFile(filename="", mode="wb", fileobj=output, compresslevel=6, mtime=0) as compressed:
-                shutil.copyfileobj(source, compressed, length=4 * MIB)
+            # The constant child sets only its own file limit. preexec_fn and
+            # process-global limits are unsafe in the threaded API worker.
+            process = subprocess.Popen([sys.executable, "-I", "-c", _GZIP_EXPORT, str(limit), str(timeout)],
+                                       stdin=subprocess.PIPE, stdout=output, stderr=subprocess.PIPE,
+                                       bufsize=0, start_new_session=True)
+            transfer_error = None
+            try:
+                # libguestfs explicitly supports FileOut to /dev/fd/N. No
+                # uncompressed host file, FIFO or Python thread is involved.
+                g.tar_out("/", f"/dev/fd/{process.stdin.fileno()}", numericowner=True, **ARCHIVE_METADATA)
+            except Exception as exc:
+                transfer_error = exc
+            finally:
+                process.stdin.close()
+            try:
+                code = process.wait(timeout=30)
+            except subprocess.TimeoutExpired as exc:
+                raise StorageError("Native archive compressor did not finish within its shutdown timeout") from exc
+            status = process.stderr.read(128)
+            if code != 0 or not re.fullmatch(rb"OK [0-9]{1,20}\n", status):
+                raise StorageError("Native archive compression failed or exceeded its workspace/time limit") from transfer_error
+            if transfer_error is not None:
+                raise transfer_error
+            size = int(status[3:])
+            if not 0 < size <= limit:
+                raise StorageError("Native archive compressor returned an invalid input size")
         return size
     except BaseException:
         if created:
             archive.unlink(missing_ok=True)
         raise
     finally:
-        if raw is not None:
-            raw.unlink(missing_ok=True)
+        if process is not None:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            process.stdin.close()
+            process.stderr.close()
 
 
 def _import_archive(g, archive, raw_size):
