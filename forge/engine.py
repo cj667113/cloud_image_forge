@@ -102,6 +102,57 @@ def _run_guest_script(work, script, log, *, allow_network=False, relabel=True):
         return _run(command, log)
 
 
+def _validate_vmdk(path: Path, header: bytes) -> None:
+    """Accept embedded, standalone sparse VMDKs before QEMU reads a parent.
+
+    QEMU reads parentFileNameHint from a fixed 20-sector descriptor window,
+    independently of descriptorSize. Check that same window, including comments.
+    https://github.com/qemu/qemu/blob/v7.2.0/block/vmdk.c
+    """
+    version = struct.unpack_from("<I", header, 4)[0]
+    capacity = struct.unpack_from("<Q", header, 12)[0]
+    offset, sectors = struct.unpack_from("<QQ", header, 28)
+    length = path.stat().st_size
+    if version not in (1, 2, 3) or not capacity:
+        raise EngineError("Unsupported VMDK sparse header; export a standalone monolithicSparse or streamOptimized disk.")
+    if not (0 < offset <= MIB // 512 and 0 < sectors <= MIB // 512
+            and (offset + sectors) * 512 <= length):
+        raise EngineError("VMDK needs a complete embedded descriptor; split disks and external extents are unsupported.")
+    with path.open("rb") as stream:
+        stream.seek(offset * 512)
+        raw = stream.read(max(sectors * 512, 20 * 512))
+        descriptor = raw.split(b"\0", 1)[0]
+        # A reference in a comment also matters: QEMU searches with strstr.
+        if b"parentfilenamehint" in descriptor.lower():
+            raise EngineError("VMDK parent/backing-file references are not accepted; flatten the disk before importing.")
+        try:
+            text = descriptor.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise EngineError("Invalid VMDK embedded descriptor.") from exc
+        parents = re.findall(r'^\s*parentCID\s*=\s*([0-9a-fA-F]+)\s*$', text, re.M)
+        kinds = re.findall(r'^\s*createType\s*=\s*"([^"]+)"\s*$', text, re.M)
+        if parents != ["ffffffff"] and parents != ["FFFFFFFF"]:
+            raise EngineError("VMDK snapshots and missing or ambiguous parentCID are unsupported; flatten the disk first.")
+        if len(kinds) != 1 or kinds[0] not in {"monolithicSparse", "streamOptimized"}:
+            raise EngineError("Only self-contained monolithicSparse and streamOptimized VMDK disks are supported.")
+        extents = [line.strip() for line in text.splitlines()
+                   if re.match(r"^\s*(?:RW|RDONLY|NOACCESS)\b", line)]
+        extent = re.fullmatch(r'(?:RW|RDONLY)\s+(\d+)\s+SPARSE\s+"([^"\r\n]+)"', extents[0]) if len(extents) == 1 else None
+        if not extent or int(extent[1]) != capacity:
+            raise EngineError("VMDK must contain one embedded sparse extent matching its disk capacity; split disks are unsupported.")
+        # An embedded extent's historical name is descriptive: uploads rename
+        # the file, and QEMU uses the already-open sparse image for this extent.
+        if struct.unpack_from("<Q", header, 56)[0] == 0xffffffffffffffff:
+            stream.seek(max(0, length - 1536))
+            footer = stream.read(1536)
+            if (len(footer) != 1536 or footer[512:516] != b"KDMV"
+                    or struct.unpack_from("<II", footer, 8) != (0, 3)
+                    or footer[1024:1040] != bytes(16)):
+                raise EngineError("VMDK stream footer is missing or invalid. The file may be incomplete or damaged; finish downloading or re-export it before importing.")
+            if footer[516:520] != header[4:8] or footer[524:532] != header[12:20] or footer[540:556] != header[28:44]:
+                raise EngineError("VMDK footer disagrees with its sparse header; re-export the disk before importing.")
+
+
 def _input_format(path: Path) -> str:
     """Read headers before QEMU can follow references to external host files."""
     if not path.is_file() or path.is_symlink():
@@ -137,10 +188,13 @@ def _input_format(path: Path) -> str:
         if disk_type not in (2, 3):
             raise EngineError("Only standalone fixed or dynamic VHD is supported; differencing VHD is rejected.")
         return "vpc"
-    if (header.startswith((b"KDMV", b"COWD", b"# Disk DescriptorFile", b"vhdxfile", b"QED\x00"))
+    if header.startswith(b"KDMV"):
+        _validate_vmdk(path, header)
+        return "vmdk"
+    if (header.startswith((b"COWD", b"# Disk DescriptorFile", b"vhdxfile", b"QED\x00"))
             or path.suffix.lower() in {".vmdk", ".vdi", ".vhdx", ".ova", ".oci", ".tar", ".gz"}
             or b"Oracle VM VirtualBox Disk Image" in header):
-        raise EngineError("Import a standalone QCOW2, raw disk, or VHD file; archives and VMDK are not supported.")
+        raise EngineError("Import a standalone QCOW2, raw disk, VHD, or self-contained sparse VMDK; VMDK descriptor-only files, split disks, and archives are unsupported.")
     return "raw"
 
 
@@ -425,7 +479,7 @@ class ImageEngine:
         return {"available": not missing, "missing": missing,
                 "worker_arch": worker, "guest_architectures": list(SUPPORTED_ARCHES),
                 "guest_execution_architectures": [worker] if worker in SUPPORTED_ARCHES else [],
-                "input_formats": ["qcow2", "raw", "vhd"],
+                "input_formats": ["qcow2", "raw", "vhd", "vmdk"],
                 "output_formats": ["qcow2", "raw", "vhd", "gcp"],
                 "kvm": os.access("/dev/kvm", os.R_OK | os.W_OK),
                 "resize": "Partition and LVM growth, offline ext2/3/4 shrink, and a validated filesystem rebuild for supported GPT/UEFI XFS and LVM layouts."}
