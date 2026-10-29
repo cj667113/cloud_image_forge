@@ -18,7 +18,7 @@ function automaticDestinationLabel() {
 }
 function renderDestinationProfile() {
   const profiles=destinationProfiles(),arch=sourceArchitecture();
-  return `<label class="field destination-profile-field">Destination profile<select id="destination-profile"><option value="auto" selected>${esc(automaticDestinationLabel())}</option>${[['vm','Virtual machines'],['bare_metal','Bare metal']].map(([kind,label])=>`<optgroup label="${label}">${profiles.filter(profile=>profile.target===kind).map(profile=>`<option value="${esc(profile.id)}">${esc(profile.label)}${!arch?` · ${esc(profile.architecture)}`:''}</option>`).join('')}</optgroup>`).join('')}<option value="custom">Custom settings</option></select>${helpHint('Profiles choose destination attachments from the catalog, using the inspected CPU architecture. They do not infer where the source last ran or prove it will boot. Custom settings keep explicit hardware overrides.','Destination profiles')}</label><p class="destination-profile-status" id="destination-profile-loading" role="status" hidden>Applying destination defaults…</p><div class="destination-profile-actions"><button type="button" class="button secondary small" id="destination-profile-apply" data-destination-action="apply" hidden>Reapply profile</button></div><div id="destination-profile-summary" class="destination-profile-summary" hidden></div><div id="destination-downloads" class="destination-downloads" hidden><label class="check-field"><input type="checkbox" id="destination-allow-downloads"><span>Allow required downloads</span></label><span id="destination-downloads-help"></span></div><div id="destination-profile-error" class="notice error" role="alert" hidden></div><div id="destination-profile-warnings" hidden></div>${destinationState.error?`<div class="notice warning">Destination catalog unavailable. Use Custom settings or retry.<button type="button" class="button ghost small" data-destination-action="reload">Retry</button></div>`:''}`;
+  return `<label class="field destination-profile-field">Destination profile<select id="destination-profile"><option value="auto" selected>${esc(automaticDestinationLabel())}</option>${[['vm','Virtual machines'],['bare_metal','Bare metal']].map(([kind,label])=>`<optgroup label="${label}">${profiles.filter(profile=>profile.target===kind).map(profile=>`<option value="${esc(profile.id)}">${esc(profile.label)}${!arch?` · ${esc(profile.architecture)}`:''}</option>`).join('')}</optgroup>`).join('')}<option value="custom">Custom settings</option></select>${helpHint('Profiles choose destination attachments from the catalog, using the inspected CPU architecture. They do not infer where the source last ran or prove it will boot. Custom settings keep explicit hardware overrides. Required preparation packages are downloaded automatically from guest repositories.','Destination profiles')}</label><p class="destination-profile-status" id="destination-profile-loading" role="status" hidden>Applying destination defaults…</p><div class="destination-profile-actions"><button type="button" class="button secondary small" id="destination-profile-apply" data-destination-action="apply" hidden>Reapply profile</button></div><div id="destination-profile-summary" class="destination-profile-summary" hidden></div><div id="destination-profile-error" class="notice error" role="alert" hidden></div><div id="destination-profile-warnings" hidden></div>${destinationState.error?`<div class="notice warning">Destination catalog unavailable. Use Custom settings or retry.<button type="button" class="button ghost small" data-destination-action="reload">Retry</button></div>`:''}`;
 }
 function selectedDestinationProfileId() {
   const value=$('#destination-profile')?.value;
@@ -70,19 +70,13 @@ function renderDestinationResult(result) {
   if(profile){const attachment={paravirtualized:'PV',accelerated:'Accelerated PV',vfio:'Physical NIC',iscsi:'Firmware iSCSI'};summary.innerHTML=`<span><strong>${esc(architectureName(profile.architecture))}</strong></span><span>${profile.target==='bare_metal'?'Bare metal':'Virtual machine'}</span><span>${esc(attachment[profile.boot_attachment]||profile.boot_attachment)} boot</span><span>${esc(attachment[profile.network_attachment]||profile.network_attachment)} network</span>`;}
   const blockers=[...(result?.blockers||[]),...(result?.schema_error?[result.schema_error]:[])];renderDestinationIssues(blockers);$('#destination-profile-apply').hidden=!result?.schema_error;
   const warnings=$('#destination-profile-warnings'),notesOpen=$('details',warnings)?.open??state.editorDrafts[state.selected]?.disclosures?.['destination-notes'];warnings.hidden=!result?.warnings?.length;warnings.innerHTML=result?.warnings?.length?`<details class="editor-disclosure" data-disclosure="destination-notes"${notesOpen?' open':''}><summary>Profile notes <span class="disclosure-meta">${result.warnings.length}</span></summary><div class="details-content"><ul>${result.warnings.map(item=>`<li>${esc(item)}</li>`).join('')}</ul></div></details>`:'';
-  updateDestinationDownloads(result);
 }
-function updateDestinationDownloads(result=studioSession().destination) {
-  const container=$('#destination-downloads');if(!container)return;
-  const required=result?.required_packages||[];
-  container.hidden=!$('#platform-enabled').checked||$('#platform-strategy').value==='preserve'||$('#destination-profile').value==='custom'||!required.length;
-  $('#destination-allow-downloads').checked=$('#allow-network').checked&&$('#platform-install-packages').checked&&(result?.profile?.provider!=='oci'||$('#oci-install-packages').checked);
-  const help=$('#destination-downloads-help'),signature=JSON.stringify(required);
-  if(help.dataset.packages!==signature){help.dataset.packages=signature;help.innerHTML=required.length?helpHint(`Required packages: ${required.join(', ')}. Allows guest network access and installation from guest repositories for hardware and OCI preparation.`,'Required downloads'):'';}
-}
-function setDestinationDownloads(allowed) {
-  for(const id of ['allow-network','oci-allow-network','migration-allow-network','platform-allow-network','platform-install-packages','oci-install-packages'])$(`#${id}`).checked=allowed;
-  invalidateStudioPlans('platform');if($('#boot-migration-enabled').checked)invalidateMigrationPlan();updatePlatformStudio();updateDisclosureSummaries();updateDestinationDownloads();
+function applyDestinationPackageRequirements(result,strategy) {
+  // A selected profile authorizes only its inspected preparation prerequisites.
+  // Do not infer permission from an old checkbox or an unrelated cached plan.
+  const required=strategy!=='preserve'&&Array.isArray(result?.required_packages)&&result.required_packages.length>0;
+  if($('#platform-install-packages'))$('#platform-install-packages').checked=required;
+  if(result?.profile?.provider==='oci'&&$('#oci-install-packages'))$('#oci-install-packages').checked=required&&Boolean($('#oci-prepare')?.checked);
 }
 function destinationConfigurationIssue() {
   if(!$('#platform-enabled')?.checked||$('#destination-profile')?.value==='custom')return '';
@@ -109,6 +103,7 @@ async function resolveDestinationProfile({apply=true,syncOci=true}={}) {
       if(!result.schema_error&&syncOci)applyDestinationOci(result.oci_defaults,selection.strategy);
       else if(!result.schema_error&&result.oci_defaults&&session.destinationOciPrepare?.profileId===selection.profile_id)$('#oci-prepare').checked=selection.strategy!=='preserve'&&session.destinationOciPrepare.prepare;
       if(selection.strategy==='preserve')preservePlatformConfiguration();
+      applyDestinationPackageRequirements(result,selection.strategy);
       state.editorRevision++;invalidateStudioPlans('platform');
     }
     result.selection=JSON.stringify(destinationSelection());result.snapshot=snapshot;session.destination=result;renderDestinationResult(result);updatePlatformStudio();
@@ -133,8 +128,6 @@ function scheduleDestinationResolution(options) {
 }
 document.addEventListener('change',event=>{
   const input=event.target;
-  if(input.id==='destination-allow-downloads')setDestinationDownloads(input.checked);
-  if(['allow-network','oci-allow-network','migration-allow-network','platform-allow-network','platform-install-packages','oci-install-packages','platform-strategy','platform-enabled'].includes(input.id))queueMicrotask(()=>updateDestinationDownloads());
   if(input.name==='target'){
     $('#destination-profile option[value="auto"]').textContent=automaticDestinationLabel();
     if($('#destination-profile').value==='auto'&&$('#platform-enabled').checked)scheduleDestinationResolution({syncOci:studioSession().destinationOciPrepare?.profileId!==selectedDestinationProfileId()});

@@ -78,7 +78,7 @@ function wizardShowStep(id, {focus=false} = {}) {
   session.step = id;
   if (!session.visited.includes(id)) session.visited.push(id);
   wizardUpdate();
-  if (focus) {
+  if (focus && state.view === 'images') {
     $('#wizard-heading')?.focus({preventScroll:true});
     $('#wizard-chrome')?.scrollIntoView({block:'start',behavior:'instant'});
   }
@@ -129,6 +129,17 @@ function wizardUpdate() {
   if (session.step === 'result') wizardRenderResult();
   updateDisclosureSummaries();
   compactStudioHelp($('#recipe-form')||document);
+  wizardOpenCompletedExport();
+}
+function wizardOpenCompletedExport() {
+  if (state.view !== 'images' || !state.selected) return false;
+  const session = wizardSession();
+  if (session.step !== 'result' || !session.jobId || session.completedJobId === session.jobId) return false;
+  const job = state.jobs.find(item => item.id === session.jobId && item.image_id === state.selected && item.kind === 'build');
+  const artifact = job?.status === 'succeeded' && state.artifacts.find(item => item.id === job.result?.artifact_id && item.image_id === state.selected);
+  if (!artifact) return false;
+  session.completedJobId = session.jobId;
+  return openExportArtifact(artifact.id, {details:false});
 }
 function wizardSetBusy(value) { wizardState.busy = Boolean(value); wizardUpdate(); }
 function wizardError(message, node) {
@@ -165,13 +176,8 @@ async function wizardValidateStep(id, remote = false) {
   if (id === 'storage') {
     const size = getDiskSizeGiB();
     if (size && size > (state.health?.limits?.max_virtual_gib || 2048)) throw new Error('The requested disk capacity exceeds the server limit.');
-    const rebuild = getStorageRebuildConfig();
-    if (rebuild) { if(remote)await previewStorage(rebuild,true); return; }
-    if(size && getDiskCapacityBytes()<image?.inspection?.virtual_size && !$$('[data-partition]').some(node=>node.value)) throw editorError('Choose partition sizes before reducing the disk. Turn on Resize or use Advanced resizing.','#storage-rebuild-enabled');
-    if ($$('[data-partition]').some(node => node.value && node.dataset.partition === $('#expand-partition').value)) throw new Error('Choose either an explicit size or automatic expansion for the same partition.');
-    for(const field of $$('[data-partition]')) { const part=image?.inspection?.partitions?.find(item=>item.device===field.dataset.partition);if(field.value&&Number(field.value)*MiB<part?.size&&['xfs','LVM2_member'].includes(part.filesystem))throw new Error('Shrinking XFS or an LVM container requires filesystem rebuild mode.'); }
-    const lv = $('#expand-lv').value.trim();
-    if (lv && !/^\/dev\/[A-Za-z0-9_+.-]+\/[A-Za-z0-9_+.-]+$/.test(lv)) throw new Error('Enter a logical-volume path such as /dev/volume-group/root.');
+    const resize = getStorageResizeConfig();
+    if (resize && remote) await previewStorage(resize,true);
   }
   if (id === 'export') { const platform=getPlatformMigrationConfig(); if(remote&&platform)await previewPlatform(platform,true); }
   if (id === 'access') getSshAccessConfig();
@@ -188,13 +194,12 @@ async function wizardValidateStep(id, remote = false) {
   if (id === 'boot') {
     const install = $('#packages-install').value.trim().split(/[\s,]+/).filter(Boolean);
     const remove = $('#packages-remove').value.trim().split(/[\s,]+/).filter(Boolean);
-    if (install.length && !$('#allow-network').checked) throw editorError('Enable guest networking to install packages.','#allow-network');
     if ([...install,...remove].some(name => !/^[A-Za-z0-9][A-Za-z0-9.+_:~=-]{0,159}$/.test(name))) throw editorError('Use package names or versions, without paths, wildcards, or command options.','#packages-install');
     if (install.some(name => remove.includes(name))) throw editorError('A package cannot be installed and removed in the same build.','#packages-install');
     const grub = $('[data-file="/etc/default/grub"]');
     if (grub.value !== grub.defaultValue && !$('#regenerate-grub').checked) throw editorError('Enable GRUB regeneration to apply your changed GRUB defaults.','#regenerate-grub');
     const migration = getBootMigrationConfig();
-    if (remote && migration) await previewBootMigration(migration,true,$('#allow-network').checked);
+    if (remote && migration) await previewBootMigration(migration,true,requiredDownloadsEnabled());
   }
   if (id === 'mounts') {
     validateMountPolicy();
@@ -213,7 +218,7 @@ async function wizardValidateStep(id, remote = false) {
   }
   if (id === 'oci' && $('#oci-enabled').checked) {
     const config = getOciConfig();
-    if (remote) await previewOci(config,true,getBootMigrationConfig(),$('#allow-network').checked);
+    if (remote) await previewOci(config,true,getBootMigrationConfig(),requiredDownloadsEnabled());
   }
 }
 async function wizardValidateAll() {
@@ -263,7 +268,10 @@ function wizardRenderReview() {
   let recipe;
   try { recipe = getRecipe(); }
   catch (error) { delete panel.dataset.signature; panel.innerHTML = `<div class="notice error">${esc(errorText(error))}</div><p class="muted">Use Back or the completed steps to correct these settings.</p>`; return; }
-  const signature = JSON.stringify([state.selected,recipe,wizardImage()?.inspection?.boot]);
+  const cachedStorage = studioSession().storage;
+  const sizing = recipe.storage_resize && cachedStorage?.signature === JSON.stringify({storage_resize:recipe.storage_resize,disk_size_gib:recipe.disk_size_gib,mount_policy:recipe.mount_policy}) && cachedStorage.snapshot === studioInspectionKey() ? cachedStorage.plan : null;
+  const plannedCapacity = sizing?.ready ? sizing.layout?.disk_size_after : recipe.disk_size_gib ? recipe.disk_size_gib*GiB : null;
+  const signature = JSON.stringify([state.selected,recipe,wizardImage()?.inspection?.boot,sizing]);
   if (panel.dataset.signature === signature) return;
   panel.dataset.signature = signature;
   const unchangedOpen = $('[data-disclosure="review-unchanged"]',panel)?.open ?? state.editorDrafts[state.selected]?.disclosures?.['review-unchanged'];
@@ -271,12 +279,9 @@ function wizardRenderReview() {
   const add = (title, step, lines, changed=true) => (changed ? cards : unchanged).push(`<article class="wizard-review-card"><div class="wizard-review-heading"><h3>${esc(title)}</h3><button type="button" class="button ghost small" data-wizard-step="${step}">Edit</button></div><ul>${lines.map(line => `<li>${esc(line)}</li>`).join('')}</ul></article>`);
   add('Source','source',[wizardImage()?.name || 'Selected source',`Architecture: ${architectureName(wizardImage()?.inspection?.os?.arch)}`,`Detected boot: ${bootModeLabel(wizardImage()?.inspection?.boot)}`]);
   add('Storage','storage',[
-    recipe.disk_size_gib ? `Disk: ${bytes(recipe.disk_size_gib*GiB)} (${Math.round(recipe.disk_size_gib*GiB).toLocaleString()} bytes)` : 'Keep current disk capacity',
-    ...(recipe.storage_rebuild ? ['Rebuild filesystems on a separate disk',...recipe.storage_rebuild.sizes.map(item=>`${item.device}: ${item.size_mib.toLocaleString()} MiB`)] : []),
-    ...recipe.partition_changes.map(part => `${part.device}: resize to ${part.size_mib} MiB`),
-    ...(recipe.expand_partition ? [`Expand ${recipe.expand_partition}`] : []),
-    ...(recipe.expand_lv ? [`Expand logical volume ${recipe.expand_lv}`] : [])
-  ],Boolean(recipe.disk_size_gib || recipe.storage_rebuild || recipe.partition_changes.length || recipe.expand_partition || recipe.expand_lv));
+    plannedCapacity ? `Disk: ${bytes(plannedCapacity)}` : recipe.storage_resize ? 'Size the disk automatically' : 'Keep current disk capacity',
+    ...(recipe.storage_resize?.sizes.length ? recipe.storage_resize.sizes.map(item=>`${storageFilesystems().find(fs=>fs.device===item.device)?.mountpoint || item.device}: ${bytes(item.size_mib*MiB)}`) : sizing?.ready && sizing.root_fill ? sizing.filesystems.filter(fs=>fs.selected_size!==fs.size).map(fs=>`${fs.mountpoint || fs.device}: ${bytes(fs.selected_size)} · automatic`) : sizing?.ready ? ['Keep filesystem capacities'] : recipe.storage_resize ? ['Automatic filesystem sizing'] : [])
+  ],Boolean(recipe.disk_size_gib || recipe.storage_resize));
   const startup = recipe.services.map(item => `${item.action} ${item.name}`);
   startup.push(...recipe.files.filter(file => /\/cron|\/systemd\//.test(file.path)).map(file => `Edit ${file.path}`));
   add('Startup','startup',startup.length ? startup : ['Unchanged'],Boolean(startup.length));
@@ -290,7 +295,6 @@ function wizardRenderReview() {
   if (recipe.rebuild_initramfs) boot.push('Rebuild initramfs');
   if (recipe.regenerate_grub) boot.push('Regenerate GRUB configuration');
   boot.push(...recipe.files.filter(file => /\/modules-load\.d\/|\/modprobe\.d\//.test(file.path)).map(file => `Edit ${file.path}`));
-  boot.push(recipe.allow_network ? 'Guest networking enabled during customization' : 'Guest networking disabled during customization');
   add('Boot and kernel','boot',boot,Boolean(recipe.boot_migration || recipe.kernel_default || recipe.kernel_args || recipe.packages_install.length || recipe.packages_remove.length || recipe.rebuild_initramfs || recipe.regenerate_grub || recipe.allow_network || recipe.files.some(file => /\/modules-load\.d\/|\/modprobe\.d\//.test(file.path))));
   add('Destination','export',[profiles[recipe.target].label,`Output: ${recipe.output_format.toUpperCase()}`,recipe.sparsify ? 'Reclaim unused space' : 'Keep unused blocks',...(recipe.output_format === 'qcow2' ? [recipe.compress ? 'Compress QCOW2 output' : 'Uncompressed QCOW2 output'] : [])]);
   if(recipe.platform_migration) { const platform=recipe.platform_migration;add('Hardware compatibility','export',[platform.strategy==='preserve'?'Preserve & validate · hardware settings unchanged':'Reconfigure hardware settings',platform.source==='unknown'?`Destination: ${platform.target==='vm'?'Virtual machine':'Bare metal'}; previous platform unspecified`:`${platform.source==='vm'?'Virtual machine':'Bare metal'} → ${platform.target==='vm'?'Virtual machine':'Bare metal'}`,`Boot: ${platform.boot_attachment}; network: ${platform.network_attachment==='accelerated'?'Accelerated PV':platform.network_attachment}`,...(platform.nic_driver?[platform.nic_driver==='auto'?'NIC drivers: automatic available bundle':`NIC driver: ${platform.nic_driver}`]:[]),...(platform.target==='bare_metal'?['Experimental · OCI bare-metal BYOI is unsupported']:[])]); }
@@ -319,7 +323,7 @@ function wizardRenderResult() {
   $('.job-log',panel).scrollTop = logScroll;
 }
 function wizardBuildQueued(imageId,jobId) {
-  const session = wizardSession(imageId); session.jobId = jobId; session.uploadId = null; session.step = 'result';
+  const session = wizardSession(imageId); session.jobId = jobId; session.completedJobId = null; session.uploadId = null; session.step = 'result';
   if (!session.visited.includes('result')) session.visited.push('result');
   if (state.selected === imageId) { setView('images'); wizardShowStep('result',{focus:true}); }
 }

@@ -169,6 +169,7 @@ class Recipe(StrictModel):
     allow_network: bool = False
     boot_migration: BootMigration | None = None
     storage_rebuild: StorageRebuild | None = None
+    storage_resize: StorageRebuild | None = None
     platform_migration: PlatformMigration | None = None
     ssh_access: SSHAccess | None = None
     mount_policy: MountPolicy = "auto"
@@ -205,6 +206,8 @@ class Recipe(StrictModel):
             raise ValueError("Each partition can have one resize action")
         if self.storage_rebuild and self.storage_rebuild.enabled and (self.partition_changes or self.expand_partition or self.expand_lv):
             raise ValueError("Filesystem rebuild cannot be combined with direct partition or LV expansion actions")
+        if self.storage_resize and self.storage_resize.enabled and (self.partition_changes or self.expand_partition or self.expand_lv or (self.storage_rebuild and self.storage_rebuild.enabled)):
+            raise ValueError("Automatic filesystem sizing cannot be combined with legacy rebuild, partition or LV actions")
         paths = [f.path for f in self.files]
         if len(paths) != len(set(paths)):
             raise ValueError("Each configuration file can be edited once")
@@ -227,9 +230,16 @@ class UefiPlanRequest(StrictModel):
 
 
 class StoragePlanRequest(StrictModel):
-    storage_rebuild: StorageRebuild
+    storage_rebuild: StorageRebuild | None = None
+    storage_resize: StorageRebuild | None = None
     disk_size_gib: float | None = Field(default=None, gt=0, le=2048)
     mount_policy: MountPolicy = "auto"
+
+    @model_validator(mode="after")
+    def one_sizing_method(self):
+        if (self.storage_rebuild is None) == (self.storage_resize is None):
+            raise ValueError("Provide exactly one storage sizing request")
+        return self
 
 
 class PlatformPlanRequest(StrictModel):

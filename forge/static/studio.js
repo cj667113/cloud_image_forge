@@ -68,8 +68,9 @@ function storageFilesystems() {
 function getDiskCapacityBytes(unit=null) { const raw=$('#disk-size')?.value;if(!raw)return null;const value=Number(raw),scale=(unit||$('#disk-size-unit')?.value)==='gb'?1e9:GiB;return Math.ceil(value*scale/512)*512; }
 function getDiskSizeGiB() { const value=getDiskCapacityBytes();return value===null?null:value/GiB; }
 function storageSizeInputs() { return $$('[data-rebuild-device]'); }
-function getStorageRebuildConfig() {
-  if (!$('#storage-rebuild-enabled')?.checked) return null;
+function getStorageResizeConfig() {
+  const explicit=$('#storage-rebuild-enabled')?.checked;
+  if (!explicit) return getDiskSizeGiB()===null?null:{enabled:true,sizes:[]};
   for(const field of $$('[data-fs-size-input]')) {
     const unit=$('[data-fs-size-unit]',field.closest('[data-fs-device]')).value;
     field.min=String(unit==='gib'?32/1024:32);field.step=unit==='gib'?'any':'1';
@@ -80,7 +81,7 @@ function getStorageRebuildConfig() {
   return {enabled:true,sizes};
 }
 function storagePlanBody(config=undefined,disk=undefined,mountPolicy=undefined) {
-  return {storage_rebuild:config===undefined?(getStorageRebuildConfig()||{enabled:false,sizes:[]}):config,disk_size_gib:disk===undefined?getDiskSizeGiB():disk,mount_policy:mountPolicy??getMountPolicy()};
+  return {storage_resize:config===undefined?(getStorageResizeConfig()||{enabled:false,sizes:[]}):config,disk_size_gib:disk===undefined?getDiskSizeGiB():disk,mount_policy:mountPolicy??getMountPolicy()};
 }
 function storageRows() {
   return [...storageFilesystems()].sort((a,b)=>(a.mountpoint==='/'?-1:b.mountpoint==='/'?1:0)).map((fs,index)=>{
@@ -89,7 +90,7 @@ function storageRows() {
     const description=fs.mountpoint==='/'?'System':fs.kind==='efi'?'EFI boot':fs.mountpoint==='/boot'?'Boot':fs.kind==='lv'?'Logical volume':'Partition';
     return `<article class="filesystem-row" data-fs-device="${esc(fs.device)}">
       <div class="filesystem-heading"><div><span class="filesystem-dot color-${index%5}"></span><strong>${esc(name)}</strong>${helpHint(`${description} · ${fs.filesystem||'Unknown'} · ${fs.device}${fs.editable?'. Sizes round up to whole MiB, or 4 MiB for LVM.':''}`,`About ${name}`)}</div><span class="filesystem-kind">${esc(description)} · ${esc(fs.filesystem||'Unknown')}</span></div>
-      <div class="filesystem-size-choice"><span class="filesystem-original"><small>Current</small><strong>${bytes(fs.size)}</strong></span>${fs.editable?`<span class="filesystem-arrow" data-rebuild-controls hidden aria-hidden="true">→</span><label class="filesystem-target" data-rebuild-controls hidden><span>New size</span><span class="size-field"><input type="number" id="fs-size-${encodeURIComponent(fs.device)}" data-fs-size-input="${esc(fs.device)}" value="${unit==='gib'?current/1024:current}" min="${unit==='gib'?32/1024:32}" step="${unit==='gib'?'any':'1'}" required aria-label="New capacity of ${esc(name)}"><select id="fs-unit-${encodeURIComponent(fs.device)}" data-fs-size-unit="${esc(fs.device)}" aria-label="Capacity unit for ${esc(name)}"><option value="gib"${unit==='gib'?' selected':''}>GiB</option><option value="mib"${unit==='mib'?' selected':''}>MiB</option></select></span></label><input type="hidden" value="${current}" data-rebuild-device="${esc(fs.device)}">`:`<span class="filesystem-locked">Fixed${helpHint(fs.kind==='efi'?'The EFI partition keeps its original size and boot files.':'This filesystem is not supported for resizing. Refresh inspection if storage evidence is missing.',`Why ${name} is fixed`)}</span>`}</div>
+      <div class="filesystem-size-choice"><span class="filesystem-original"><small>Current</small><strong>${bytes(fs.size)}</strong></span><span class="filesystem-auto-target" hidden><small>Planned</small><strong data-fs-auto-size></strong></span>${fs.editable?`<span class="filesystem-arrow" data-rebuild-controls hidden aria-hidden="true">→</span><label class="filesystem-target" data-rebuild-controls hidden><span>New size</span><span class="size-field"><input type="number" id="fs-size-${encodeURIComponent(fs.device)}" data-fs-size-input="${esc(fs.device)}" value="${unit==='gib'?current/1024:current}" min="${unit==='gib'?32/1024:32}" step="${unit==='gib'?'any':'1'}" required aria-label="New capacity of ${esc(name)}"><select id="fs-unit-${encodeURIComponent(fs.device)}" data-fs-size-unit="${esc(fs.device)}" aria-label="Capacity unit for ${esc(name)}"><option value="gib"${unit==='gib'?' selected':''}>GiB</option><option value="mib"${unit==='mib'?' selected':''}>MiB</option></select></span></label><input type="hidden" value="${current}" data-rebuild-device="${esc(fs.device)}">`:`<span class="filesystem-locked">Fixed${helpHint(fs.kind==='efi'?'The EFI partition keeps its original size and boot files.':'This filesystem is not supported for resizing. Refresh inspection if storage evidence is missing.',`Why ${name} is fixed`)}</span>`}</div>
       <div class="filesystem-visual"><div class="fs-track" role="img"><span class="fs-original-capacity"></span><span class="fs-capacity"><i class="fs-used"></i></span><span class="fs-size-marker"></span></div><div class="filesystem-usage"><span>${known?`${bytes(fs.used)} used`:'Usage unavailable'}</span><span data-fs-difference></span><span class="sr-only" data-fs-planned>${bytes(fs.size)}</span></div></div>
       ${fs.editable?`<div class="filesystem-resize" data-rebuild-controls hidden><label class="slider-field"><span class="sr-only">Resize ${esc(name)} in MiB</span><input type="range" min="${minimum}" max="${Math.max(current*2,minimum+1024)}" step="1" value="${current}" data-rebuild-slider="${esc(fs.device)}"></label><span class="filesystem-minimum">Min. ${bytes(minimum*MiB)} ${helpHint(`Estimated minimum: ${minimum.toLocaleString()} MiB, including data and headroom. The server checks the layout before building; the estimate is not a guarantee.`,'Minimum size estimate')}</span></div>`:''}
       <div class="filesystem-alert" data-fs-alert role="status" hidden></div></article>`;
@@ -99,10 +100,10 @@ function renderStorageStudio() {
   const evidence=studioImage()?.inspection?.storage;
   return `<div id="storage-studio">
     <section class="storage-sizing-card" aria-labelledby="storage-sizing-title">
-      <div class="storage-card-heading"><h3 id="storage-sizing-title">Disk &amp; filesystems</h3><label class="check-field"><input type="checkbox" id="storage-rebuild-enabled"><span>Resize filesystems</span>${helpHint('Adjust supported XFS, ext and LVM filesystems on a new disk. Fixed boot partitions keep their size. The imported source stays unchanged.','Partition resizing')}</label></div>
+      <div class="storage-card-heading"><h3 id="storage-sizing-title">Disk &amp; filesystems</h3><label class="check-field"><input type="checkbox" id="storage-rebuild-enabled"><span>Resize filesystems</span>${helpHint('Adjust supported XFS, ext and LVM filesystems on a new disk. Containing partitions and LVM grow automatically. Shrinking uses the verified filesystem rebuild workflow. The imported source stays unchanged.','Partition resizing')}</label></div>
       <div class="storage-capacity-editor">
         <div class="storage-summary"><div><span>Current disk</span><strong id="storage-before"></strong></div><span class="storage-summary-arrow" aria-hidden="true">→</span><div><span>Planned disk</span><strong id="storage-after"></strong></div><div class="storage-saving"><strong id="storage-reduction"></strong></div><div class="storage-capacity-rail" role="img"><span id="storage-capacity-original"></span><span id="storage-capacity-target"></span></div></div>
-        <div class="storage-capacity-controls"><fieldset class="storage-capacity-modes"><legend>Disk capacity</legend><div><label><input type="radio" name="storage-capacity-mode" id="storage-capacity-keep" value="keep" checked><span>Keep current</span></label><label><input type="radio" name="storage-capacity-mode" id="storage-capacity-custom" value="custom"><span>Custom size</span></label></div></fieldset><div id="storage-capacity-field" hidden></div><div class="storage-fit-action"><button type="button" class="button secondary small" id="storage-fit-button" data-studio-action="storage-fit" hidden>${icon('image')}Fit to filesystems</button><span id="storage-fit-help" hidden>${helpHint('Checks the server’s layout plan and sets the disk to its minimum capacity, rounded up to two decimal places in your selected unit. Refit after changing filesystem sizes.','Fit disk to filesystems')}</span></div></div>
+        <div class="storage-capacity-controls"><fieldset class="storage-capacity-modes"><legend>Disk capacity</legend><div><label><input type="radio" name="storage-capacity-mode" id="storage-capacity-keep" value="keep" checked><span>Automatic</span></label><label><input type="radio" name="storage-capacity-mode" id="storage-capacity-custom" value="custom"><span>Custom size</span></label></div></fieldset><div id="storage-capacity-field" hidden></div><div class="storage-fit-action"><button type="button" class="button secondary small" id="storage-fit-button" data-studio-action="storage-fit" hidden>${icon('image')}Fit to filesystems</button><span id="storage-fit-help" hidden>${helpHint('Checks the server’s layout plan and sets the disk to its minimum capacity, rounded up to two decimal places in your selected unit. Refit after changing filesystem sizes.','Fit disk to filesystems')}</span></div></div>
       </div>
       ${!evidence?'<div class="notice warning storage-evidence-notice">Refresh inspection to enable resizing. <button type="button" class="button ghost small" data-action="refresh-inspection">Refresh</button></div>':''}
       <div class="storage-filesystems-heading"><h4>Filesystems</h4><span class="storage-usage-key">Used / capacity${helpHint('The dark bar shows used data; the lighter area is filesystem capacity. Hatched space marks a reduction from the source size. The downloaded file size is measured after export.','Reading the size bars')}</span></div>
@@ -110,7 +111,7 @@ function renderStorageStudio() {
       <div id="filesystem-reduction" class="filesystem-total-change"></div>
       <div id="storage-plan-controls" hidden><div class="plan-action-row"><button type="button" class="button secondary" id="storage-plan-button" data-studio-action="storage-preview">${icon('check')}Check sizes</button>${helpHint('Sizes and available space are also checked when you choose Next. The plan reports layout limits before any image is built.','Sizing validation')}</div><div id="storage-plan-error" class="notice error" role="alert" hidden></div><div id="storage-plan" class="studio-plan"></div></div>
     </section>
-    <details class="editor-disclosure storage-layout-details" data-disclosure="storage-layout"><summary>Layout &amp; advanced resizing <span class="disclosure-meta">Optional</span></summary><div class="details-content" id="storage-advanced-content">
+    <details class="editor-disclosure storage-layout-details" data-disclosure="storage-layout"><summary>Disk layout <span class="disclosure-meta">Details</span></summary><div class="details-content" id="storage-advanced-content">
       <div class="storage-disk-facts"><span>Source file <strong id="storage-file-size"></strong></span><span>Target capacity <strong id="storage-exact-capacity"></strong></span></div>
       <div class="disk-comparison"><div class="disk-caption"><span>Current</span><span id="storage-current-size"></span></div><div class="disk-track" id="storage-current-map" role="img"></div><div class="disk-caption"><span>Planned</span><span id="storage-planned-size"></span></div><div class="disk-track" id="storage-planned-map" role="img"></div><div id="storage-map-note" class="storage-note"></div></div>
     </div></details>
@@ -119,13 +120,8 @@ function renderStorageStudio() {
 function prepareStudioEditor() {
   const panel=$('#panel-storage');if(!panel||$('#storage-studio'))return;
   const capacity=$('#disk-size').closest('label');capacity.remove();
-  $('h3',panel)?.remove();$('.panel-intro',panel)?.remove();
-  const direct=document.createElement('details');direct.id='storage-direct-options';direct.className='studio-details editor-disclosure';direct.dataset.disclosure='storage-direct';
-  direct.innerHTML='<summary>Advanced resizing <span class="disclosure-meta">Direct partitions & LVM growth</span></summary><div class="details-content"></div>';
-  const content=$('.details-content',direct);while(panel.firstChild)content.append(panel.firstChild);
-  panel.innerHTML=renderStorageStudio();$('#storage-capacity-field').append(capacity);$('#storage-advanced-content').append(direct);
-  const disk=$('#disk-size');disk.setAttribute('aria-label','Target disk capacity');disk.step='any';disk.placeholder='Keep current';const title=[...capacity.childNodes].find(node=>node.nodeType===3&&node.textContent.trim());if(title)title.textContent='Target capacity';const units=document.createElement('div');units.className='capacity-input';disk.replaceWith(units);units.append(disk);units.insertAdjacentHTML('beforeend','<select id="disk-size-unit" aria-label="Capacity unit" data-previous-unit="gib"><option value="gib">GiB</option><option value="gb">GB</option></select>');const oldHelp=$('.field-help',capacity);if(oldHelp)oldHelp.remove();capacity.insertAdjacentHTML('beforeend',helpHint('GiB uses 1024³ bytes; GB uses 1000³. Capacity is rounded up to a disk sector. File size is measured after export; boot migration can add capacity.','Target disk capacity'));
-  $$('[data-partition]',direct).forEach(field=>{const part=studioImage().inspection.partitions.find(item=>item.device===field.dataset.partition),size=Math.ceil((part?.size||0)/MiB);field.insertAdjacentHTML('afterend',`<input type="range" class="direct-resize-slider" min="32" max="${Math.max(size*2,1024)}" value="${size}" step="1" data-partition-slider="${esc(field.dataset.partition)}" aria-label="Resize ${esc(field.dataset.partition)} in MiB">`);});
+  panel.innerHTML=renderStorageStudio();$('#storage-capacity-field').append(capacity);
+  const disk=$('#disk-size');disk.setAttribute('aria-label','Target disk capacity');disk.step='any';disk.placeholder='Automatic';const title=[...capacity.childNodes].find(node=>node.nodeType===3&&node.textContent.trim());if(title)title.textContent='Target capacity';const units=document.createElement('div');units.className='capacity-input';disk.replaceWith(units);units.append(disk);units.insertAdjacentHTML('beforeend','<select id="disk-size-unit" aria-label="Capacity unit" data-previous-unit="gib"><option value="gib">GiB</option><option value="gb">GB</option></select>');const oldHelp=$('.field-help',capacity);if(oldHelp)oldHelp.remove();capacity.insertAdjacentHTML('beforeend',helpHint('Keeps current capacity unless filesystem targets require more space. Custom size sets a fixed disk capacity. Fit to filesystems chooses the smallest verified layout. A larger custom disk fills the verified root only when filesystem sizes are not explicitly selected. GiB uses 1024³ bytes; GB uses 1000³.','Target disk capacity'));
   $('#panel-export').insertAdjacentHTML('beforeend',renderPlatformStudio());
   compactStudioHelp($('#recipe-form'));
 }
@@ -146,11 +142,12 @@ function reductionText(before,after) {
 function updateStorageStudio() {
   if(!$('#storage-studio'))return;
   const inspection=studioImage()?.inspection||{},enabled=$('#storage-rebuild-enabled').checked;
-  $('#storage-direct-options').hidden=enabled;$('#storage-plan-controls').hidden=!enabled;
+  const requested=enabled||getDiskSizeGiB()!==null;$('#storage-plan-controls').hidden=!requested;
   $('#storage-fit-button').hidden=!enabled;$('#storage-fit-help').hidden=!enabled;
   $('#storage-studio').classList.toggle('resizing',enabled);
   $$('[data-rebuild-controls]').forEach(node=>node.hidden=!enabled);
-  const before=Number(inspection.virtual_size)||0,raw=$('#disk-size').value,custom=Boolean(raw)||$('#storage-capacity-custom').checked,after=custom?(getDiskCapacityBytes()??NaN):before;
+  let plan;try { const body=storagePlanBody();const cached=studioSession().storage;if(cached?.signature===JSON.stringify(body)&&cached.snapshot===studioInspectionKey())plan=cached.plan;}catch{}
+  const before=Number(inspection.virtual_size)||0,raw=$('#disk-size').value,custom=Boolean(raw)||$('#storage-capacity-custom').checked,after=custom?(getDiskCapacityBytes()??NaN):(plan?.layout?.disk_size_after||before);
   $('#storage-capacity-keep').checked=!custom;$('#storage-capacity-custom').checked=custom;$('#storage-capacity-field').hidden=!custom;$('#disk-size').required=custom;
   $('#storage-before').textContent=bytes(before);$('#storage-after').textContent=after>0?bytes(after):'Enter a valid size';$('#storage-reduction').textContent=reductionText(before,after);$('#storage-file-size').textContent=bytes(inspection.actual_size);$('#storage-exact-capacity').textContent=after>0?`${after.toLocaleString('en-US')} bytes`:'Enter a positive disk capacity.';
   const diskScale=Math.max(before,after||0,1);
@@ -159,21 +156,20 @@ function updateStorageStudio() {
   $('.storage-capacity-rail').setAttribute('aria-label',`Disk capacity: ${bytes(before)} current, ${bytes(after)} planned. ${reductionText(before,after)}`);
   $('#storage-studio').classList.toggle('disk-shrinking',after>0&&after<before);
   const sourceParts=(inspection.partitions||[]).filter(part=>/^\/dev\/sda\d+$/.test(part.device));
-  let plan;try { const body=storagePlanBody();const cached=studioSession().storage;if(cached?.signature===JSON.stringify(body)&&cached.snapshot===studioInspectionKey())plan=cached.plan;}catch{}
   let proposed=sourceParts.map(part=>({...part}));
-  if(enabled&&plan?.layout?.partitions)proposed=plan.layout.partitions;
-  else if(!enabled)proposed=proposed.map(part=>{const input=$$('[data-partition]').find(node=>node.dataset.partition===part.device);return {...part,size:input?.value?Number(input.value)*MiB:part.size};});
+  if(plan?.layout?.partitions)proposed=plan.layout.partitions;
   const scale=Math.max(before,after||0,1);
   $('#storage-current-map').innerHTML=partitionMap(sourceParts,before,scale);$('#storage-current-map').setAttribute('aria-label',`Current disk ${bytes(before)}. ${sourceParts.map(part=>part.device+' '+bytes(part.size)).join(', ')}`);
-  $('#storage-planned-map').innerHTML=partitionMap(proposed,after,scale);$('#storage-planned-map').setAttribute('aria-label',`Planned disk ${bytes(after)}. ${enabled&&!plan?'Partition positions require plan validation.':proposed.map(part=>part.device+' '+bytes(part.size)).join(', ')}`);
-  $('#storage-planned-map').classList.toggle('unvalidated',enabled&&!plan);$('#storage-current-size').textContent=bytes(before);$('#storage-planned-size').textContent=after>0?bytes(after):'Invalid capacity';
-  $('#storage-map-note').textContent=`Scale: ${bytes(scale)}. `+(enabled&&!plan?'Check sizes to update this layout.':enabled&&plan?.ready?'Validated layout.':enabled?'Resolve the size blockers.':'Hatched areas are unallocated.');
+  $('#storage-planned-map').innerHTML=partitionMap(proposed,after,scale);$('#storage-planned-map').setAttribute('aria-label',`Planned disk ${bytes(after)}. ${requested&&!plan?'Partition positions require plan validation.':proposed.map(part=>part.device+' '+bytes(part.size)).join(', ')}`);
+  $('#storage-planned-map').classList.toggle('unvalidated',requested&&!plan);$('#storage-current-size').textContent=bytes(before);$('#storage-planned-size').textContent=after>0?bytes(after):'Invalid capacity';
+  $('#storage-map-note').textContent=`Scale: ${bytes(scale)}. `+(requested&&!plan?'Check sizes to update this layout.':requested&&plan?.ready?'Validated layout.':requested?'Resolve the size blockers.':'Hatched areas are unallocated.');
   let fsBefore=0,fsAfter=0;
   for(const fs of storageFilesystems()) {
     const row=$$('[data-fs-device]').find(node=>node.dataset.fsDevice===fs.device);if(!row)continue;
-    const directField=$$('[data-partition]').find(node=>node.dataset.partition===fs.device),field=storageSizeInputs().find(node=>node.dataset.rebuildDevice===fs.device),selected=plan?.filesystems?.find(item=>item.device===fs.device)?.selected_size_mib,next=enabled&&field?(Number.isFinite(selected)?selected:Number(field.value))*MiB:!enabled&&directField?.value?Number(directField.value)*MiB:Number(fs.size),current=Number(fs.size)||0,used=Number.isFinite(fs.used)?fs.used:null;
+    const field=storageSizeInputs().find(node=>node.dataset.rebuildDevice===fs.device),selected=plan?.filesystems?.find(item=>item.device===fs.device)?.selected_size_mib,next=Number.isFinite(selected)?selected*MiB:enabled&&field?Number(field.value)*MiB:Number(fs.size),current=Number(fs.size)||0,used=Number.isFinite(fs.used)?fs.used:null;
     fsBefore+=current;fsAfter+=Number.isFinite(next)?next:current;
     $('[data-fs-planned]',row).textContent=next>0?bytes(next):'Invalid';
+    const automatic=$('.filesystem-auto-target',row);automatic.hidden=enabled||!Number.isFinite(selected)||next===current;$('[data-fs-auto-size]',row).textContent=next>0?bytes(next):'Invalid';
     const max=Math.max(current,next||0,1);
     const track=$('.fs-track',row),bar=$('.fs-capacity',track);
     bar.style.width=`${Math.max(0,Math.min(100,(next||0)/max*100))}%`;
@@ -184,12 +180,11 @@ function updateStorageStudio() {
     $('[data-fs-difference]',row).textContent=next>0&&next!==current?`${bytes(Math.abs(current-next))} ${next<current?'less':'more'}`:'';
     row.classList.toggle('size-changed',next>0&&next!==current);
     const slider=$('[data-rebuild-slider]',row);if(slider&&field) { slider.max=Math.max(Number(slider.max),Number(field.value)||0);slider.value=field.value;slider.setAttribute('aria-valuetext',`${field.value} MiB`); }
-    const minimum=Number(fs.minimum_size_mib);const tooSmall=enabled&&field&&minimum&&Number(field.value)<minimum;const directShrink=!enabled&&directField?.value&&next<current&&fs.filesystem==='xfs';
-    const alert=$('[data-fs-alert]',row);alert.hidden=!tooSmall&&!directShrink;alert.textContent=directShrink?'Turn on Resize to shrink XFS.':tooSmall?`Use at least ${bytes(minimum*MiB)} (${minimum.toLocaleString()} MiB).`:'';row.classList.toggle('size-blocked',Boolean(tooSmall||directShrink));
+    const minimum=Number(fs.minimum_size_mib);const tooSmall=enabled&&field&&minimum&&Number(field.value)<minimum;
+    const alert=$('[data-fs-alert]',row);alert.hidden=!tooSmall;alert.textContent=tooSmall?`Use at least ${bytes(minimum*MiB)} (${minimum.toLocaleString()} MiB).`:'';row.classList.toggle('size-blocked',Boolean(tooSmall));
   }
-  $$('[data-partition-slider]').forEach(slider=>{const field=$$('[data-partition]').find(node=>node.dataset.partition===slider.dataset.partitionSlider),part=sourceParts.find(item=>item.device===slider.dataset.partitionSlider);slider.max=Math.max(Number(slider.max),Number(field?.value)||0);slider.value=field?.value||Math.ceil((part?.size||0)/MiB);});
   $('#filesystem-reduction').textContent=fsBefore===fsAfter?'':`Filesystems: ${reductionText(fsBefore,fsAfter)}`;
-  if(enabled&&plan)renderStoragePlan(plan);
+  if(requested&&plan)renderStoragePlan(plan);
   for(const button of [$('#storage-plan-button'),$('#storage-fit-button')])if(button)button.disabled=wizardInspectionPending()||Boolean(studioSession().storageFitPending)||button.getAttribute('aria-busy')==='true';
 }
 function renderStoragePlan(plan) {
@@ -197,7 +192,7 @@ function renderStoragePlan(plan) {
   if(container.dataset.renderedPlan===signature&&$('.plan-status',container))return;
   container.dataset.renderedPlan=signature;
   const lines=items=>(items||[]).map(item=>`<li>${esc(item)}</li>`).join('');
-  $('#storage-plan').innerHTML=`<div role="status" class="plan-status ${plan.ready?'ready':'blocked'}">${icon(plan.ready?'check':'info')}<strong>${plan.ready?'Storage plan ready':'Resolve storage blockers'}</strong></div>${plan.blockers?.length?`<ul class="plan-blockers" role="alert">${lines(plan.blockers)}</ul>`:''}<div class="plan-facts"><span>Minimum disk <strong>${bytes(plan.layout?.minimum_disk_size)}</strong></span><span>Working space <strong>${bytes(plan.estimated_temporary_bytes)}</strong></span></div>${plan.changes?.length?`<details><summary>Planned changes</summary><ul>${lines(plan.changes)}</ul></details>`:''}${plan.warnings?.length?`<details><summary>Checks & limitations (${plan.warnings.length})</summary><ul>${lines(plan.warnings)}</ul></details>`:''}`;
+  $('#storage-plan').innerHTML=`<div role="status" class="plan-status ${plan.ready?'ready':'blocked'}">${icon(plan.ready?'check':'info')}<strong>${plan.ready?'Storage plan ready':'Resolve storage blockers'}</strong></div>${plan.blockers?.length?`<ul class="plan-blockers" role="alert">${lines(plan.blockers)}</ul>`:''}<div class="plan-facts"><span>Method <strong>${plan.mode==='growth'?'Grow in place on a copy':plan.mode==='unchanged'?'Keep current sizes':'Rebuild filesystems'}</strong></span><span>Minimum disk <strong>${bytes(plan.layout?.minimum_disk_size)}</strong></span><span>Working space <strong>${bytes(plan.estimated_temporary_bytes)}</strong></span></div>${plan.changes?.length?`<details><summary>Planned changes</summary><ul>${lines(plan.changes)}</ul></details>`:''}${plan.warnings?.length?`<details><summary>Checks & limitations (${plan.warnings.length})</summary><ul>${lines(plan.warnings)}</ul></details>`:''}`;
 }
 function beginStudioPlan(button) {
   const requestId=String(++studioState.requestId);
@@ -230,7 +225,8 @@ async function fitStorageDisk() {
   session.storageFitPending=true;button.disabled=true;button.setAttribute('aria-busy','true');
   button.innerHTML='<span class="spinner" aria-hidden="true"></span>Calculating…';updateStorageStudio();wizardUpdate();
   try {
-    const plan=await previewStorage(undefined,false,null);
+    // A bounded undersized preview selects the safe packing/rebuild planner.
+    const plan=await previewStorage(undefined,false,1/1024);
     if(!plan||state.selected!==imageId||state.editorRevision!==revision||studioInspectionKey()!==snapshot)return;
     const minimum=plan.layout?.minimum_disk_size;
     if(!Number.isFinite(minimum)||minimum<=0)return;
@@ -283,8 +279,7 @@ function renderPlatformStudio() {
       <details class="editor-disclosure" id="platform-write-options" data-disclosure="platform-options" hidden><summary>Preparation options <span class="disclosure-meta">Network, console & packages</span></summary><div class="details-content platform-options">
         <label class="check-field"><input type="checkbox" id="platform-configure-network" checked><span>Configure network startup${helpHint('Replaces machine-bound network profiles with portable DHCP and prepares early networking when required.','Network startup')}</span></label>
         <label class="check-field"><input type="checkbox" id="platform-serial-console" checked><span>Enable serial console${helpHint(sourceArchitecture()==='aarch64'?'Enables ttyAMA0 at 115200 baud and a serial login service for ARM64.':sourceArchitecture()==='x86_64'?'Enables ttyS0 at 115200 baud and a serial login service for x86_64.':'Enables the guest-supported serial console after architecture checks.','Serial console')}</span></label>
-        <label class="check-field"><input type="checkbox" id="platform-install-packages"><span>Install required packages${helpHint('Uses the guest repositories. Guest network access must also be enabled.','Package installation')}</span></label>
-        <label class="check-field"><input type="checkbox" id="platform-allow-network"><span>Allow guest network access</span></label>
+        <label class="check-field"><input type="checkbox" id="platform-install-packages"><span>Install required packages${helpHint('Required packages are downloaded from the guest repositories during preparation.','Package installation')}</span></label>
       </div></details>
       <div class="notice error" id="platform-preserve-conflict" role="alert" hidden>Preserve &amp; validate requires OCI guest preparation off. <button type="button" class="button ghost small" id="platform-preserve-validate-button" data-studio-action="platform-validate-oci">Use validate-only</button></div>
       <div class="platform-oci-note" id="platform-oci-note" hidden></div>
@@ -299,7 +294,6 @@ function getPlatformMigrationConfig() {
   const destinationIssue=destinationConfigurationIssue();if(destinationIssue)throw editorError(destinationIssue,'#destination-profile');
   if(platformPreserveConflict())throw editorError('Turn off OCI guest preparation to preserve the existing hardware configuration.','#platform-preserve-validate-button');
   if((config.target==='bare_metal'||config.network_attachment==='vfio')&&!config.nic_driver)throw editorError('Choose Automatic or the NIC driver for the destination hardware.','#platform-nic');
-  if(config.install_packages&&!$('#allow-network').checked)throw new Error('Enable networking to install platform packages.');
   return config;
 }
 function platformPreserveConflict() { return Boolean($('#platform-enabled')?.checked&&$('#platform-strategy')?.value==='preserve'&&$('input[name="target"]:checked')?.value==='oci'&&$('#oci-enabled')?.checked&&$('#oci-prepare')?.checked); }
@@ -346,12 +340,11 @@ function updatePlatformStudio() {
   const accelerated=$('#platform-accelerated-note'),issue=oci?ociAcceleratedSchemaError():'';
   accelerated.hidden=$('#platform-network').value!=='accelerated';accelerated.className=`notice ${issue?'error':'warning'}`;accelerated.textContent=issue||'Accelerated PV is shape-dependent. Confirm image and regional schema support, then test the destination launch.';
   const note=$('#platform-oci-note');note.hidden=preserve||!oci||!note.textContent;
-  $('#platform-allow-network').checked=Boolean($('#allow-network')?.checked);
   const button=$('#platform-plan-button');button.disabled=wizardInspectionPending()||button.getAttribute('aria-busy')==='true';
 }
 function platformPlanBody(config=undefined,recipe=null) {
   const selected=config===undefined?getPlatformMigrationConfig():config;
-  return {target:recipe?recipe.target:($('input[name="target"]:checked')?.value||'oci'),platform_migration:selected,mount_policy:recipe?recipe.mount_policy:getMountPolicy(),allow_network:recipe?recipe.allow_network:$('#allow-network').checked,...((recipe?recipe.boot_migration:getBootMigrationConfig())?{boot_migration:recipe?recipe.boot_migration:getBootMigrationConfig()}:{}),...((recipe?recipe.oci:($('input[name="target"]:checked')?.value==='oci'&&$('#oci-enabled').checked?getOciConfig():null))?{oci:recipe?recipe.oci:getOciConfig()}:{} )};
+  return {target:recipe?recipe.target:($('input[name="target"]:checked')?.value||'oci'),platform_migration:selected,mount_policy:recipe?recipe.mount_policy:getMountPolicy(),allow_network:recipe?recipe.allow_network:requiredDownloadsEnabled(),...((recipe?recipe.boot_migration:getBootMigrationConfig())?{boot_migration:recipe?recipe.boot_migration:getBootMigrationConfig()}:{}),...((recipe?recipe.oci:($('input[name="target"]:checked')?.value==='oci'&&$('#oci-enabled').checked?getOciConfig():null))?{oci:recipe?recipe.oci:getOciConfig()}:{} )};
 }
 function renderPlatformPlan(plan) {
   const container=$('#platform-plan'),signature=JSON.stringify(plan);
@@ -406,7 +399,6 @@ document.addEventListener('focusout',event=>{const anchor=event.target.closest('
 document.addEventListener('keydown',event=>{if(event.key==='Escape'){const anchor=$('.help-anchor.open');if(anchor)studioState.dismissedHelp.add(anchor);closeHelp();}});
 document.addEventListener('input',event=>{
   const input=event.target;
-  if(input.dataset.partitionSlider){const field=$$('[data-partition]').find(node=>node.dataset.partition===input.dataset.partitionSlider);if(field)field.value=input.value;}
   if(input.dataset.rebuildSlider){const field=storageSizeInputs().find(node=>node.dataset.rebuildDevice===input.dataset.rebuildSlider);if(field)field.value=input.value;syncFilesystemInput(input.dataset.rebuildSlider);}
   if(input.dataset.fsSizeInput)syncFilesystemInput(input.dataset.fsSizeInput,true);
   if(input.dataset.rebuildDevice)syncFilesystemInput(input.dataset.rebuildDevice);
@@ -429,9 +421,6 @@ document.addEventListener('change',event=>{
   if(['platform-boot','platform-network'].includes(input.id)){syncOciPlatformChoices();updatePlatformStudio();invalidateStudioPlans('platform');}
   if(['oci-enabled','oci-prepare'].includes(input.id)){updatePlatformPreserveConflict();invalidateStudioPlans('platform');}
   if(input.closest('#panel-storage'))updateStorageStudio();
-  if(['allow-network','oci-allow-network','migration-allow-network','platform-allow-network'].includes(input.id)) {
-    ['allow-network','oci-allow-network','migration-allow-network','platform-allow-network'].forEach(id=>{if($(`#${id}`))$(`#${id}`).checked=input.checked;});invalidateStudioPlans('platform');
-  }
 });
 
 window.addEventListener('scroll',()=>{const anchor=document.querySelector('.help-anchor.open');if(!anchor)return;const rect=anchor.querySelector('.help-toggle').getBoundingClientRect();if(rect.bottom<0||rect.top>innerHeight)closeHelp();else positionHelp(anchor);},{passive:true});

@@ -648,3 +648,62 @@ def test_real_vm_plan_and_profile_survive_worker_and_manifest(client):
     manifest = client.get(f"/api/artifacts/{job['result']['artifact_id']}/manifest").json()
     for key, value in profile.items():
         assert manifest["recipe"]["platform_migration"][key] == value
+
+
+def test_automatic_storage_plan_and_build_preserve_explicit_intent(client,tmp_path):
+    from test_growth import image,options
+    image_id=imported(client);client.app.state.store.update('image',image_id,inspection=image())
+    recipe={'storage_resize':options(size=16384),'mount_policy':'labels'}
+    preview=client.post(f'/api/images/{image_id}/storage/plan',json=recipe)
+    assert preview.status_code==200 and preview.json()['ready'],preview.text
+    assert preview.json()['mode']=='growth' and preview.json()['layout']['disk_size_after']>12*1024**3
+    assert len(client.get('/api/jobs').json())==1
+    response=client.post(f'/api/images/{image_id}/build',json=recipe)
+    assert response.status_code==202,response.text
+    job=finished(client,response.json()['job_id']);assert job['status']=='succeeded'
+    manifest=client.get(f"/api/artifacts/{job['result']['artifact_id']}/manifest").json()
+    assert manifest['recipe']['storage_resize']==recipe['storage_resize']
+    assert manifest['recipe']['mount_policy']=='labels' and manifest['recipe']['storage_rebuild'] is None
+    assert (tmp_path/'images'/image_id/'source').read_bytes()==b'test-source'
+
+
+@pytest.mark.parametrize('recipe',[
+ {'storage_resize':{'enabled':True,'sizes':[{'device':'/dev/sda2','size_mib':1024}]}},
+ {'storage_resize':{'enabled':True},'expand_partition':'/dev/sda3'},
+ {'storage_resize':{'enabled':True},'storage_rebuild':{'enabled':True}},
+ {'storage_resize':{'enabled':True,'sizes':[{'device':'/dev/ocivolume/missing','size_mib':8192}]}},
+])
+def test_ambiguous_or_conflicting_automatic_storage_never_queues_build(client,recipe):
+    from test_growth import image
+    image_id=imported(client);client.app.state.store.update('image',image_id,inspection=image())
+    assert client.post(f'/api/images/{image_id}/build',json=recipe).status_code==422
+    assert len(client.get('/api/jobs').json())==1
+
+
+def test_auto_grown_disk_limit_enforced_before_queue_even_without_explicit_disk(client):
+    from test_growth import image,options
+    image_id=imported(client);client.app.state.store.update('image',image_id,inspection=image())
+    # The LV alone fits 2048 GiB, but its boot partitions and PV metadata do not.
+    recipe={'storage_resize':options(size=2097152)}
+    preview=client.post(f'/api/images/{image_id}/storage/plan',json=recipe)
+    assert preview.status_code==200 and not preview.json()['ready']
+    assert 'FORGE_MAX_VIRTUAL_GIB' in ' '.join(preview.json()['blockers'])
+    assert client.post(f'/api/images/{image_id}/build',json=recipe).status_code==422
+    assert len(client.get('/api/jobs').json())==1
+
+
+def test_automatic_storage_capacity_is_counted_before_uefi_growth_admission(client,monkeypatch):
+    from forge.storage import plan_storage,GIB
+    from test_growth import image,options
+    original=image();selected=options(size=16384)
+    planned=plan_storage(original,selected)['layout']['disk_size_after']
+    image_id=imported(client);client.app.state.store.update('image',image_id,inspection=original)
+    limit=client.app.state.settings.max_virtual_gib*GIB
+    # Original capacity plus migration fits; inferred filesystem capacity plus
+    # migration does not. Admission must use the automatic storage plan.
+    monkeypatch.setattr('forge.uefi.plan_migration',lambda *a,**k:{
+        'ready_to_migrate':True,'blockers':[],'growth_bytes':limit-planned+1})
+    response=client.post(f'/api/images/{image_id}/build',json={
+        'storage_resize':selected,'boot_migration':{'enabled':True}})
+    assert response.status_code==422 and 'FORGE_MAX_VIRTUAL_GIB' in response.text
+    assert len(client.get('/api/jobs').json())==1

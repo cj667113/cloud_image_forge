@@ -14,22 +14,22 @@ Moving a disk between a VM and bare metal does not itself change its filesystem 
 
 Reconciliation runs before storage rebuild and after explicit edits, with fresh identity and `fstab` verification before export. A repaired critical reference also requires verified boot and initramfs references; correcting `fstab` alone does not establish a bootable image. True changes to a boot filesystem UUID require a separately verified boot update and are blocked by this workflow. The artifact records the actual mount changes and identity map. Select **Mount references → Keep current** to keep the original `fstab`; unresolved references are then retained and reported without claiming they were repaired. Hardware preparation additionally requires proven stable selectors; raw appliance names such as `/dev/sda2` do not prove portability to another boot transport.
 
-## Smaller disks and filesystems
+## Disk and filesystem sizing
 
 The Storage step separates **virtual disk capacity**, **filesystem capacity**, **used data**, and the imported **file length**. A smaller virtual disk does not predict the size of compressed QCOW2 output or the boot volume a cloud provider will provision. Filesystem reduction does not reduce the outer disk unless a smaller target disk is also selected.
 
-The **Disk & filesystems** card combines the current/planned disk comparison, capacity choice and filesystem rows. **Keep current** preserves the source disk capacity. **Custom size** reveals the capacity field and remembers the last custom entry for that image. Turn on **Resize filesystems** to adjust editable filesystems using their slider or numeric field. Numeric fields accept GiB or MiB; GiB values round upward to whole MiB, and ordinary LVM sizes round upward to 4 MiB extents. Fixed EFI partitions retain their original capacity. The bars show used space, planned capacity, and hatched space removed from the original allocation.
+The **Disk & filesystems** card combines the current/planned disk comparison, capacity choice and filesystem rows. **Automatic** keeps the current disk capacity unless filesystem targets require more space. **Custom size** reveals the capacity field and remembers the last custom entry for that image. Turn on **Resize filesystems** to adjust editable filesystems using their slider or numeric field. Numeric fields accept GiB or MiB; GiB values round upward to whole MiB, and ordinary LVM sizes round upward to 4 MiB extents. Fixed EFI partitions retain their original capacity. With resizing off, a larger custom disk fills the independently verified root filesystem when its containing partition is last and unambiguous. With resizing on, the explicit filesystem capacities are retained; additional disk space is not silently assigned to a volume. The bars show used space, planned capacity, and hatched space removed from the original allocation.
 
 Choose **Fit to filesystems** beside the capacity controls to calculate the minimum outer disk for the selected filesystem sizes, including layout metadata, rounded upward to two decimal places in your selected unit. This uses the server's planner and checks the resulting target again. It does not choose smaller filesystem sizes for you; refit after changing those sizes. **Check sizes** and **Next** validate the current plan; estimates do not guarantee that every archive will fit.
 
-Target disk capacity accepts binary GiB or decimal GB. Arbitrary target capacities round upward to a 512-byte boundary; **Layout & advanced resizing** shows the actual byte count and partition maps. For example, 10 GB is exactly 10,000,000,000 bytes, or 9.313225746154785 GiB.
+Target disk capacity accepts binary GiB or decimal GB. Arbitrary target capacities round upward to a 512-byte boundary; **Disk layout** shows the actual byte count and partition maps. For example, 10 GB is exactly 10,000,000,000 bytes, or 9.313225746154785 GiB.
 
-**Layout & advanced resizing → Advanced resizing** retains the direct growth and offline ext2/3/4 shrink path. **Resize filesystems** uses filesystem rebuild to shrink XFS or an ordinary LVM filesystem. Its preview is available through `POST /api/images/{image_id}/storage/plan`:
+The server chooses between growth and verified filesystem rebuild from the requested sizes. Increasing an ext2/3/4 or XFS filesystem automatically grows its containing partition, PV and LV when required; no separate expansion device needs to be selected. Reducing a filesystem or the disk uses the existing rebuild workflow and its stricter eligibility checks below. The read-only preview is available through `POST /api/images/{image_id}/storage/plan`:
 
 ```json
 {
   "disk_size_gib": 9.313225746154785,
-  "storage_rebuild": {
+  "storage_resize": {
     "enabled": true,
     "sizes": [
       {"device": "/dev/sda2", "size_mib": 512},
@@ -40,7 +40,13 @@ Target disk capacity accepts binary GiB or decimal GB. Arbitrary target capaciti
 }
 ```
 
-The same fields are included in a build recipe. Devices and minimums must come from that image's inspection; this example is not a universal layout. Unspecified filesystems keep their current capacities. The PV occupies the planned remaining space, and LVs use ordinary 4 MiB extents. Rebuild cannot be combined with direct partition changes or automatic partition/LV expansion in the same recipe.
+The same fields are included in a build recipe. Devices and minimums must come from that image's inspection; this example is not a universal layout. `storage_resize` cannot be combined with legacy `storage_rebuild`, `partition_changes`, `expand_partition`, or `expand_lv` actions. Those older API fields remain supported for existing clients. The plan reports `mode` (`growth`, `rebuild`, or `unchanged`), inferred container changes, selected filesystem capacities and any blockers.
+
+Growth supports a validated GPT or simple primary MBR disk with 512-byte sectors, direct ext/XFS filesystems, and optionally one ordinary single-PV VG with single-segment writable LVs and 4 MiB extents. It retains partition starts, disk and partition identities, filesystem UUIDs/labels and PV/VG/LV identities. An existing PV may use either its standard LVM type or a proved Linux-data GPT partition. Unknown data, complex LVM mappings, missing capacity evidence and changes that would overlap a following partition are blocked. Existing VG free space is used before the PV needs expansion. Explicit LV sizes are applied individually and are not expanded to consume all VG free space.
+
+The engine applies [partition-end growth](https://libguestfs.org/guestfs.3.html#guestfs_part_resize), then [PV growth](https://libguestfs.org/guestfs.3.html#guestfs_pvresize), exact [LV capacities](https://libguestfs.org/guestfs.3.html#guestfs_lvresize) and the filesystem's own grow operation on an independent copy. Final verification checks both block-device capacity and actual filesystem data capacity, plus retained partition, filesystem and LVM identities. Growth can retain an existing BIOS layout without relocating its boot code; a boot test is still required. Rebuild has the narrower UEFI-only scope below.
+
+For a rebuild, unspecified filesystems keep their current capacities, the PV occupies the planned remaining space, and LVs use ordinary 4 MiB extents.
 
 The engine exports each supported filesystem separately with numeric ownership, ACLs, extended attributes and SELinux labels. It copies the EFI system partition byte for byte, creates a new GPT disk and fresh filesystems, restores data and filesystem identities, and compares archive manifests covering content hashes, hardlinks, symlinks, ownership, modes, modification times and archived metadata. Source and destination are attached to separate appliances to avoid duplicate UUID/VG ambiguity. The final export is reinspected and checked against the planned disk layout and filesystem identities, including after format alignment. QCOW2 conversion additionally uses `qemu-img check` and guest-visible byte comparison.
 
@@ -66,7 +72,7 @@ Minimum sizes include measured use and conservative headroom, but sparse files c
 
 Enabling hardware preparation starts with **Prepare for destination**. **Automatic** follows the selected provider: OCI receives general OCI VM defaults, including guest preparation and actual OS metadata, while generic exports retain a generic VM profile. No specific shape is invented. Select a documented shape profile for its exact attachments and advertised compatibility. **Preserve & validate** remains available for an already-prepared image. Existing API recipes that omit `strategy` retain `reconfigure` behavior. Source hardware may be **Not specified**; Forge prepares the chosen destination without inventing source history. Both strategies support a VM-to-VM move. Passing a VM check does not also certify bare-metal compatibility.
 
-When the inspected destination needs missing tools, **Allow required downloads** grants the existing guest-network and package-installation permissions together. The requirement preview performs no downloads and does not grant consent itself. Images already containing their prerequisites show no additional download control.
+When **Prepare for destination** needs missing tools, the UI enables the required package installation and guest network access automatically. The destination preview remains read-only; downloads occur only during the requested build. Already complete images and **Preserve & validate** do not enable unnecessary downloads. API clients retain explicit `allow_network` and package-installation flags, which default to false.
 
 `GET /api/destinations/catalog` lists documented profiles. `POST /api/images/{image_id}/destination/resolve` accepts a `profile_id`, with optional source, strategy and physical NIC choices, and returns recipe defaults, required packages and warnings. Resolution is read-only; the normal platform and OCI plans still check readiness before a build is queued.
 

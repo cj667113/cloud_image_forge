@@ -237,15 +237,19 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
 
     @app.post("/api/images/{image_id}/storage/plan")
     def plan_storage(image_id: str, body: StoragePlanRequest):
-        from .storage import plan_rebuild
+        from .storage import plan_rebuild, plan_storage as automatic_plan
         with app.state.jobs.inspection_lock:
             image = get_record("image", image_id)
             if image["status"] != "ready" or image.get("inspection_status") in {"queued", "running"}:
                 raise HTTPException(409, "Wait for successful inspection before planning storage changes")
             if body.disk_size_gib and body.disk_size_gib > settings.max_virtual_gib:
                 raise HTTPException(422, "Requested virtual size exceeds FORGE_MAX_VIRTUAL_GIB")
-            return plan_rebuild(image["inspection"], body.storage_rebuild.model_dump(), body.disk_size_gib,
-                                mount_policy=body.mount_policy)
+            planner, options = (automatic_plan, body.storage_resize) if body.storage_resize is not None else (plan_rebuild, body.storage_rebuild)
+            result = planner(image["inspection"], options.model_dump(), body.disk_size_gib, mount_policy=body.mount_policy)
+            if result.get("layout", {}).get("disk_size_after", 0) > settings.max_virtual_gib * 1024**3:
+                result["ready"] = False
+                result["blockers"].append("Automatic disk growth exceeds FORGE_MAX_VIRTUAL_GIB")
+            return result
 
     @app.post("/api/images/{image_id}/mounts/plan")
     def plan_mount_references(image_id: str, body: MountPlanRequest):
@@ -335,12 +339,15 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
             if execution_error:
                 raise HTTPException(422, execution_error)
             migration = recipe.boot_migration.model_dump() if recipe.boot_migration else None
-            if recipe.storage_rebuild and recipe.storage_rebuild.enabled:
-                from .storage import plan_rebuild
-                storage_plan = plan_rebuild(image["inspection"], recipe.storage_rebuild.model_dump(), recipe.disk_size_gib,
-                                            mount_policy=recipe.mount_policy)
+            storage_plan = None
+            if ((recipe.storage_rebuild and recipe.storage_rebuild.enabled)
+                    or (recipe.storage_resize and recipe.storage_resize.enabled)):
+                from .storage import plan_recipe_storage
+                storage_plan = plan_recipe_storage(image["inspection"], recipe.model_dump())
                 if not storage_plan["ready"]:
-                    raise HTTPException(422, "Storage rebuild: " + " ".join(storage_plan["blockers"]))
+                    raise HTTPException(422, "Storage sizing: " + " ".join(storage_plan["blockers"]))
+                if storage_plan["layout"]["disk_size_after"] > settings.max_virtual_gib * 1024**3:
+                    raise HTTPException(422, "Automatic disk growth exceeds FORGE_MAX_VIRTUAL_GIB")
             if recipe.platform_migration and recipe.platform_migration.enabled:
                 from .platform import plan_platform
                 platform_plan = plan_platform(image["inspection"], recipe.platform_migration.model_dump(), recipe.allow_network,
@@ -354,6 +361,8 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
                 if not migration_plan["ready_to_migrate"]:
                     raise HTTPException(422, "UEFI migration: " + (" ".join(migration_plan["blockers"]) or "The image is not eligible for migration"))
                 capacity = recipe.disk_size_gib * 1024**3 if recipe.disk_size_gib else image["inspection"]["virtual_size"]
+                if storage_plan:
+                    capacity = storage_plan["layout"]["disk_size_after"]
                 if capacity + migration_plan.get("growth_bytes", 0) > settings.max_virtual_gib * 1024**3:
                     raise HTTPException(422, "UEFI migration would exceed FORGE_MAX_VIRTUAL_GIB")
             if recipe.oci:

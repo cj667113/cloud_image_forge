@@ -44,9 +44,9 @@ function renderExports() {
   for(const [id,entry]of exportsView.rows)if(!ids.has(id)){entry.element.remove();exportsView.rows.delete(id);exportsView.open.delete(id);exportsView.warnings.delete(id);}
   if(focus?.key&&document.activeElement!==active){const row=exportEntry(focus.id);if(row)$$('[data-export-focus]',row).find(node=>node.dataset.exportFocus===focus.key)?.focus({preventScroll:true});}
 }
-function openExportArtifact(id) {
+function openExportArtifact(id, {details=true} = {}) {
   setView('artifacts');renderExports();const row=exportEntry(id);if(!row)return false;
-  updateExportDisclosure(id,true);$('.export-name',row).focus({preventScroll:true});row.scrollIntoView({block:'start',behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'instant':'smooth'});return true;
+  updateExportDisclosure(id,details);$('.export-name',row).focus({preventScroll:true});row.scrollIntoView({block:'start',behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'instant':'smooth'});return true;
 }
 document.addEventListener('click',event=>{
   const button=event.target.closest('button');if(!button||button.disabled)return;

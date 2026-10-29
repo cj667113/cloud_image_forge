@@ -348,6 +348,15 @@ def _validate_recipe(recipe: dict, inspection: dict) -> None:
     size = recipe.get("disk_size_gib")
     if size is not None and (not math.isfinite(size) or not 0 < size <= int(os.getenv("FORGE_MAX_VIRTUAL_GIB", "2048"))):
         raise EngineError("Requested virtual disk size is outside the allowed range.")
+    if (recipe.get("storage_resize") or {}).get("enabled"):
+        from .storage import plan_storage
+        if recipe.get("partition_changes") or recipe.get("expand_partition") or recipe.get("expand_lv") or (recipe.get("storage_rebuild") or {}).get("enabled"):
+            raise EngineError("Automatic storage sizing cannot be combined with legacy resize or rebuild actions.")
+        automatic = plan_storage(inspection, recipe["storage_resize"], size, mount_policy=recipe.get("mount_policy", "auto"))
+        if not automatic["ready"]:
+            raise EngineError("Automatic storage sizing blocked: " + " ".join(automatic["blockers"]))
+        if automatic["layout"]["disk_size_after"] > int(os.getenv("FORGE_MAX_VIRTUAL_GIB", "2048")) * GIB:
+            raise EngineError("Automatic disk growth exceeds FORGE_MAX_VIRTUAL_GIB.")
     if (recipe.get("storage_rebuild") or {}).get("enabled"):
         from .storage import plan_rebuild
         if recipe.get("partition_changes") or recipe.get("expand_partition") or recipe.get("expand_lv"):
@@ -497,6 +506,21 @@ class ImageEngine:
                 "warnings": ["Bootability and cloud-agent compatibility require a test launch after export."]}
 
     def _resize(self, work: Path, destination: Path, inspection: dict, recipe: dict, log) -> Path:
+        if (recipe.get("storage_resize") or {}).get("enabled"):
+            from .storage import plan_storage
+            plan = plan_storage(inspection, recipe["storage_resize"], recipe.get("disk_size_gib"), mount_policy=recipe.get("mount_policy", "auto"))
+            if not plan["ready"]:
+                raise EngineError("Automatic storage sizing blocked: " + " ".join(plan["blockers"]))
+            if plan["mode"] == "rebuild":
+                return self._resize(work, destination, inspection,
+                                    {**recipe, "storage_resize": None, "storage_rebuild": recipe["storage_resize"],
+                                     "disk_size_gib": plan["layout"]["disk_size_after"] / GIB}, log)
+            from .growth import grow
+            grown = grow(work, destination / f"grown-{uuid4().hex}.qcow2", inspection,
+                         recipe["storage_resize"], recipe.get("disk_size_gib"), log)
+            if grown != work:
+                work.unlink()
+            return grown
         if (recipe.get("storage_rebuild") or {}).get("enabled"):
             from .storage import rebuild
             rebuilt = rebuild(work, destination / f"rebuilt-{uuid4().hex}.qcow2", inspection, recipe, log)
@@ -620,9 +644,8 @@ class ImageEngine:
                                       boot_migration=migration_options, mount_policy=mount_policy)
         if platform_plan["requested"] and not platform_plan["ready"]:
             raise EngineError("Hardware compatibility blocked: " + " ".join(platform_plan["blockers"]))
-        from .storage import plan_rebuild
-        storage_plan = plan_rebuild(inspection, recipe.get("storage_rebuild"), recipe.get("disk_size_gib"),
-                                    mount_policy=mount_policy)
+        from .storage import plan_recipe_storage
+        storage_plan = plan_recipe_storage(inspection, recipe)
         oci_config = None
         if recipe.get("oci") is not None:
             from .oci import OciConfig, compatibility_plan
@@ -757,8 +780,8 @@ class ImageEngine:
                                   + ", ".join(missing) + "; export was stopped.")
         storage_result = None
         if storage_plan["requested"]:
-            from .storage import verify_rebuild
-            storage_result = verify_rebuild(result_inspection, storage_plan, expected_disk_size=virtual_size)
+            from .storage import verify_storage
+            storage_result = verify_storage(result_inspection, storage_plan, expected_disk_size=virtual_size)
             if not storage_result["ready"]:
                 raise EngineError("Final storage rebuild verification failed: " + " ".join(storage_result["blockers"]))
             storage_result["plan"] = storage_plan
@@ -815,6 +838,7 @@ class ImageEngine:
                 "architecture": normalize_arch(result_inspection["os"]["arch"]),
                 "virtual_size": virtual_size, "sha256": digest.hexdigest(), "warnings": warnings,
                 "boot": result_inspection.get("boot"),
-                "storage_rebuild": storage_result,
+                "storage_rebuild": storage_result if not (recipe.get("storage_resize") or {}).get("enabled") else None,
+                "storage_resize": storage_result if (recipe.get("storage_resize") or {}).get("enabled") else None,
                 "platform_migration": platform_result, "ssh_access": ssh_result,
                 "mount_reconciliation": mount_result}

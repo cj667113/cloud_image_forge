@@ -35,26 +35,30 @@
 #storage-studio .filesystem-row{grid-template-columns:minmax(0,1fr) minmax(220px,1.1fr);gap:9px 25px;padding:13px 21px;border-bottom:1px solid #eee9e2}
 #storage-studio .filesystem-heading strong{font-size:12px}
 #storage-studio .filesystem-heading .help-toggle{height:24px;width:24px;min-width:24px;font-size:10px}
-#storage-studio .filesystem-kind{font-size:10px}
+#storage-studio .filesystem-kind{font-size:11px}
 #storage-studio .filesystem-size-choice{gap:12px}
-#storage-studio .filesystem-original small{font-size:9px}
+#storage-studio .filesystem-original small{font-size:10px}
 #storage-studio .filesystem-original strong{font-size:12px}
+#storage-studio .filesystem-auto-target{display:grid;gap:5px;padding-left:12px;border-left:1px solid var(--line);text-align:right;white-space:nowrap}
+#storage-studio .filesystem-auto-target small{font-size:10px;font-weight:400;color:var(--muted)}
+#storage-studio .filesystem-auto-target strong{font-size:12px;font-weight:600;color:var(--teal-dark);font-variant-numeric:tabular-nums}
+#storage-studio .filesystem-target .size-field{display:grid;grid-template-columns:minmax(0,1fr) 60px}
+#storage-studio .size-field input,#storage-studio .size-field select{width:100%;min-width:0}
 #storage-studio .filesystem-visual{grid-column:1/-1}
 #storage-studio.resizing .filesystem-visual{grid-column:1;align-self:center}
 #storage-studio .fs-track{height:6px}
-#storage-studio .filesystem-usage{font-size:10px;margin-top:5px}
+#storage-studio .filesystem-usage{font-size:11px;margin-top:5px}
 #storage-studio .filesystem-resize{grid-column:2;grid-row:2;gap:10px;align-self:center}
-#storage-studio .filesystem-minimum{font-size:10px}
+#storage-studio .filesystem-minimum{font-size:11px}
 #storage-studio .filesystem-minimum .help-toggle{height:22px;width:22px;min-width:22px;font-size:10px}
 #storage-studio .filesystem-alert{grid-column:1/-1}
 #storage-studio .filesystem-total-change{padding:0 21px 11px;margin:8px 0 0}
 #storage-studio .storage-evidence-notice{margin:16px 21px 0}
 #storage-studio #storage-plan-controls{padding:15px 21px 19px;border-top:1px solid var(--line);background:#fcfaf7}
-#storage-studio .plan-action-row{margin:0;gap:6px}
+#storage-studio .plan-action-row{display:flex;flex-direction:row;align-items:center;justify-content:flex-start;margin:0;gap:6px}
+#storage-studio #storage-plan-button{width:auto;min-height:40px}
 #storage-studio .studio-plan:empty{display:none}
 #storage-studio .storage-layout-details{margin-top:14px}
-#storage-direct-options{margin-top:16px}
-#storage-studio #storage-direct-options .table-wrap{margin-top:14px}
 @media(max-width:900px){
   #storage-studio .storage-summary{grid-template-columns:minmax(0,1fr) auto minmax(0,1fr)}
   #storage-studio .storage-summary>.storage-saving{grid-column:1/-1;margin-top:9px}
@@ -79,6 +83,8 @@
   #storage-studio .storage-filesystems-heading{padding:14px 15px 7px;flex-wrap:wrap;gap:4px}
   #storage-studio .filesystem-row{grid-template-columns:minmax(0,1fr) auto;padding:12px 15px;gap:9px}
   #storage-studio.resizing .filesystem-size-choice{grid-column:1/-1;justify-content:space-between}
+  #storage-studio .filesystem-row:has(.filesystem-auto-target:not([hidden])) .filesystem-size-choice{grid-column:1/-1;justify-content:flex-start;gap:18px}
+  #storage-studio .filesystem-auto-target{text-align:left}
   #storage-studio.resizing .filesystem-visual{grid-column:1/-1}
   #storage-studio .filesystem-resize{grid-column:1/-1;grid-row:auto}
   #storage-studio .filesystem-target .size-field{width:139px}
@@ -87,4 +93,13 @@
   #storage-studio #storage-plan-controls{padding:14px 15px}
   #storage-studio .storage-evidence-notice{margin:13px 15px 0}
   #storage-studio .plan-action-row{align-items:center;flex-wrap:nowrap}
+}
+@media(max-width:360px){
+  #storage-studio.resizing .filesystem-size-choice:has(.filesystem-target){display:grid;grid-template-columns:minmax(0,1fr);gap:8px}
+  #storage-studio.resizing .filesystem-size-choice:has(.filesystem-target) .filesystem-original{display:flex;align-items:baseline;gap:8px}
+  #storage-studio.resizing .filesystem-arrow{display:none}
+  #storage-studio .filesystem-target,#storage-studio .filesystem-target .size-field{width:100%}
+}
+@media(pointer:coarse){
+  #storage-studio #storage-plan-button,#storage-studio #storage-fit-button,#storage-studio .size-field input,#storage-studio .size-field select{min-height:44px}
 }

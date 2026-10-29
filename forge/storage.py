@@ -751,7 +751,7 @@ def _inspect_initrd_lvm(g, identifiers, errors, warnings):
 def inspect_storage(g, root, partitions: list[dict], layout: dict) -> dict:
     """Optional read-only evidence collector; call with the OS already mounted."""
     result = {"version": 1, "layout": deepcopy(layout), "filesystems": [],
-              "lvm": {"pvs": [], "vgs": [], "lvs": []}, "errors": [], "warnings": [],
+              "lvm": {"pvs": [], "vgs": [], "lvs": []}, "errors": [], "growth_errors": None, "warnings": [],
               "lvm_identity_pins": {"version": 1, "paths": [], "config_scan_complete": False, "fstab_sha256": None}}
     errors = result["errors"]
     try:
@@ -781,16 +781,19 @@ def inspect_storage(g, root, partitions: list[dict], layout: dict) -> dict:
                     errors.append(f"Filesystem {device} is not mounted by inspection; all data filesystems must be accounted for")
                 if fs == "xfs":
                     info = g.xfs_info(part.get("mountpoint") or device)
+                    item["filesystem_capacity"] = int(info.get("xfs_blocksize", 0)) * int(info.get("xfs_datablocks", 0)) or None
                     if info.get("xfs_logname") != "internal" or info.get("xfs_rtblocks", 0) != 0:
                         errors.append(f"{device} uses an external XFS log or realtime device")
                 else:
                     info = g.tune2fs_l(device)
+                    item["filesystem_capacity"] = int(info.get("Block size", 0)) * int(info.get("Block count", 0)) or None
                     if info.get("Journal device"):
                         errors.append(f"{device} uses an external ext journal")
                     features = set(info.get("Filesystem features", "").split())
                     if features & {"encrypt", "casefold", "verity", "quota", "project"}:
                         errors.append(f"{device} uses filesystem encryption, quota, verity, project IDs, or casefolding")
             result["filesystems"].append(item)
+        result["growth_errors"] = list(errors)
         if _configured_quotas(g):
             errors.append("Configured filesystem quotas are not supported by file-level rebuild")
         if _active(_read(g, "/etc/projects")).strip() or _active(_read(g, "/etc/projid")).strip():
@@ -858,6 +861,44 @@ def _lvm_errors(lvm, partitions, filesystems):
                 or lv.get("seg_count", 0) < 1 or any(lv.get(key) for key in ("origin", "move_pv", "mirror_log", "modules", "lv_tags"))):
             errors.append(f"LV {lv.get('lv_name', '?')} is not an ordinary writable linear volume")
     return errors
+
+
+def plan_storage(inspection, options, disk_size_gib=None, *, mount_policy="auto"):
+    """Choose fixed-start growth or the existing verified shrink/rebuild path."""
+    if not options or not options.get("enabled"):
+        return {"requested": False, "ready": False, "mode": "unchanged", "blockers": [], "warnings": [],
+                "changes": [], "layout": {}, "filesystems": [], "estimated_temporary_bytes": 0}
+    known = {fs["device"]: fs for fs in inspection.get("storage", {}).get("filesystems", [])}
+    shrink = disk_size_gib is not None and disk_size_gib * GIB < inspection.get("virtual_size", 0)
+    shrink = shrink or any(isinstance(item.get("size_mib"), int) and item.get("device") in known
+                           and item["size_mib"] * MIB < known[item["device"]].get("size", 0)
+                           for item in options.get("sizes", []))
+    if shrink:
+        result = plan_rebuild(inspection, options, disk_size_gib, mount_policy=mount_policy)
+        minimum = result.get("layout", {}).get("minimum_disk_size", 0)
+        if disk_size_gib is None and minimum > inspection.get("virtual_size", 0):
+            result = plan_rebuild(inspection, options, minimum / GIB, mount_policy=mount_policy)
+        result.update(mode="rebuild", root_fill=False)
+        return result
+    from .growth import plan_growth
+    return plan_growth(inspection, options, disk_size_gib)
+
+
+def plan_recipe_storage(inspection, recipe):
+    if (recipe.get("storage_resize") or {}).get("enabled"):
+        return plan_storage(inspection, recipe["storage_resize"], recipe.get("disk_size_gib"),
+                            mount_policy=recipe.get("mount_policy", "auto"))
+    result = plan_rebuild(inspection, recipe.get("storage_rebuild"), recipe.get("disk_size_gib"),
+                          mount_policy=recipe.get("mount_policy", "auto"))
+    result["mode"] = "rebuild"
+    return result
+
+
+def verify_storage(inspection, plan, *, expected_disk_size=None):
+    if plan.get("mode") in {"growth", "unchanged"}:
+        from .growth import verify_growth
+        return verify_growth(inspection, plan, expected_disk_size=expected_disk_size)
+    return verify_rebuild(inspection, plan, expected_disk_size=expected_disk_size)
 
 
 def plan_rebuild(inspection: dict, options: dict | None, disk_size_gib=None, *, mount_policy="auto") -> dict:

@@ -620,3 +620,23 @@ class BuildTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_automatic_resize_engine_uses_growth_and_keeps_old_copy_until_success(tmp_path):
+    from test_growth import image,options
+    from forge.engine import ImageEngine
+    work=tmp_path/'working.qcow2';work.write_bytes(b'old-copy')
+    def grow(source,dest,inspection,config,disk,log):
+        assert source.read_bytes()==b'old-copy' and config==options()
+        dest.write_bytes(b'grown');return dest
+    with patch('forge.growth.grow',grow):
+        result=ImageEngine()._resize(work,tmp_path,image(),{'storage_resize':options()},lambda _:None)
+    assert not work.exists() and result.read_bytes()==b'grown'
+
+
+def test_automatic_resize_rejected_before_guest_or_qemu_execution():
+    from test_growth import image,options
+    with patch('forge.engine._run') as run,patch('forge.engine._guest') as guest:
+        with __import__('pytest').raises(EngineError,match='overlap'):
+            _validate_recipe({'storage_resize':options('/dev/sda2',1024)},image())
+    run.assert_not_called();guest.assert_not_called()
