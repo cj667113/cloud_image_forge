@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 import io
 import hashlib
+import gzip
 from pathlib import Path
 import shutil
 import tarfile
@@ -505,10 +506,13 @@ class ExecutorTests(unittest.TestCase):
             g.download_offset.side_effect = lambda dev, output, offset, size: Path(output).write_bytes(b"E" * size)
             def tar_out(directory, output, **options):
                 self.assertTrue(all(options[key] for key in ("numericowner", "xattrs", "selinux", "acls")))
+                self.assertNotIn("compress", options)
+                selected = source_archive
                 if corrupt and Path(path) == destination and readonly:
-                    make_archive(Path(output), contents=b"bad restore")
-                else:
-                    shutil.copyfile(source_archive, output)
+                    selected = root / "corrupt.tar.gz"
+                    make_archive(selected, contents=b"bad restore")
+                with gzip.open(selected, "rb") as payload:
+                    Path(output).write_bytes(payload.read())
             g.tar_out.side_effect = tar_out
             if fail_restore:
                 g.tar_in.side_effect = RuntimeError("restore failed")
@@ -523,6 +527,7 @@ class ExecutorTests(unittest.TestCase):
         with patch("forge.engine.ImageEngine.inspect", return_value=image), patch("forge.engine._guest", side_effect=appliance), \
              patch("forge.engine._run", return_value=""), patch("forge.uefi.inspect_layout", return_value=actual_layout), \
              patch("forge.boot.detect_boot", return_value=image["boot"]) as detect_boot, \
+             patch("forge.storage._raw_gpt_names", return_value={part["number"]: part["name"] for part in plan["layout"]["partitions"]}), \
              patch("forge.engine._roots", return_value="/dev/ocivolume/root"), \
              patch("forge.engine._mount", return_value={item["mountpoint"]: item["device"] for item in image["storage"]["filesystems"]}), \
              patch("forge.storage.shutil.disk_usage", return_value=Mock(free=100 * GIB)):
@@ -541,17 +546,19 @@ class ExecutorTests(unittest.TestCase):
         self.assertTrue(all(readonly for path, readonly in accesses if path == source))
         self.assertEqual(list(root.glob("storage-rebuild-*")), [])
         if not fail_restore:
-            write_guest = guests[1]
-            self.assertEqual(write_guest.lvcreate.call_args.args, ("root", "ocivolume", 7680))
-            write_guest.pvcreate.assert_called_once_with("/dev/sda3")
+            layout_guest, write_guest = guests[0], guests[2]
+            self.assertEqual(accesses[0], (destination, False), "Layout is verified before archiving the source")
+            self.assertEqual(layout_guest.lvcreate.call_args.args, ("root", "ocivolume", 7680))
+            layout_guest.pvcreate.assert_called_once_with("/dev/sda3")
             if linux_data_pv:
-                self.assertIn(("/dev/sda", 3, LINUX_GUID), [call.args for call in write_guest.part_set_gpt_type.call_args_list])
+                self.assertIn(("/dev/sda", 3, LINUX_GUID), [call.args for call in layout_guest.part_set_gpt_type.call_args_list])
             self.assertNotIn("/dev/sda1", [call.args[1] for call in write_guest.mkfs.call_args_list])
             self.assertNotIn("/dev/sda2", [call.args[0] for call in write_guest.set_label.call_args_list],
                              "Fresh XFS with an empty source label must retain its default blank label")
             write_guest.set_label.assert_called_once_with("/dev/ocivolume/root", "ROOT")
             for call in write_guest.tar_in.call_args_list:
                 self.assertTrue(all(call.kwargs[key] for key in ("xattrs", "selinux", "acls")))
+                self.assertNotIn("compress", call.kwargs)
 
     def test_success_verifies_copy_keeps_source_and_never_formats_efi(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -593,7 +600,7 @@ class ExecutorTests(unittest.TestCase):
             actual = {"errors": [], "partition_table": "gpt", "disk_size": 10 * GIB,
                       "disk_identity": plan["layout"]["disk_identity"], "partitions": deepcopy(plan["layout"]["partitions"])}
             actual["partitions"][0][field] = "changed"
-            with patch("forge.uefi.inspect_layout", return_value=actual), self.assertRaises(StorageError):
+            with patch("forge.uefi.inspect_layout", return_value=actual), patch("forge.storage._raw_gpt_names", return_value={part["number"]: part["name"] for part in plan["layout"]["partitions"]}), self.assertRaises(StorageError):
                 _verify_layout(Mock(), plan)
 
 

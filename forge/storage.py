@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+import gzip
 import math
 import os
 from pathlib import Path, PurePosixPath
@@ -28,6 +29,7 @@ LINUX_GUID = "0fc63daf-8483-4772-8e79-3d69d8477de4"
 FILESYSTEMS = {"xfs", "ext2", "ext3", "ext4"}
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,126}\Z")
 ARCHIVE_OPTIONS = {"compress": "gzip", "xattrs": True, "selinux": True, "acls": True}
+ARCHIVE_METADATA = {key: value for key, value in ARCHIVE_OPTIONS.items() if key != "compress"}
 QUOTA_OPTIONS = {"quota", "qnoenforce", "uquota", "usrquota", "uqnoenforce", "gquota", "grpquota",
                  "gqnoenforce", "pquota", "prjquota", "pqnoenforce", "usrjquota", "grpjquota", "jqfmt"}
 LVM_PIN_ERROR = "Boot or mount configuration pins internal LVM UUIDs; this workflow preserves names and filesystem UUIDs only"
@@ -1193,7 +1195,7 @@ def plan_rebuild(inspection: dict, options: dict | None, disk_size_gib=None, *, 
                         "disk_identity": old["disk_identity"], "partitions": planned, "lvs": lvs,
                         "pv_device": next(iter(pv_devices)) if pv_devices else None}
     used = [item.get("used", 0) for item in filesystems if item.get("editable")]
-    result["estimated_temporary_bytes"] = sum(used) * 2 + max(used, default=0) + parts[0]["size"] + 512 * MIB
+    result["estimated_temporary_bytes"] = sum(used) * 2 + max(used, default=0) + max((item["size"] for item in filesystems if item.get("editable")), default=0) + parts[0]["size"] + 512 * MIB
     warnings.extend(["This preview is source-based; archive contents and capacity are checked again before creating the new disk.",
                      "Size minima and temporary space are estimates. Sparse/reflink files can expand during tar restore; insufficient capacity stops the build.",
                      "Filesystem layout and creation features change; quotas, project IDs, inode flags and BIOS boot-code relocation are unsupported. A UEFI boot test is still required."])
@@ -1400,6 +1402,89 @@ def _identity(g, filesystem):
         raise StorageError(f"Filesystem type, UUID or label changed unexpectedly on {device}")
 
 
+def _raw_gpt_names(g):
+    """Read logical UTF-16 names from both checksum-validated GPT copies."""
+    from .uefi import _gpt_header
+    size = g.blockdev_getsize64("/dev/sda")
+    primary, backup = _gpt_header(g, 1, size), _gpt_header(g, size // 512 - 1, size)
+    if primary["entries"] != backup["entries"] or primary["entry_size"] != backup["entry_size"]:
+        raise StorageError("GPT copies disagree while verifying partition names")
+    names = {}
+    for number in primary["used"]:
+        offset = (number - 1) * primary["entry_size"] + 56
+        raw = primary["entries"][offset:offset + 72]
+        end = next((index for index in range(0, 72, 2) if raw[index:index+2] == b"\0\0"), 72)
+        try:
+            names[number] = raw[:end].decode("utf-16-le")
+        except UnicodeDecodeError as exc:
+            raise StorageError("GPT partition name is not valid UTF-16") from exc
+    return names
+
+
+def _set_gpt_name(g, number, name):
+    g.part_set_name("/dev/sda", number, name)
+    if name == "" and g.part_get_name("/dev/sda", number) != "":
+        # Bookworm Parted parses its own quoting: an empty argv is a no-op,
+        # while the literal quoted-empty token clears the logical GPT name.
+        g.part_set_name("/dev/sda", number, "''")
+    if g.part_get_name("/dev/sda", number) != name or _raw_gpt_names(g).get(number) != name:
+        raise StorageError("The worker could not preserve the exact GPT partition name")
+
+
+def _archive_space(folder, size):
+    if shutil.disk_usage(folder).free < size + 512 * MIB:
+        raise StorageError("Not enough host workspace for one uncompressed filesystem archive and verification headroom")
+
+
+def _export_archive(g, archive, capacity):
+    """Transport raw tar from the appliance; gzip on the native worker CPU."""
+    archive = Path(archive)
+    _archive_space(archive.parent, capacity)
+    raw = None
+    created = False
+    try:
+        with tempfile.NamedTemporaryFile(prefix="raw-", suffix=".tar", dir=archive.parent, delete=False) as stream:
+            raw = Path(stream.name)
+        g.tar_out("/", str(raw), numericowner=True, **ARCHIVE_METADATA)
+        size = raw.stat().st_size
+        _archive_space(archive.parent, size)
+        with archive.open("xb") as output:
+            created = True
+            with raw.open("rb") as source, gzip.GzipFile(filename="", mode="wb", fileobj=output, compresslevel=6, mtime=0) as compressed:
+                shutil.copyfileobj(source, compressed, length=4 * MIB)
+        return size
+    except BaseException:
+        if created:
+            archive.unlink(missing_ok=True)
+        raise
+    finally:
+        if raw is not None:
+            raw.unlink(missing_ok=True)
+
+
+def _import_archive(g, archive, raw_size):
+    """Decompress one owned archive with an exact observed expansion bound."""
+    archive = Path(archive)
+    _archive_space(archive.parent, raw_size)
+    raw = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="raw-", suffix=".tar", dir=archive.parent, delete=False) as output:
+            raw = Path(output.name)
+            count = 0
+            with gzip.open(archive, "rb") as source:
+                while data := source.read(4 * MIB):
+                    count += len(data)
+                    if count > raw_size:
+                        raise StorageError("Filesystem archive exceeds its verified uncompressed size")
+                    output.write(data)
+            if count != raw_size:
+                raise StorageError("Filesystem archive uncompressed size changed")
+        g.tar_in(str(raw), "/", **ARCHIVE_METADATA)
+    finally:
+        if raw is not None:
+            raw.unlink(missing_ok=True)
+
+
 def _verify_layout(g, plan):
     from .uefi import inspect_layout
 
@@ -1411,10 +1496,12 @@ def _verify_layout(g, plan):
             or len(actual.get("partitions", [])) != len(expected["partitions"])):
         raise StorageError("Rebuilt disk geometry or GPT identity failed verification")
     fields = ("number", "device", "start", "end", "size", "type", "partition_guid", "attributes")
+    raw_names = _raw_gpt_names(g)
     for before, after in zip(expected["partitions"], actual["partitions"]):
         if any(before.get(field) != after.get(field) for field in fields):
             raise StorageError(f"Rebuilt partition layout differs from the plan: {before['device']}")
-        if g.part_get_name("/dev/sda", before["number"]) != before.get("name", ""):
+        if (g.part_get_name("/dev/sda", before["number"]) != before.get("name", "")
+                or raw_names.get(before["number"]) != before.get("name", "")):
             raise StorageError("Rebuilt GPT partition label changed")
     for lv in expected["lvs"]:
         if g.blockdev_getsize64(lv["device"]) != lv["size"]:
@@ -1458,39 +1545,15 @@ def rebuild(source_work: Path, destination: Path, inspection: dict, recipe: dict
     file_systems = plan["filesystems"]
     esp = next(item for item in file_systems if item["kind"] == "efi")
     regular = [item for item in file_systems if item["editable"]]
-    needed = sum(item.get("used", 0) for item in regular) + esp["size"] + 512 * MIB
+    needed = sum(item.get("used", 0) for item in regular) + esp["size"] + max((item["size"] for item in regular), default=0) + 512 * MIB
     if shutil.disk_usage(destination.parent).free < needed:
         raise StorageError("Not enough host workspace for the source archives and verification headroom")
     created = False
     try:
         with tempfile.TemporaryDirectory(prefix="storage-rebuild-", dir=destination.parent) as folder:
             staging = Path(folder)
-            archives, manifests = {}, {}
+            archives, manifests, raw_sizes = {}, {}, {}
             efi_raw = staging / "efi.raw"
-            with _guest(source_work, "qcow2", readonly=True) as g:
-                for index, filesystem in enumerate(regular):
-                    device = filesystem["device"]
-                    log(f"Archiving {device} separately with numeric ownership, ACLs, xattrs and SELinux contexts")
-                    _identity(g, filesystem)
-                    g.mount_ro(device, "/")
-                    archive = staging / f"filesystem-{index}.tar.gz"
-                    g.tar_out("/", str(archive), numericowner=True, **ARCHIVE_OPTIONS)
-                    g.umount_all()
-                    manifest = _archive_manifest(archive)
-                    # guestfs tar-in expands sparse and reflink files; reject a
-                    # selection that cannot contain their actual logical data.
-                    minimum = _minimum(manifest["logical_bytes"], filesystem["filesystem"])
-                    if filesystem["selected_size_mib"] < minimum:
-                        raise StorageError(f"Expanded archive for {device} requires at least {minimum} MiB; choose a larger filesystem")
-                    archives[device], manifests[device] = archive, manifest
-                log(f"Copying EFI partition {esp['device']} byte for byte")
-                g.download_offset(esp["device"], str(efi_raw), 0, esp["size"])
-            if efi_raw.stat().st_size != esp["size"]:
-                raise StorageError("EFI raw copy is truncated")
-            efi_hash = _digest(efi_raw)
-            needed = sum(manifest["logical_bytes"] for manifest in manifests.values()) + max((path.stat().st_size for path in archives.values()), default=0) + 512 * MIB
-            if shutil.disk_usage(destination.parent).free < needed:
-                raise StorageError("Not enough host workspace to restore files and verify the rebuilt disk")
             # Reserve ownership atomically so cleanup cannot remove a preexisting
             # artifact if another process creates this name during the preflight.
             descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -1509,7 +1572,7 @@ def rebuild(source_work: Path, destination: Path, inspection: dict, recipe: dict
                     g.part_set_gpt_type("/dev/sda", number, part["type"])
                     g.part_set_gpt_guid("/dev/sda", number, str(UUID(bytes_le=bytes.fromhex(part["partition_guid"]))))
                     g.part_set_gpt_attributes("/dev/sda", number, part.get("attributes", 0))
-                    g.part_set_name("/dev/sda", number, part.get("name", ""))
+                    _set_gpt_name(g, number, part.get("name", ""))
                 if layout["lvs"]:
                     pv = layout["pv_device"]
                     vg = fresh["storage"]["lvm"]["vgs"][0]["vg_name"]
@@ -1517,6 +1580,32 @@ def rebuild(source_work: Path, destination: Path, inspection: dict, recipe: dict
                     g.vgcreate(vg, [pv])
                     for lv in layout["lvs"]:
                         g.lvcreate(lv["name"], vg, lv["size"] // MIB)
+                _verify_layout(g, plan)
+            with _guest(source_work, "qcow2", readonly=True) as g:
+                for index, filesystem in enumerate(regular):
+                    device = filesystem["device"]
+                    log(f"Archiving {device} separately with numeric ownership, ACLs, xattrs and SELinux contexts")
+                    _identity(g, filesystem)
+                    g.mount_ro(device, "/")
+                    archive = staging / f"filesystem-{index}.tar.gz"
+                    raw_sizes[device] = _export_archive(g, archive, filesystem["size"])
+                    g.umount_all()
+                    manifest = _archive_manifest(archive)
+                    # guestfs tar-in expands sparse and reflink files; reject a
+                    # selection that cannot contain their actual logical data.
+                    minimum = _minimum(manifest["logical_bytes"], filesystem["filesystem"])
+                    if filesystem["selected_size_mib"] < minimum:
+                        raise StorageError(f"Expanded archive for {device} requires at least {minimum} MiB; choose a larger filesystem")
+                    archives[device], manifests[device] = archive, manifest
+                log(f"Copying EFI partition {esp['device']} byte for byte")
+                g.download_offset(esp["device"], str(efi_raw), 0, esp["size"])
+            if efi_raw.stat().st_size != esp["size"]:
+                raise StorageError("EFI raw copy is truncated")
+            efi_hash = _digest(efi_raw)
+            needed = sum(manifest["logical_bytes"] for manifest in manifests.values()) + max((path.stat().st_size for path in archives.values()), default=0) + max(raw_sizes.values(), default=0) + 512 * MIB
+            if shutil.disk_usage(destination.parent).free < needed:
+                raise StorageError("Not enough host workspace to restore files and verify the rebuilt disk")
+            with _guest(destination, "qcow2", readonly=False) as g:
                 g.upload_offset(str(efi_raw), esp["device"], 0)
                 for filesystem in regular:
                     device, fs = filesystem["device"], filesystem["filesystem"]
@@ -1534,7 +1623,7 @@ def rebuild(source_work: Path, destination: Path, inspection: dict, recipe: dict
                     g.mount(device, "/")
                     if g.is_dir("/lost+found") and not g.ls("/lost+found"):
                         g.rmdir("/lost+found")
-                    g.tar_in(str(archives[device]), "/", **ARCHIVE_OPTIONS)
+                    _import_archive(g, archives[device], raw_sizes[device])
                     stats = g.statvfs("/")
                     if stats["bavail"] * stats["frsize"] < 64 * MIB:
                         raise StorageError(f"Restored filesystem {device} has less than 64 MiB available; choose a larger size")
@@ -1549,7 +1638,7 @@ def rebuild(source_work: Path, destination: Path, inspection: dict, recipe: dict
                     device = filesystem["device"]
                     log(f"Verifying every archived file and preserved metadata on {device}")
                     g.mount_ro(device, "/")
-                    g.tar_out("/", str(verification), numericowner=True, **ARCHIVE_OPTIONS)
+                    _export_archive(g, verification, filesystem["selected_size_mib"] * MIB)
                     g.umount_all()
                     _compare_manifests(manifests[device], _archive_manifest(verification), device)
                     verification.unlink()
