@@ -56,11 +56,19 @@ function applyDestinationOci(defaults,strategy) {
   studioSession().destinationOciPrepare={profileId:selectedDestinationProfileId(),prepare:true};
   $('#oci-enabled').checked=true;$('#oci-prepare').checked=strategy!=='preserve';markOciChanged();
 }
+function renderDestinationIssues(issues) {
+  notice('#destination-profile-error',issues.join(' '));
+  if(issues.length>1)$('#destination-profile-error').innerHTML=`<strong>Review these destination requirements</strong><ul class="destination-issue-list">${issues.map(issue=>`<li>${esc(issue)}</li>`).join('')}</ul>`;
+}
+function setDestinationLoading(loading) {
+  $('#destination-profile-loading').hidden=!loading;
+  $('#destination-profile-summary').setAttribute('aria-busy',String(loading));
+}
 function renderDestinationResult(result) {
   const profile=result?.profile,summary=$('#destination-profile-summary');if(!summary)return;
   summary.hidden=!profile;
   if(profile){const attachment={paravirtualized:'PV',accelerated:'Accelerated PV',vfio:'Physical NIC',iscsi:'Firmware iSCSI'};summary.innerHTML=`<span><strong>${esc(architectureName(profile.architecture))}</strong></span><span>${profile.target==='bare_metal'?'Bare metal':'Virtual machine'}</span><span>${esc(attachment[profile.boot_attachment]||profile.boot_attachment)} boot</span><span>${esc(attachment[profile.network_attachment]||profile.network_attachment)} network</span>`;}
-  const blockers=[...(result?.blockers||[]),...(result?.schema_error?[result.schema_error]:[])];notice('#destination-profile-error',blockers.join(' '));$('#destination-profile-apply').hidden=!result?.schema_error;
+  const blockers=[...(result?.blockers||[]),...(result?.schema_error?[result.schema_error]:[])];renderDestinationIssues(blockers);$('#destination-profile-apply').hidden=!result?.schema_error;
   const warnings=$('#destination-profile-warnings'),notesOpen=$('details',warnings)?.open??state.editorDrafts[state.selected]?.disclosures?.['destination-notes'];warnings.hidden=!result?.warnings?.length;warnings.innerHTML=result?.warnings?.length?`<details class="editor-disclosure" data-disclosure="destination-notes"${notesOpen?' open':''}><summary>Profile notes <span class="disclosure-meta">${result.warnings.length}</span></summary><div class="details-content"><ul>${result.warnings.map(item=>`<li>${esc(item)}</li>`).join('')}</ul></div></details>`:'';
   updateDestinationDownloads(result);
 }
@@ -88,7 +96,7 @@ async function resolveDestinationProfile({apply=true,syncOci=true}={}) {
   if(!$('#platform-enabled')?.checked)return;
   if($('#destination-profile').value==='custom'){useCustomDestination();return;}
   const imageId=state.selected,revision=state.editorRevision,selection=destinationSelection(),snapshot=studioInspectionKey(),session=studioSession(),requestId=++destinationState.requestId;
-  session.destinationPending=requestId;notice('#destination-profile-error','');$('#destination-profile-loading').hidden=false;
+  session.destinationPending=requestId;notice('#destination-profile-error','');setDestinationLoading(true);
   try{
     const result=await api(`/images/${encodeURIComponent(imageId)}/destination/resolve`,{method:'POST',body:JSON.stringify(selection)});
     if(state.selected!==imageId||state.editorRevision!==revision||studioInspectionKey()!==snapshot||session.destinationPending!==requestId)return;
@@ -105,7 +113,7 @@ async function resolveDestinationProfile({apply=true,syncOci=true}={}) {
     }
     result.selection=JSON.stringify(destinationSelection());result.snapshot=snapshot;session.destination=result;renderDestinationResult(result);updatePlatformStudio();
   }catch(error){if(state.selected===imageId&&state.editorRevision===revision&&studioInspectionKey()===snapshot){notice('#destination-profile-error',errorText(error));$('#destination-profile-apply').hidden=false;}}
-  finally{if(session.destinationPending===requestId){delete session.destinationPending;if(state.selected===imageId){$('#destination-profile-loading').hidden=true;syncDestinationEditor();wizardUpdate();}}}
+  finally{if(session.destinationPending===requestId){delete session.destinationPending;if(state.selected===imageId){setDestinationLoading(false);syncDestinationEditor();wizardUpdate();}}}
 }
 function syncDestinationEditor() {
   if(!$('#destination-profile'))return;
@@ -116,7 +124,7 @@ function syncDestinationEditor() {
 }
 function useCustomDestination() {
   if(!$('#destination-profile'))return;
-  $('#destination-profile').value='custom';delete studioSession().destination;delete studioSession().destinationPending;renderDestinationResult(null);$('#destination-profile-loading').hidden=true;$('#platform-advanced').open=true;
+  $('#destination-profile').value='custom';delete studioSession().destination;delete studioSession().destinationPending;renderDestinationResult(null);setDestinationLoading(false);$('#platform-advanced').open=true;
 }
 function scheduleDestinationResolution(options) {
   const imageId=state.selected,requestId=++destinationState.scheduledRequest;

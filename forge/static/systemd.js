@@ -157,6 +157,7 @@ function renderSystemdSearch() {
   if(session.searchOpen&&session.searchIndex>=0)input.setAttribute('aria-activedescendant',`systemd-option-${session.searchIndex}`);else input.removeAttribute('aria-activedescendant');
   list.innerHTML=systemdExplorer.searchResults.map((unit,index)=>`<button type="button" role="option" id="systemd-option-${index}" tabindex="-1" aria-selected="${index===session.searchIndex}" data-systemd-pick="${esc(unit.name)}"><strong>${esc(unit.name)}</strong>${unit.description?`<span>${esc(unit.description)}</span>`:''}</button>`).join('')||'<div class="systemd-search-empty">No matching units.</div>';
   if(matches.length>12)list.insertAdjacentHTML('beforeend',`<div class="systemd-search-hint">${matches.length} matches · type to narrow</div>`);
+  if(session.searchOpen&&session.searchIndex>=0)$(`#systemd-option-${session.searchIndex}`,list)?.scrollIntoView({block:'nearest',behavior:'instant'});
 }
 function systemdRelatedRow(edge,unitName,trace) {
   const other=edge.source===unitName?edge.target:edge.source,canLocate=trace.items.has(other);

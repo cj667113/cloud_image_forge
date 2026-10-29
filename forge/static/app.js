@@ -142,7 +142,7 @@ function bootSummary(inspection, location) {
   const message = !boot ? 'This image predates boot-mode detection. Refresh its inspection to check the boot files and disk structures.' : mode === 'dual' ? 'Both UEFI and legacy BIOS boot support were detected. Choose the firmware to use for your cloud deployment.' : mode === 'unknown' ? 'The available evidence does not establish a boot mode. Review the findings before selecting cloud firmware.' : `${bootModeLabel(boot)} boot support was detected in the source image.`;
   const rows = (boot?.efi_loaders || []).map(loader => `<tr><td><code>${esc(loader.device)}</code></td><td><code>${esc(loader.path)}</code></td><td>${esc(loader.architecture || 'Unknown')}</td><td>${loader.fallback ? 'Yes' : 'No'}</td></tr>`).join('');
   const evidence = boot?.evidence || [];
-  return `<div class="boot-card ${mode === 'unknown' || mode === 'missing' ? 'boot-uncertain' : ''}" data-boot-summary="${esc(location)}"><div class="boot-card-heading"><div class="boot-card-title"><span class="boot-icon">${icon('settings')}</span><div><span class="eyebrow">DETECTED BOOT SUPPORT</span><h3>${esc(bootModeLabel(boot))}</h3></div></div><button type="button" class="button secondary small" data-action="refresh-inspection"${refreshing ? ' disabled' : ''}>${icon('activity')}${refreshing ? 'Refreshing…' : 'Refresh inspection'}</button></div>${refreshNotice}${['missing','dual','unknown'].includes(mode) ? `<p class="boot-description">${esc(message)}</p>` : ''}${boot ? `<p class="boot-scope">Detected offline · boot not verified. ${helpHint("Detection checks installed boot files and disk structures. It does not identify the last VM firmware or prove the image boots.","About boot detection")}</p><details class="boot-evidence"><summary>Detection evidence</summary><div class="details-content"><dl class="detail-list"><div><dt>Partition table</dt><dd>${esc(boot.partition_table || 'Unknown')}</dd></div><div><dt>Supported firmware</dt><dd>${esc((boot.supported_firmware || []).join(', ') || 'Not established')}</dd></div><div><dt>Recommended firmware</dt><dd>${esc(boot.recommended_firmware || (mode === 'dual' ? 'Choose a firmware mode' : 'Not established'))}</dd></div></dl>${evidence.length ? `<ul>${evidence.map(item => `<li>${esc(item)}</li>`).join('')}</ul>` : '<p class="field-help">No detailed boot evidence was recorded.</p>'}${boot.bios_evidence?.length ? `<h4>Legacy BIOS evidence</h4><ul>${boot.bios_evidence.map(item => `<li>${esc(item)}</li>`).join('')}</ul>` : ''}${rows ? `<h4>EFI boot loaders</h4><div class="table-wrap"><table><thead><tr><th>Device</th><th>Loader</th><th>Architecture</th><th>Fallback path</th></tr></thead><tbody>${rows}</tbody></table></div>` : ''}${(boot.warnings || []).map(warning => `<div class="notice warning">${esc(warning)}</div>`).join('')}</div></details>` : '<p class="boot-scope">Source and draft preserved.</p>'}</div>`;
+  return `<div class="boot-card ${mode === 'unknown' || mode === 'missing' ? 'boot-uncertain' : ''}" data-boot-summary="${esc(location)}"><div class="boot-card-heading"><div class="boot-card-title"><span class="boot-icon">${icon('settings')}</span><div><span class="eyebrow">DETECTED BOOT SUPPORT</span><h3>${esc(bootModeLabel(boot))}</h3></div></div><button type="button" class="button secondary small" data-action="refresh-inspection" aria-label="Refresh inspection" title="Refresh source inspection"${refreshing ? ' disabled' : ''}>${icon('refresh')}${refreshing ? 'Refreshing…' : 'Refresh'}</button></div>${refreshNotice}${['missing','dual','unknown'].includes(mode) ? `<p class="boot-description">${esc(message)}</p>` : ''}${boot ? `<p class="boot-scope">Detected offline · boot not verified. ${helpHint("Detection checks installed boot files and disk structures. It does not identify the last VM firmware or prove the image boots.","About boot detection")}</p><details class="boot-evidence"><summary>Detection evidence</summary><div class="details-content"><dl class="detail-list"><div><dt>Partition table</dt><dd>${esc(boot.partition_table || 'Unknown')}</dd></div><div><dt>Supported firmware</dt><dd>${esc((boot.supported_firmware || []).join(', ') || 'Not established')}</dd></div><div><dt>Recommended firmware</dt><dd>${esc(boot.recommended_firmware || (mode === 'dual' ? 'Choose a firmware mode' : 'Not established'))}</dd></div></dl>${evidence.length ? `<ul>${evidence.map(item => `<li>${esc(item)}</li>`).join('')}</ul>` : '<p class="field-help">No detailed boot evidence was recorded.</p>'}${boot.bios_evidence?.length ? `<h4>Legacy BIOS evidence</h4><ul>${boot.bios_evidence.map(item => `<li>${esc(item)}</li>`).join('')}</ul>` : ''}${rows ? `<h4>EFI boot loaders</h4><div class="table-wrap"><table><thead><tr><th>Device</th><th>Loader</th><th>Architecture</th><th>Fallback path</th></tr></thead><tbody>${rows}</tbody></table></div>` : ''}${(boot.warnings || []).map(warning => `<div class="notice warning">${esc(warning)}</div>`).join('')}</div></details>` : '<p class="boot-scope">Source and draft preserved.</p>'}</div>`;
 }
 function captureEditorDraft() {
   const form = $('#recipe-form'); if (!form) return;
@@ -406,7 +406,7 @@ document.addEventListener('invalid',event => { if (!event.target.closest('#recip
 document.addEventListener('keydown',event => { if(event.target.matches?.('.editor-tab') && ['ArrowLeft','ArrowRight','Home','End'].includes(event.key)) { event.preventDefault(); const tabs = $$('.editor-tab'), current = tabs.indexOf(event.target); const index = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length-1 : (current + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length; setTab(tabs[index].dataset.tab); tabs[index].focus(); } });
 window.addEventListener('hashchange',() => setView(location.hash.slice(1)));
 function renderBootMigration() {
-  return `<details class="editor-disclosure boot-migration" id="boot-migration-section" data-disclosure="boot-migration"><summary id="boot-migration-title">BIOS → UEFI conversion <span class="disclosure-meta">${sourceArchitecture()==='aarch64'?'Unavailable for ARM64':'Optional'}</span></summary><div class="details-content">
+  return `<details class="editor-disclosure boot-migration" id="boot-migration-section" data-disclosure="boot-migration"><summary id="boot-migration-title">BIOS → UEFI conversion <span class="disclosure-meta">${studioImage()?.inspection?.boot?.mode==='uefi'?'Already UEFI':sourceArchitecture()==='aarch64'?'Unavailable for ARM64':'Optional'}</span></summary><div class="details-content">
     <label class="check-field migration-enable"><input type="checkbox" id="boot-migration-enabled"><span>Convert this image to UEFI during the build<small>${sourceArchitecture()==='aarch64'?'ARM64 requires an existing ARM64 UEFI bootloader. BIOS conversion is unavailable.':'Changes the working copy only. Selecting OCI firmware alone does not convert boot files.'}</small></span></label>
     <div id="migration-architecture-error" class="notice error" role="alert" hidden></div>
     <div id="migration-controls" hidden><div class="form-grid"><label class="field">EFI System Partition size (MiB)<input type="number" id="migration-esp-size" min="512" max="2048" step="1" value="512"><span class="field-help">The plan shows whether an ESP can be created or reused and how much the virtual disk must grow.</span></label><div class="migration-options"><label class="check-field"><input type="checkbox" id="migration-install-packages"><span>Install or refresh bootloader packages<small>Allow required installation or reinstallation from the guest repositories.</small></span></label><label class="check-field"><input type="checkbox" id="migration-allow-network"><span>Allow networking during customization<small>Required for package installation; shared with the other customization settings.</small></span></label></div></div>
@@ -427,7 +427,7 @@ function getBootMigrationConfig() {
 }
 function invalidateMigrationPlan() {
   if ($('#migration-plan')) $('#migration-plan').innerHTML = '<p class="muted">Settings changed. Check the migration plan again.</p>';
-  if ($('#oci-enabled')?.checked && $('#oci-plan')) $('#oci-plan').innerHTML = '<p class="muted">Boot migration settings changed. Preview the OCI compatibility plan again.</p>';
+  if ($('#oci-enabled')?.checked) setOciPlanMessage('Boot settings changed. Check compatibility again.');
 }
 function applyMigrationFirmware() {
   const firmware = $$('[data-oci-default]').find(node => node.dataset.ociDefault === 'Compute.Firmware');
@@ -616,7 +616,14 @@ function getOciConfig() {
   if (guest.install_packages && !$('#allow-network').checked) throw editorError('Enable networking during customization to install OCI preparation packages.','#oci-allow-network');
   return {capabilities:readOciCapabilities(),guest,import_options,global_schema_version:$('#oci-schema-version').value.trim() || null,global_schema};
 }
-function markOciChanged() { if ($('#oci-enabled')) $('#oci-enabled').checked = true; updateDisclosureSummaries(); if ($('#oci-plan')) $('#oci-plan').innerHTML = '<p class="muted">Settings changed. Check compatibility again.</p>'; }
+function setOciPlanMessage(message, status = 'stale') {
+  const panel = $('#oci-plan');
+  if (!panel) return;
+  panel.dataset.state = status;
+  panel.setAttribute('aria-busy', String(status === 'loading'));
+  panel.innerHTML = `<p class="muted">${esc(message)}</p>`;
+}
+function markOciChanged() { if ($('#oci-enabled')) $('#oci-enabled').checked = true; updateDisclosureSummaries(); setOciPlanMessage('Settings changed. Check compatibility again.'); }
 function addOciShape(focus=true) {
   const row = document.createElement('div'); row.className = 'oci-shape-row';
   row.innerHTML = `<div class="oci-shape-heading"><label class="field">OCI shape<input data-shape-field="shape" placeholder="${sourceArchitecture()==='aarch64'?'VM.Standard.A1.Flex':sourceArchitecture()==='x86_64'?'VM.Standard.E5.Flex':'Exact OCI shape name'}"></label><button type="button" class="icon-button" data-action="oci-remove-shape" aria-label="Remove shape">${icon('close')}</button></div><div class="oci-shape-limits">${[['min_ocpus','Minimum OCPUs'],['max_ocpus','Maximum OCPUs'],['min_memory_gbs','Minimum memory (GiB)'],['max_memory_gbs','Maximum memory (GiB)']].map(([key,label]) => `<label class="field">${label}<input type="number" data-shape-field="${key}" min="1" step="1" placeholder="OCI default"></label>`).join('')}</div>`;
@@ -625,22 +632,41 @@ function addOciShape(focus=true) {
 function renderOciPlan(plan) {
   const items = value => (value || []).map(item => `<li>${esc(typeof item === 'string' ? item : JSON.stringify(item))}</li>`).join('');
   const blocked = Boolean(plan.blockers?.length);
+  $('#oci-plan').dataset.state = blocked ? 'blocked' : 'ready';
+  $('#oci-plan').setAttribute('aria-busy', 'false');
   $('#oci-plan').innerHTML = `<div class="oci-plan-status ${blocked ? 'blocked' : 'clear'}">${icon(blocked ? 'info' : 'check')}<strong>${blocked ? 'Resolve these blockers before building' : 'Compatibility plan is ready'}</strong></div>${blocked ? `<div class="oci-plan-section"><h4>Blockers</h4><ul class="oci-blockers">${items(plan.blockers)}</ul></div>` : ''}${plan.changes?.length ? `<details class="editor-disclosure"><summary>Planned changes <span class="disclosure-meta">${plan.changes.length}</span></summary><div class="details-content"><ul>${items(plan.changes)}</ul></div></details>` : ''}${plan.warnings?.length ? `<div class="oci-plan-section"><h4>Checks and limitations</h4><ul class="oci-warnings">${items(plan.warnings)}</ul></div>` : ''}<p class="validation-note">OCI import and a test launch are still required.</p>`;
 }
 async function previewOci(config = null, beforeBuild = false, migrationOverride = undefined, networkOverride = undefined, platformOverride = undefined, mountPolicyOverride = undefined) {
   const imageId = state.selected, revision = state.editorRevision;
-  const button = $('#oci-plan-button'); if (button) button.disabled = true; notice('#oci-form-error','');
+  const button = $('#oci-plan-button'), panel = $('#oci-plan'), owner = Symbol('oci-preview');
+  if (panel) panel.previewOwner = owner;
+  const ownsPanel = () => panel?.isConnected && panel.previewOwner === owner && state.selected === imageId;
+  if (button) { button.disabled = true; button.setAttribute('aria-busy', 'true'); }
+  notice('#oci-form-error','');
   try {
     if (!config) { $('#oci-enabled').checked = true; updateOciVisibility(); config = getOciConfig(); }
     const migration = migrationOverride === undefined ? getBootMigrationConfig() : migrationOverride;
     const platform = platformOverride === undefined ? getPlatformMigrationConfig() : platformOverride;
+    setOciPlanMessage('Checking compatibility…', 'loading');
     const plan = await api(`/images/${encodeURIComponent(imageId)}/oci/plan`,{method:'POST',body:JSON.stringify({oci:config,mount_policy:mountPolicyOverride ?? getMountPolicy(),allow_network:networkOverride ?? $('#allow-network').checked,...(migration ? {boot_migration:migration} : {}),...(platform ? {platform_migration:platform} : {})})});
     if (state.selected !== imageId || state.editorRevision !== revision) throw new Error('The source or settings changed. Preview the OCI settings again for the current choices.');
-    renderOciPlan(plan);
+    if (ownsPanel()) renderOciPlan(plan);
     if (beforeBuild && plan.blockers?.length) { setTab('oci'); $('#oci-plan').scrollIntoView({behavior:'smooth',block:'center'}); throw new Error('The OCI compatibility plan has blockers. Resolve them in the OCI compatibility step before building.'); }
     return plan;
-  } catch (error) { if (state.selected === imageId) notice('#oci-form-error',errorText(error)); revealEditorField(error.field); if (beforeBuild) throw error; return null; }
-  finally { if (button?.isConnected) button.disabled = ['queued','running'].includes(state.images.find(image => image.id === state.selected)?.inspection_status); }
+  } catch (error) {
+    if (ownsPanel()) {
+      notice('#oci-form-error',errorText(error));
+      if (panel.dataset.state === 'loading') setOciPlanMessage('Compatibility check incomplete. Try again.', 'error');
+      revealEditorField(error.field);
+    }
+    if (beforeBuild) throw error;
+    return null;
+  } finally {
+    if (ownsPanel() && button?.isConnected) {
+      button.disabled = ['queued','running'].includes(state.images.find(image => image.id === state.selected)?.inspection_status);
+      button.setAttribute('aria-busy', 'false');
+    }
+  }
 }
 async function loadOciCatalog(schema = null, commit = true) {
   const owner={authGeneration:state.authGeneration,requestId:state.ociCatalogRequest=(state.ociCatalogRequest||0)+1};

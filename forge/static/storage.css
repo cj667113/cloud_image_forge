@@ -26,6 +26,7 @@
 .storage-fit-action{display:flex;align-items:center;gap:3px;min-height:38px;margin-left:auto}
 #storage-studio #storage-fit-button{min-width:0;min-height:36px;margin:0;font-size:11px;padding:8px 10px}
 .storage-fit-action>.help-anchor{margin:0}
+.storage-fit-action:has(>#storage-fit-button[hidden]){display:none}
 #storage-studio .storage-filesystems-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 21px 10px}
 #storage-studio .storage-filesystems-heading h4{font-size:12px;font-weight:600;margin:0;color:var(--ink)}
 .storage-usage-key{display:flex;align-items:center;gap:3px;font-size:10px;color:var(--muted)}

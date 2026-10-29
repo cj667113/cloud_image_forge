@@ -10,11 +10,11 @@ const wizardStepCatalog = [
   {id:'startup',label:'Startup',description:'Services and scheduled jobs.'},
   {id:'access',label:'Access',description:'SSH login and authorized public keys.'},
   {id:'mounts',label:'Mounts',description:'Persistent filesystem mounts.'},
-  {id:'boot',label:'Boot & kernel',description:'Firmware, kernels and drivers.'},
+  {id:'boot',label:'Boot & kernel',navLabel:'Boot',description:'Firmware, kernels and drivers.'},
   {id:'export',label:'Destination',description:'Output format and target hardware.'},
-  {id:'oci',label:'OCI compatibility',description:'Guest readiness and image capabilities.'},
+  {id:'oci',label:'OCI compatibility',navLabel:'OCI',description:'Guest readiness and image capabilities.'},
   {id:'review',label:'Review',description:'Confirm the changes before building.'},
-  {id:'result',label:'Build & export',description:'Follow progress, then download or upload.'}
+  {id:'result',label:'Build & export',navLabel:'Build',description:'Follow progress, then download or upload.'}
 ];
 
 function wizardSession(imageId = state.selected) {
@@ -35,14 +35,15 @@ function wizardBuildPending() {
   return !job || !['succeeded','failed'].includes(job.status);
 }
 function wizardChrome() {
-  return '<div id="wizard-chrome"><nav aria-label="Image build steps"><ol class="wizard-stepper"></ol></nav><div class="wizard-context"><div><span id="wizard-step-count" class="eyebrow"></span><h2 id="wizard-heading" tabindex="-1"></h2><p id="wizard-description"></p></div><progress class="wizard-progress" id="wizard-progress" max="100" value="0" aria-label="Wizard progress"></progress></div></div>';
+  return '<div id="wizard-chrome"><div class="wizard-context"><h2 id="wizard-heading" tabindex="-1" aria-describedby="wizard-description"></h2><span id="wizard-step-count"></span><p id="wizard-description" class="sr-only"></p><progress class="wizard-progress sr-only" id="wizard-progress" max="100" value="0" aria-label="Wizard progress"></progress></div><nav aria-label="Image build steps"><ol class="wizard-stepper"></ol></nav></div>';
 }
 function wizardFooter() {
   return `<div id="wizard-error" class="notice error" role="alert" hidden></div><div class="wizard-footer"><div class="wizard-footer-copy"><strong id="build-summary">Image export</strong><span id="wizard-footer-help" hidden></span></div><div class="wizard-footer-actions"><button type="button" id="wizard-back" class="button secondary" data-wizard-action="back"><span class="wizard-back-arrow">${icon('arrow')}</span>Back</button><button type="button" id="wizard-next" class="button primary" data-wizard-action="next">Next${icon('arrow')}</button><button type="submit" id="build-button" class="button primary" hidden>${icon('stack')}Build image</button></div></div>`;
 }
 function wizardSource() {
   const image = wizardImage();
-  return `<div class="wizard-source-card"><span class="large-icon">${icon('upload')}</span><div><h3>Import a source</h3><p>Local file · S3 · HTTPS</p><button type="button" class="button primary" data-action="open-import">${icon('plus')}Import image</button></div></div>${state.images.length ? `<div class="wizard-source-card"><span class="large-icon">${icon('image')}</span><div><label class="field">Or choose an imported image<select id="image-select">${state.images.map(item => `<option value="${esc(item.id)}"${item.id === state.selected ? ' selected' : ''}>${esc(item.name)} · ${esc(item.status)}</option>`).join('')}</select></label>${image?.status === 'ready' ? '' : '<p>Inspection is in progress.</p>'}</div></div>` : ''}`;
+  if (!state.images.length) return `<div class="wizard-source-card"><span class="large-icon">${icon('upload')}</span><div><h3>Import a source</h3><p>Local file · S3 · HTTPS</p><button type="button" class="button primary" data-action="open-import">${icon('plus')}Import image</button></div></div>`;
+  return `<div class="wizard-source-card wizard-source-current"><span class="large-icon">${icon('image')}</span><div><label class="field">Source image<select id="image-select">${state.images.map(item => `<option value="${esc(item.id)}"${item.id === state.selected ? ' selected' : ''}>${esc(item.name)} · ${esc(item.status)}</option>`).join('')}</select></label>${image?.status === 'ready' ? '' : `<p>${image?.status === 'failed' ? 'Choose another image or import a new source.' : 'Inspection is in progress.'}</p>`}</div></div><div class="wizard-source-import"><p>Local file · S3 · HTTPS</p><button type="button" class="button secondary" data-action="open-import">${icon('plus')}Import image</button></div>`;
 }
 function wizardPendingInspection(image) {
   if (!image) return '<p class="muted">Import an image in the Source step to begin inspection.</p>';
@@ -94,7 +95,7 @@ function wizardUpdate() {
     const visited = session.visited.includes(step.id), current = i === index;
     const unavailable = (!image && i > 0) || (image?.status !== 'ready' && i > 1) || (step.id === 'result' && !session.jobId);
     const disabled = busy || unavailable || (!visited && i > index + 1);
-    return `<li><button type="button" class="wizard-step-button${current ? ' current' : ''}${visited && i < index ? ' completed' : ''}" data-wizard-step="${step.id}"${current ? ' aria-current="step"' : ''}${disabled ? ' disabled' : ''} aria-label="Step ${i + 1}: ${esc(step.label)}"><span class="wizard-step-number">${visited && i < index ? icon('check') : i + 1}</span><span class="wizard-step-label">${esc(step.label)}</span></button></li>`;
+    return `<li><button type="button" class="wizard-step-button${current ? ' current' : ''}${visited && i < index ? ' completed' : ''}" data-wizard-step="${step.id}"${current ? ' aria-current="step"' : ''}${disabled ? ' disabled' : ''} aria-label="Step ${i + 1}: ${esc(step.label)}" title="${esc(step.label+': '+step.description)}"><span class="wizard-step-number" aria-hidden="true">${visited && i < index ? icon('check') : i + 1}</span><span class="wizard-step-label">${esc(step.navLabel || step.label)}</span></button></li>`;
   }).join('');
   if (stepper.dataset.signature !== navigation) {
     const focusedStep = document.activeElement?.dataset?.wizardStep;
@@ -107,7 +108,8 @@ function wizardUpdate() {
     const bounds = stepper.getBoundingClientRect(), item = active.getBoundingClientRect();
     if (item.left < bounds.left || item.right > bounds.right) stepper.scrollLeft += item.left - bounds.left - 10;
   }
-  $('#wizard-step-count').textContent = `Step ${index + 1} of ${steps.length}`;
+  $('#wizard-step-count').textContent = `${index + 1} / ${steps.length}`;
+  $('#wizard-step-count').setAttribute('aria-label',`Step ${index + 1} of ${steps.length}`);
   $('#wizard-heading').textContent = steps[index].label;
   $('#wizard-description').textContent = steps[index].description;
   $('#wizard-progress').value = Math.round(index / Math.max(1,steps.length - 1) * 100);

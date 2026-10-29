@@ -506,3 +506,8 @@ input[type=range]{appearance:auto;accent-color:#bc4c30;border:0;background:trans
   #storage-fit-button{width:100%}
 }
 @media(prefers-reduced-motion:reduce){#storage-studio .fs-capacity{transition:none}#storage-fit-button .spinner{animation:none}}
+
+/* Pending compatibility checks must remain visually distinct from a ready plan. */
+.oci-plan:not(:has(.oci-plan-status)),.oci-plan[data-state="loading"],.oci-plan[data-state="stale"],.oci-plan[data-state="error"]{background:#f8f5f0;border-color:var(--line)}
+.oci-plan[aria-busy="true"]>.muted{color:var(--ink)}
+.oci-plan-status{border-bottom-color:var(--line)}
