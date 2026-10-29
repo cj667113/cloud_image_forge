@@ -3,7 +3,7 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
 const icon = name => `<svg class="icon" aria-hidden="true"><use href="#i-${name}"/></svg>`;
-const state = {editorRevision:0,buildSubmitting:false,editorDrafts:{},migrationAutoFirmware:null,ociFirmwareEdited:false,inspectionRefreshing:null,ociCatalog:null,ociBaseCatalog:null,ociCatalogError:null,ociLoadedSchema:null,images:[], jobs:[], artifacts:[], health:null, selected:null, renderedImage:null, view:'images', importMode:'file', selectedFile:null, s3Artifact:null, uploadXhr:null, uploadCancelled:false, polling:false, authPending:false, authGeneration:0, busy:false};
+const state = {editorRevision:0,buildSubmitting:false,editorDrafts:{},migrationAutoFirmware:null,ociFirmwareEdited:false,inspectionRefreshing:null,ociCatalog:null,ociBaseCatalog:null,ociCatalogError:null,ociLoadedSchema:null,images:[], jobs:[], artifacts:[], health:null, selected:null, renderedImage:null, view:'images', importMode:'file', selectedFile:null, s3Artifact:null, uploadXhr:null, uploadCancelled:false, polling:false, authPending:false, authGeneration:0, authLoading:false, busy:false};
 const profiles = {
   oci:{label:'Oracle Cloud',format:'qcow2',title:'OCI · compressed QCOW2',description:'Standalone QCOW2 with zlib compression and 128 KiB clusters. Review firmware and launch options when importing into OCI.'},
   aws:{label:'Amazon AWS',format:'raw',title:'AWS · RAW disk image',description:'A raw disk image for the EC2 VM Import/Export workflow. Your guest OS, drivers, and boot configuration must meet AWS requirements.'},
@@ -303,12 +303,17 @@ async function buildImage(event) {
 function renderArtifacts() { renderExports(); }
 function renderJobs() { renderActivity(); }
 function openJob(id) { return openActivityJob(id); }
-async function refresh() {
-  if (state.polling) return;
+async function refresh({afterAuthentication=false}={}) {
+  if(state.authLoading&&!afterAuthentication)return;
+  const authGeneration=state.authGeneration;
+  if (state.polling&&state.pollingGeneration===authGeneration) return;
+  const requestId=state.refreshRequest=(state.refreshRequest||0)+1;
+  const current=()=>authGeneration===state.authGeneration&&requestId===state.refreshRequest;
   state.polling = true;
-  try { const [images,jobs,artifacts] = await Promise.all([api('/images'),api('/jobs'),api('/artifacts')]); state.images = images; state.jobs = jobs; state.artifacts = artifacts; $('#image-count').textContent = images.length; $('#artifact-count').textContent = artifacts.length; const active = jobs.filter(job => ['running','queued'].includes(job.status)).length; $('#job-count').textContent = active || jobs.length; renderImages(); renderArtifacts(); renderJobs(); wizardUpdate(); notice('#global-error',''); state.authPending = false; }
-  catch(error) { notice('#global-error',errorText(error)); }
-  finally { state.polling = false; }
+  state.pollingGeneration=authGeneration;
+  try { const [images,jobs,artifacts] = await Promise.all([api('/images'),api('/jobs'),api('/artifacts')]); if(!current())return;state.images = images; state.jobs = jobs; state.artifacts = artifacts; $('#image-count').textContent = images.length; $('#artifact-count').textContent = artifacts.length; const active = jobs.filter(job => ['running','queued'].includes(job.status)).length; $('#job-count').textContent = active || jobs.length; renderImages(); renderArtifacts(); renderJobs(); wizardUpdate(); notice('#global-error',''); if(!state.authLoading)state.authPending = false; }
+  catch(error) { if(current())notice('#global-error',errorText(error)); }
+  finally { if(requestId===state.refreshRequest)state.polling = false; }
 }
 function showImport() { notice('#import-error',''); compactStudioHelp($('#import-dialog')); $('#import-dialog').showModal(); }
 function setImportMode(mode) { state.importMode = mode; $$('[data-import-mode]').forEach(button => button.classList.toggle('selected',button.dataset.importMode === mode)); $('#import-local').hidden = mode !== 'file'; $('#import-remote').hidden = mode !== 'url'; $('#import-url').required = mode === 'url'; }
@@ -332,7 +337,7 @@ $('#import-form').addEventListener('submit',async event => {
   } catch(error) { if(!state.uploadCancelled) notice('#import-error',errorText(error)); }
   finally { state.uploadXhr = null; state.busy = false; $('#import-submit').disabled = false; $('#upload-progress-wrap').hidden = true; }
 });
-$('#auth-form').addEventListener('submit',async event => { event.preventDefault(); notice('#auth-error',''); const button = $('button[type="submit"]',event.target); button.disabled = true; try { await api('/session',{method:'POST',body:JSON.stringify({token:$('#auth-token').value})}); state.authGeneration++; $('#auth-token').value = ''; $('#auth-dialog').close(); state.authPending = false; toast('Connected to your workspace.'); updateHealth(await api('/health')); try { await loadOciCatalog(); } catch(error) { state.ociCatalogError = errorText(error); } await loadDestinationCatalog(); await refresh(); } catch(error) { notice('#auth-error',errorText(error)); } finally { button.disabled = false; } });
+$('#auth-form').addEventListener('submit',async event => { event.preventDefault(); notice('#auth-error',''); const button = $('button[type="submit"]',event.target); button.disabled = true; state.authLoading = true; try { await api('/session',{method:'POST',body:JSON.stringify({token:$('#auth-token').value})}); state.authGeneration++; $('#auth-token').value = ''; $('#auth-dialog').close(); state.authPending = false; toast('Connected to your workspace.'); updateHealth(await api('/health')); try { await loadOciCatalog(); } catch(error) { if(currentOciCatalogOwner(error.catalogOwner))state.ociCatalogError = errorText(error); } await loadDestinationCatalog(); await refresh({afterAuthentication:true}); } catch(error) { notice('#auth-error',errorText(error)); } finally { state.authLoading = false; button.disabled = false; } });
 $('#s3-form').addEventListener('submit',async event => {
   event.preventDefault(); notice('#s3-error','');
   const button = $('button[type="submit"]',event.target), artifactId = state.s3Artifact, wizardImage = state.s3WizardImage;
@@ -636,11 +641,15 @@ async function previewOci(config = null, beforeBuild = false, migrationOverride 
   finally { if (button?.isConnected) button.disabled = ['queued','running'].includes(state.images.find(image => image.id === state.selected)?.inspection_status); }
 }
 async function loadOciCatalog(schema = null, commit = true) {
-  const catalog = await api('/oci/catalog',schema ? {method:'POST',body:JSON.stringify({schema})} : {});
-  if (!Array.isArray(catalog.capabilities) || !catalog.capabilities.length) throw new Error('The OCI catalog did not contain any capabilities.');
-  if (commit) { state.ociCatalog = catalog; if (!schema) state.ociBaseCatalog = catalog; state.ociCatalogError = null; }
-  return catalog;
+  const owner={authGeneration:state.authGeneration,requestId:state.ociCatalogRequest=(state.ociCatalogRequest||0)+1};
+  try {
+    const catalog = await api('/oci/catalog',schema ? {method:'POST',body:JSON.stringify({schema})} : {});
+    if (!Array.isArray(catalog.capabilities) || !catalog.capabilities.length) throw new Error('The OCI catalog did not contain any capabilities.');
+    if (commit&&currentOciCatalogOwner(owner)) { state.ociCatalog = catalog; if (!schema) state.ociBaseCatalog = catalog; state.ociCatalogError = null; }
+    return catalog;
+  }catch(error){error.catalogOwner=owner;throw error;}
 }
+function currentOciCatalogOwner(owner) { return !owner||(owner.authGeneration===state.authGeneration&&owner.requestId===state.ociCatalogRequest); }
 async function changeOciSchema(reset = false) {
   const imageId = state.selected, revision = state.editorRevision;
   notice('#oci-form-error','');
@@ -659,5 +668,19 @@ async function changeOciSchema(reset = false) {
   } catch (error) { if (state.selected === imageId) notice('#oci-form-error',errorText(error)); }
 }
 
-async function start() { setView(location.hash.slice(1)); $('#image-workspace').innerHTML = '<div class="loading-surface"><div class="spinner" aria-hidden="true"></div>Connecting to your image workspace…</div>'; try { updateHealth(await api('/health')); try { await loadOciCatalog(); } catch(error) { state.ociCatalogError = errorText(error); } await loadDestinationCatalog(); await refresh(); } catch(error) { notice('#global-error',errorText(error)); renderEmpty(); } setInterval(() => { if(!document.hidden && !state.authPending && !state.busy) refresh(); },4000); }
+async function start() {
+  const authGeneration=state.authGeneration;
+  const ownsStartup=()=>authGeneration===state.authGeneration&&!state.authPending&&!state.authLoading;
+  setView(location.hash.slice(1));
+  $('#image-workspace').innerHTML = '<div class="loading-surface"><div class="spinner" aria-hidden="true"></div>Connecting to your image workspace…</div>';
+  try {
+    updateHealth(await api('/health'));
+    if(ownsStartup()) {
+      try { await loadOciCatalog(); } catch(error) { if(ownsStartup()&&currentOciCatalogOwner(error.catalogOwner))state.ociCatalogError = errorText(error); }
+      if(ownsStartup())await loadDestinationCatalog();
+      if(ownsStartup())await refresh();
+    }
+  } catch(error) { if(ownsStartup()){notice('#global-error',errorText(error));renderEmpty();} }
+  setInterval(() => { if(!document.hidden&&!state.authPending&&!state.authLoading&&!state.busy)refresh(); },4000);
+}
 start();

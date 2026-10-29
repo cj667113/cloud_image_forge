@@ -2,8 +2,10 @@
 
 const destinationState={catalog:null,error:null,requestId:0,scheduledRequest:0};
 async function loadDestinationCatalog() {
-  try{const result=await api('/destinations/catalog');if(!Array.isArray(result.profiles))throw new Error('Destination profiles are unavailable.');destinationState.catalog=result;destinationState.error=null;}
-  catch(error){destinationState.error=errorText(error);}
+  const authGeneration=state.authGeneration,requestId=destinationState.catalogRequest=(destinationState.catalogRequest||0)+1;
+  const current=()=>authGeneration===state.authGeneration&&requestId===destinationState.catalogRequest;
+  try{const result=await api('/destinations/catalog');if(!Array.isArray(result.profiles))throw new Error('Destination profiles are unavailable.');if(current()){destinationState.catalog=result;destinationState.error=null;}}
+  catch(error){if(current())destinationState.error=errorText(error);}
 }
 function destinationProfiles() {
   const arch=sourceArchitecture();
