@@ -197,7 +197,7 @@ The same Oracle fixture completed VM-to-bare-metal preparation and a reverse con
 
 A real Debian 12 ARM64 image also passed import, ARM64 UEFI detection, a file edit, direct ext4 disk/root growth and export on the x86 worker. Guest-command requests correctly failed before queueing. A native ARM64 Docker deployment subsequently passed appliance startup, import, guest service enablement, initramfs regeneration and export with UEFI/kernel preservation and download checksum verification. ARM firmware boot and cloud launch remain separate tests; see the [architecture validation record](docs/image-architectures.md#validation-record).
 
-Ubuntu 26.04.1 ARM64 validation additionally covers its current dracut/cloud-init layout, Zstandard initramfs and automatic normalization of installer mount aliases to verified filesystem UUIDs. See the [Ubuntu validation record](docs/image-architectures.md#ubuntu-26041-arm64) for native preparation results and boot-test scope.
+Ubuntu 26.04.1 ARM64 validation additionally covers native VM and experimental ARM bare-metal preparation, its current dracut/cloud-init layout, Zstandard initramfs and automatic normalization of installer mount aliases to verified filesystem UUIDs. The VM candidate reached a serial login prompt under ARM UEFI/TCG. See the [Ubuntu validation record](docs/image-architectures.md#ubuntu-26041-arm64) for preparation results and boot-test scope.
 
 Storage rebuilds and machine preparation still require an appropriate firmware boot and destination launch test for each image and target; these checks do not certify cloud support or physical hardware compatibility.
 
