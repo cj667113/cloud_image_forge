@@ -3,7 +3,7 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
 const icon = name => `<svg class="icon" aria-hidden="true"><use href="#i-${name}"/></svg>`;
-const state = {editorRevision:0,buildSubmitting:false,editorDrafts:{},migrationAutoFirmware:null,ociFirmwareEdited:false,inspectionRefreshing:null,ociCatalog:null,ociBaseCatalog:null,ociCatalogError:null,ociLoadedSchema:null,images:[], jobs:[], artifacts:[], health:null, selected:null, renderedImage:null, view:'images', importMode:'file', selectedFile:null, s3Artifact:null, uploadXhr:null, uploadCancelled:false, polling:false, authPending:false, busy:false};
+const state = {editorRevision:0,buildSubmitting:false,editorDrafts:{},migrationAutoFirmware:null,ociFirmwareEdited:false,inspectionRefreshing:null,ociCatalog:null,ociBaseCatalog:null,ociCatalogError:null,ociLoadedSchema:null,images:[], jobs:[], artifacts:[], health:null, selected:null, renderedImage:null, view:'images', importMode:'file', selectedFile:null, s3Artifact:null, uploadXhr:null, uploadCancelled:false, polling:false, authPending:false, authGeneration:0, busy:false};
 const profiles = {
   oci:{label:'Oracle Cloud',format:'qcow2',title:'OCI · compressed QCOW2',description:'Standalone QCOW2 with zlib compression and 128 KiB clusters. Review firmware and launch options when importing into OCI.'},
   aws:{label:'Amazon AWS',format:'raw',title:'AWS · RAW disk image',description:'A raw disk image for the EC2 VM Import/Export workflow. Your guest OS, drivers, and boot configuration must meet AWS requirements.'},
@@ -82,8 +82,14 @@ function updateDisclosureSummaries() {
 }
 function toast(message) { const node = $('#toast'); node.textContent = message; node.hidden = false; clearTimeout(toast.timer); toast.timer = setTimeout(() => node.hidden = true, 5000); }
 async function api(path, options = {}) {
+  const authGeneration = state.authGeneration || 0;
   const response = await fetch(`/api${path}`, {credentials:'same-origin',...options,headers:{...(options.body && !(options.body instanceof FormData) ? {'Content-Type':'application/json'} : {}),...options.headers}});
-  if (response.status === 401) { state.authPending = true; if (!$('#auth-dialog').open) $('#auth-dialog').showModal(); throw new Error('Connect with your server access token to continue.'); }
+  if (response.status === 401) {
+    // Startup reads may finish after a new session was established. Retry them with that session.
+    if (authGeneration !== state.authGeneration && ['GET','HEAD'].includes((options.method||'GET').toUpperCase())) return api(path,options);
+    if (authGeneration === state.authGeneration) { state.authPending = true; if (!$('#auth-dialog').open) $('#auth-dialog').showModal(); }
+    throw new Error('Connect with your server access token to continue.');
+  }
   if (!response.ok) { let detail; try { detail = (await response.json()).detail; } catch { /* plain response */ } if (Array.isArray(detail)) detail = detail.map(item => `${item.loc?.slice(1).join('.') || 'Request'}: ${item.msg}`).join('; '); throw new Error(typeof detail === 'string' ? detail : `Request failed (${response.status}).`); }
   if (response.status === 204) return null;
   return response.json();
@@ -326,7 +332,7 @@ $('#import-form').addEventListener('submit',async event => {
   } catch(error) { if(!state.uploadCancelled) notice('#import-error',errorText(error)); }
   finally { state.uploadXhr = null; state.busy = false; $('#import-submit').disabled = false; $('#upload-progress-wrap').hidden = true; }
 });
-$('#auth-form').addEventListener('submit',async event => { event.preventDefault(); notice('#auth-error',''); const button = $('button[type="submit"]',event.target); button.disabled = true; try { await api('/session',{method:'POST',body:JSON.stringify({token:$('#auth-token').value})}); $('#auth-token').value = ''; $('#auth-dialog').close(); state.authPending = false; toast('Connected to your workspace.'); updateHealth(await api('/health')); try { await loadOciCatalog(); } catch(error) { state.ociCatalogError = errorText(error); } await loadDestinationCatalog(); await refresh(); } catch(error) { notice('#auth-error',errorText(error)); } finally { button.disabled = false; } });
+$('#auth-form').addEventListener('submit',async event => { event.preventDefault(); notice('#auth-error',''); const button = $('button[type="submit"]',event.target); button.disabled = true; try { await api('/session',{method:'POST',body:JSON.stringify({token:$('#auth-token').value})}); state.authGeneration++; $('#auth-token').value = ''; $('#auth-dialog').close(); state.authPending = false; toast('Connected to your workspace.'); updateHealth(await api('/health')); try { await loadOciCatalog(); } catch(error) { state.ociCatalogError = errorText(error); } await loadDestinationCatalog(); await refresh(); } catch(error) { notice('#auth-error',errorText(error)); } finally { button.disabled = false; } });
 $('#s3-form').addEventListener('submit',async event => {
   event.preventDefault(); notice('#s3-error','');
   const button = $('button[type="submit"]',event.target), artifactId = state.s3Artifact, wizardImage = state.s3WizardImage;
