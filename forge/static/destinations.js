@@ -1,6 +1,6 @@
 'use strict';
 
-const destinationState={catalog:null,error:null,requestId:0};
+const destinationState={catalog:null,error:null,requestId:0,scheduledRequest:0};
 async function loadDestinationCatalog() {
   try{const result=await api('/destinations/catalog');if(!Array.isArray(result.profiles))throw new Error('Destination profiles are unavailable.');destinationState.catalog=result;destinationState.error=null;}
   catch(error){destinationState.error=errorText(error);}
@@ -116,18 +116,23 @@ function useCustomDestination() {
   if(!$('#destination-profile'))return;
   $('#destination-profile').value='custom';delete studioSession().destination;delete studioSession().destinationPending;renderDestinationResult(null);$('#destination-profile-loading').hidden=true;$('#platform-advanced').open=true;
 }
+function scheduleDestinationResolution(options) {
+  const imageId=state.selected,requestId=++destinationState.scheduledRequest;
+  // Native events can run microtasks between listeners; capture the revision after the event finishes.
+  setTimeout(()=>{if(requestId===destinationState.scheduledRequest&&imageId===state.selected)resolveDestinationProfile(options);},0);
+}
 document.addEventListener('change',event=>{
   const input=event.target;
   if(input.id==='destination-allow-downloads')setDestinationDownloads(input.checked);
   if(['allow-network','oci-allow-network','migration-allow-network','platform-allow-network','platform-install-packages','oci-install-packages','platform-strategy','platform-enabled'].includes(input.id))queueMicrotask(()=>updateDestinationDownloads());
   if(input.name==='target'){
     $('#destination-profile option[value="auto"]').textContent=automaticDestinationLabel();
-    if($('#destination-profile').value==='auto'&&$('#platform-enabled').checked)queueMicrotask(()=>resolveDestinationProfile({syncOci:studioSession().destinationOciPrepare?.profileId!==selectedDestinationProfileId()}));
+    if($('#destination-profile').value==='auto'&&$('#platform-enabled').checked)scheduleDestinationResolution({syncOci:studioSession().destinationOciPrepare?.profileId!==selectedDestinationProfileId()});
   }
   if(input.id==='oci-prepare'&&studioSession().destinationOciPrepare?.profileId===selectedDestinationProfileId())studioSession().destinationOciPrepare.prepare=input.checked;
-  if(input.id==='destination-profile'){applyDestinationNicDefault();queueMicrotask(()=>resolveDestinationProfile());syncDestinationEditor();}
-  if(input.id==='platform-enabled'&&input.checked){applyDestinationNicDefault();queueMicrotask(()=>resolveDestinationProfile());}
-  if(['platform-strategy','platform-source','platform-nic'].includes(input.id)&&$('#destination-profile')?.value!=='custom')queueMicrotask(()=>resolveDestinationProfile({syncOci:false}));
+  if(input.id==='destination-profile'){applyDestinationNicDefault();scheduleDestinationResolution();syncDestinationEditor();}
+  if(input.id==='platform-enabled'&&input.checked){applyDestinationNicDefault();scheduleDestinationResolution();}
+  if(['platform-strategy','platform-source','platform-nic'].includes(input.id)&&$('#destination-profile')?.value!=='custom')scheduleDestinationResolution({syncOci:false});
   if(['platform-target','platform-boot','platform-network'].includes(input.id)){useCustomDestination();syncOciPlatformChoices();updatePlatformStudio();invalidateStudioPlans('platform');}
 });
 document.addEventListener('click',async event=>{
