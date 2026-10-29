@@ -10,12 +10,12 @@ function helpHint(text,label='More information') {
 }
 function closeHelp(except=null) {
   clearTimeout(studioState.helpOpenTimer); clearTimeout(studioState.helpCloseTimer);
-  $$('.help-anchor.open').forEach(anchor => {
-    if(anchor!==except) { anchor.classList.remove('open','pinned'); $('.help-toggle',anchor).setAttribute('aria-expanded','false'); }
+  document.querySelectorAll('.help-anchor.open').forEach(anchor => {
+    if(anchor!==except) { anchor.classList.remove('open','pinned'); anchor.querySelector('.help-toggle')?.setAttribute('aria-expanded','false'); }
   });
 }
 function positionHelp(anchor) {
-  const button=$('.help-toggle',anchor),popover=$('.help-popover',anchor),box=button.getBoundingClientRect();
+  const button=anchor.querySelector('.help-toggle'),popover=anchor.querySelector('.help-popover'),box=button.getBoundingClientRect();
   popover.style.left=`${Math.max(14,Math.min(innerWidth-popover.offsetWidth-14,box.right-popover.offsetWidth))}px`;
   popover.style.top=`${box.bottom+6+popover.offsetHeight>innerHeight?Math.max(14,box.top-popover.offsetHeight-6):box.bottom+6}px`;
 }
@@ -98,15 +98,19 @@ function storageRows() {
 function renderStorageStudio() {
   const evidence=studioImage()?.inspection?.storage;
   return `<div id="storage-studio">
-    <div class="storage-summary"><div><span>Current disk</span><strong id="storage-before"></strong></div><span class="storage-summary-arrow" aria-hidden="true">→</span><div><span>New disk</span><strong id="storage-after"></strong></div><div class="storage-saving"><strong id="storage-reduction"></strong></div><div class="storage-capacity-rail" role="img"><span id="storage-capacity-original"></span><span id="storage-capacity-target"></span></div></div>
-    <div class="storage-step-heading"><span class="storage-step-number" aria-hidden="true">1</span><h4>Partition sizes</h4><label class="check-field"><input type="checkbox" id="storage-rebuild-enabled"><span>Resize${helpHint('Adjust supported XFS, ext and LVM filesystems on a new disk. The imported source stays unchanged. Fixed boot partitions keep their size.','Partition resizing')}</span></label></div>
-    ${!evidence?'<div class="notice warning">Refresh inspection to enable resizing. <button type="button" class="button ghost small" data-action="refresh-inspection">Refresh</button></div>':''}
-    <div class="filesystem-list">${storageRows()}</div>
-    <div id="filesystem-reduction" class="filesystem-total-change"></div>
-    <div class="storage-step-heading"><span class="storage-step-number" aria-hidden="true">2</span><h4>Disk capacity</h4>${helpHint('The disk must hold all partitions plus boot and layout metadata. Fit disk to partitions checks the server’s plan and rounds its minimum up to two decimal places in the selected unit.','Disk capacity')}</div>
-    <div class="storage-capacity-choice"><div id="storage-capacity-field"></div><button type="button" class="button secondary" id="storage-fit-button" data-studio-action="storage-fit" hidden>${icon('image')}Fit disk to partitions</button></div>
-    <div id="storage-plan-controls" hidden><div class="plan-action-row"><button type="button" class="button secondary" id="storage-plan-button" data-studio-action="storage-preview">${icon('check')}Check sizes</button><span class="storage-plan-hint">Also checked when you continue.</span></div><div id="storage-plan-error" class="notice error" role="alert" hidden></div><div id="storage-plan" class="studio-plan"></div></div>
-    <details class="editor-disclosure storage-layout-details" data-disclosure="storage-layout"><summary>Disk layout <span class="disclosure-meta">Partitions & exact sizes</span></summary><div class="details-content">
+    <section class="storage-sizing-card" aria-labelledby="storage-sizing-title">
+      <div class="storage-card-heading"><h3 id="storage-sizing-title">Disk &amp; filesystems</h3><label class="check-field"><input type="checkbox" id="storage-rebuild-enabled"><span>Resize filesystems</span>${helpHint('Adjust supported XFS, ext and LVM filesystems on a new disk. Fixed boot partitions keep their size. The imported source stays unchanged.','Partition resizing')}</label></div>
+      <div class="storage-capacity-editor">
+        <div class="storage-summary"><div><span>Current disk</span><strong id="storage-before"></strong></div><span class="storage-summary-arrow" aria-hidden="true">→</span><div><span>Planned disk</span><strong id="storage-after"></strong></div><div class="storage-saving"><strong id="storage-reduction"></strong></div><div class="storage-capacity-rail" role="img"><span id="storage-capacity-original"></span><span id="storage-capacity-target"></span></div></div>
+        <div class="storage-capacity-controls"><fieldset class="storage-capacity-modes"><legend>Disk capacity</legend><div><label><input type="radio" name="storage-capacity-mode" id="storage-capacity-keep" value="keep" checked><span>Keep current</span></label><label><input type="radio" name="storage-capacity-mode" id="storage-capacity-custom" value="custom"><span>Custom size</span></label></div></fieldset><div id="storage-capacity-field" hidden></div><div class="storage-fit-action"><button type="button" class="button secondary small" id="storage-fit-button" data-studio-action="storage-fit" hidden>${icon('image')}Fit to filesystems</button><span id="storage-fit-help" hidden>${helpHint('Checks the server’s layout plan and sets the disk to its minimum capacity, rounded up to two decimal places in your selected unit. Refit after changing filesystem sizes.','Fit disk to filesystems')}</span></div></div>
+      </div>
+      ${!evidence?'<div class="notice warning storage-evidence-notice">Refresh inspection to enable resizing. <button type="button" class="button ghost small" data-action="refresh-inspection">Refresh</button></div>':''}
+      <div class="storage-filesystems-heading"><h4>Filesystems</h4><span class="storage-usage-key">Used / capacity${helpHint('The dark bar shows used data; the lighter area is filesystem capacity. Hatched space marks a reduction from the source size. The downloaded file size is measured after export.','Reading the size bars')}</span></div>
+      <div class="filesystem-list">${storageRows()}</div>
+      <div id="filesystem-reduction" class="filesystem-total-change"></div>
+      <div id="storage-plan-controls" hidden><div class="plan-action-row"><button type="button" class="button secondary" id="storage-plan-button" data-studio-action="storage-preview">${icon('check')}Check sizes</button>${helpHint('Sizes and available space are also checked when you choose Next. The plan reports layout limits before any image is built.','Sizing validation')}</div><div id="storage-plan-error" class="notice error" role="alert" hidden></div><div id="storage-plan" class="studio-plan"></div></div>
+    </section>
+    <details class="editor-disclosure storage-layout-details" data-disclosure="storage-layout"><summary>Layout &amp; advanced resizing <span class="disclosure-meta">Optional</span></summary><div class="details-content" id="storage-advanced-content">
       <div class="storage-disk-facts"><span>Source file <strong id="storage-file-size"></strong></span><span>Target capacity <strong id="storage-exact-capacity"></strong></span></div>
       <div class="disk-comparison"><div class="disk-caption"><span>Current</span><span id="storage-current-size"></span></div><div class="disk-track" id="storage-current-map" role="img"></div><div class="disk-caption"><span>Planned</span><span id="storage-planned-size"></span></div><div class="disk-track" id="storage-planned-map" role="img"></div><div id="storage-map-note" class="storage-note"></div></div>
     </div></details>
@@ -119,8 +123,8 @@ function prepareStudioEditor() {
   const direct=document.createElement('details');direct.id='storage-direct-options';direct.className='studio-details editor-disclosure';direct.dataset.disclosure='storage-direct';
   direct.innerHTML='<summary>Advanced resizing <span class="disclosure-meta">Direct partitions & LVM growth</span></summary><div class="details-content"></div>';
   const content=$('.details-content',direct);while(panel.firstChild)content.append(panel.firstChild);
-  panel.innerHTML=renderStorageStudio();$('#storage-capacity-field').append(capacity);panel.append(direct);
-  const disk=$('#disk-size');disk.setAttribute('aria-label','Target disk capacity');disk.step='any';disk.placeholder='Keep current';const title=[...capacity.childNodes].find(node=>node.nodeType===3&&node.textContent.trim());if(title)title.textContent='New capacity';const units=document.createElement('div');units.className='capacity-input';disk.replaceWith(units);units.append(disk);units.insertAdjacentHTML('beforeend','<select id="disk-size-unit" aria-label="Capacity unit" data-previous-unit="gib"><option value="gib">GiB</option><option value="gb">GB</option></select>');const oldHelp=$('.field-help',capacity);if(oldHelp)oldHelp.remove();capacity.insertAdjacentHTML('beforeend',helpHint('Leave blank to keep the current disk capacity. GiB uses 1024³ bytes; GB uses 1000³. Compressed file size is measured after export. Boot migration can add capacity.','Target disk capacity'));
+  panel.innerHTML=renderStorageStudio();$('#storage-capacity-field').append(capacity);$('#storage-advanced-content').append(direct);
+  const disk=$('#disk-size');disk.setAttribute('aria-label','Target disk capacity');disk.step='any';disk.placeholder='Keep current';const title=[...capacity.childNodes].find(node=>node.nodeType===3&&node.textContent.trim());if(title)title.textContent='Target capacity';const units=document.createElement('div');units.className='capacity-input';disk.replaceWith(units);units.append(disk);units.insertAdjacentHTML('beforeend','<select id="disk-size-unit" aria-label="Capacity unit" data-previous-unit="gib"><option value="gib">GiB</option><option value="gb">GB</option></select>');const oldHelp=$('.field-help',capacity);if(oldHelp)oldHelp.remove();capacity.insertAdjacentHTML('beforeend',helpHint('GiB uses 1024³ bytes; GB uses 1000³. Capacity is rounded up to a disk sector. File size is measured after export; boot migration can add capacity.','Target disk capacity'));
   $$('[data-partition]',direct).forEach(field=>{const part=studioImage().inspection.partitions.find(item=>item.device===field.dataset.partition),size=Math.ceil((part?.size||0)/MiB);field.insertAdjacentHTML('afterend',`<input type="range" class="direct-resize-slider" min="32" max="${Math.max(size*2,1024)}" value="${size}" step="1" data-partition-slider="${esc(field.dataset.partition)}" aria-label="Resize ${esc(field.dataset.partition)} in MiB">`);});
   $('#panel-export').insertAdjacentHTML('beforeend',renderPlatformStudio());
   compactStudioHelp($('#recipe-form'));
@@ -143,10 +147,11 @@ function updateStorageStudio() {
   if(!$('#storage-studio'))return;
   const inspection=studioImage()?.inspection||{},enabled=$('#storage-rebuild-enabled').checked;
   $('#storage-direct-options').hidden=enabled;$('#storage-plan-controls').hidden=!enabled;
-  $('#storage-fit-button').hidden=!enabled;
+  $('#storage-fit-button').hidden=!enabled;$('#storage-fit-help').hidden=!enabled;
   $('#storage-studio').classList.toggle('resizing',enabled);
   $$('[data-rebuild-controls]').forEach(node=>node.hidden=!enabled);
-  const before=Number(inspection.virtual_size)||0,raw=$('#disk-size').value,after=raw?getDiskCapacityBytes():before;
+  const before=Number(inspection.virtual_size)||0,raw=$('#disk-size').value,custom=Boolean(raw)||$('#storage-capacity-custom').checked,after=custom?(getDiskCapacityBytes()??NaN):before;
+  $('#storage-capacity-keep').checked=!custom;$('#storage-capacity-custom').checked=custom;$('#storage-capacity-field').hidden=!custom;$('#disk-size').required=custom;
   $('#storage-before').textContent=bytes(before);$('#storage-after').textContent=after>0?bytes(after):'Enter a valid size';$('#storage-reduction').textContent=reductionText(before,after);$('#storage-file-size').textContent=bytes(inspection.actual_size);$('#storage-exact-capacity').textContent=after>0?`${after.toLocaleString('en-US')} bytes`:'Enter a positive disk capacity.';
   const diskScale=Math.max(before,after||0,1);
   $('#storage-capacity-original').style.width=`${before/diskScale*100}%`;
@@ -183,7 +188,7 @@ function updateStorageStudio() {
     const alert=$('[data-fs-alert]',row);alert.hidden=!tooSmall&&!directShrink;alert.textContent=directShrink?'Turn on Resize to shrink XFS.':tooSmall?`Use at least ${bytes(minimum*MiB)} (${minimum.toLocaleString()} MiB).`:'';row.classList.toggle('size-blocked',Boolean(tooSmall||directShrink));
   }
   $$('[data-partition-slider]').forEach(slider=>{const field=$$('[data-partition]').find(node=>node.dataset.partition===slider.dataset.partitionSlider),part=sourceParts.find(item=>item.device===slider.dataset.partitionSlider);slider.max=Math.max(Number(slider.max),Number(field?.value)||0);slider.value=field?.value||Math.ceil((part?.size||0)/MiB);});
-  $('#filesystem-reduction').textContent=fsBefore===fsAfter?'':`Partitions: ${reductionText(fsBefore,fsAfter)}`;
+  $('#filesystem-reduction').textContent=fsBefore===fsAfter?'':`Filesystems: ${reductionText(fsBefore,fsAfter)}`;
   if(enabled&&plan)renderStoragePlan(plan);
   for(const button of [$('#storage-plan-button'),$('#storage-fit-button')])if(button)button.disabled=wizardInspectionPending()||Boolean(studioSession().storageFitPending)||button.getAttribute('aria-busy')==='true';
 }
@@ -234,9 +239,21 @@ async function fitStorageDisk() {
     await previewStorage();
   } finally {
     session.storageFitPending=false;
-    if(button.isConnected) {button.removeAttribute('aria-busy');button.innerHTML=icon('image')+'Fit disk to partitions';}
+    if(button.isConnected) {button.removeAttribute('aria-busy');button.innerHTML=icon('image')+'Fit to filesystems';}
     updateStorageStudio();wizardUpdate();
   }
+}
+function setStorageCapacityMode(mode) {
+  const field=$('#disk-size'),unit=$('#disk-size-unit').value,session=studioSession();
+  if(mode==='keep') {
+    if(field.value)session.customCapacity={value:field.value,unit};
+    field.value='';
+  } else if(!field.value) {
+    const saved=session.customCapacity;
+    field.value=saved?(saved.unit===unit?saved.value:String(Number(saved.value)*(saved.unit==='gb'?1e9:GiB)/(unit==='gb'?1e9:GiB))):String(Number(studioImage()?.inspection?.virtual_size||0)/(unit==='gb'?1e9:GiB));
+  }
+  field.dispatchEvent(new Event('input',{bubbles:true}));
+  if(mode==='custom')field.focus({preventScroll:true});
 }
 function syncFilesystemInput(device,fromDisplay=false) {
   const row=$$('[data-fs-device]').find(node=>node.dataset.fsDevice===device);if(!row)return;
@@ -393,12 +410,13 @@ document.addEventListener('input',event=>{
   if(input.dataset.rebuildSlider){const field=storageSizeInputs().find(node=>node.dataset.rebuildDevice===input.dataset.rebuildSlider);if(field)field.value=input.value;syncFilesystemInput(input.dataset.rebuildSlider);}
   if(input.dataset.fsSizeInput)syncFilesystemInput(input.dataset.fsSizeInput,true);
   if(input.dataset.rebuildDevice)syncFilesystemInput(input.dataset.rebuildDevice);
-  if(input.closest('#panel-storage'))invalidateStudioPlans('storage');
+  if(input.closest('#panel-storage')&&input.name!=='storage-capacity-mode')invalidateStudioPlans('storage');
   if(input.closest('#platform-controls'))invalidateStudioPlans('platform');
 });
 document.addEventListener('change',event=>{
   const input=event.target;
   if(input.name==='target'){if(input.value==='oci'&&studioSession().pendingOciPlatformSync)syncOciPlatformChoices();updatePlatformStudio();invalidateStudioPlans('platform');}
+  if(input.name==='storage-capacity-mode')setStorageCapacityMode(input.value);
   if(input.id==='disk-size-unit'){const previous=input.dataset.previousUnit||'gib',value=getDiskCapacityBytes(previous);if(value!==null)$('#disk-size').value=String(value/(input.value==='gb'?1e9:GiB));input.dataset.previousUnit=input.value;invalidateStudioPlans('storage');}
   if(input.dataset.fsSizeUnit){syncFilesystemInput(input.dataset.fsSizeUnit);invalidateStudioPlans('storage');}
   if(input.id==='storage-rebuild-enabled'){updateStorageStudio();invalidateStudioPlans('storage');}
@@ -416,5 +434,5 @@ document.addEventListener('change',event=>{
   }
 });
 
-window.addEventListener('scroll',()=>{const anchor=$('.help-anchor.open');if(!anchor)return;const rect=$('.help-toggle',anchor).getBoundingClientRect();if(rect.bottom<0||rect.top>innerHeight)closeHelp();else positionHelp(anchor);},{passive:true});
+window.addEventListener('scroll',()=>{const anchor=document.querySelector('.help-anchor.open');if(!anchor)return;const rect=anchor.querySelector('.help-toggle').getBoundingClientRect();if(rect.bottom<0||rect.top>innerHeight)closeHelp();else positionHelp(anchor);},{passive:true});
 window.addEventListener('resize',()=>closeHelp());

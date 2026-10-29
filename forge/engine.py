@@ -316,8 +316,8 @@ def _relabel_edited_files(g, paths):
 
 
 def _validate_recipe(recipe: dict, inspection: dict) -> None:
-    if recipe.get("mount_policy", "auto") not in {"auto", "preserve"}:
-        raise EngineError("Mount policy must be auto or preserve.")
+    if recipe.get("mount_policy", "auto") not in {"auto", "labels", "preserve"}:
+        raise EngineError("Mount policy must be auto, labels or preserve.")
     if normalize_arch(inspection.get("os", {}).get("arch")) not in SUPPORTED_ARCHES:
         raise EngineError("A detected x86_64 or ARM64 (aarch64) guest architecture is required; refresh inspection.")
     execution_error = recipe_execution_blocker(inspection, recipe)
@@ -551,7 +551,7 @@ class ImageEngine:
             with _guest(work, "qcow2", readonly=False) as g:
                 _mount(g, _roots(g), False)
                 for item in files:
-                    if item["path"] == "/etc/fstab" and recipe.get("mount_policy", "auto") == "auto":
+                    if item["path"] == "/etc/fstab" and recipe.get("mount_policy", "auto") != "preserve":
                         _write_guest(g, item["path"], item["content"], validate_mounts=False)
                     else:
                         _write_guest(g, item["path"], item["content"])

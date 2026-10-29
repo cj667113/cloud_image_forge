@@ -11,6 +11,13 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
 
+MountPolicy = Literal["auto", "labels", "preserve"]
+
+
+class MountPlanRequest(StrictModel):
+    mount_policy: MountPolicy = "auto"
+
+
 class ObjectLocation(StrictModel):
     url: str = Field(min_length=1, max_length=16384)
     endpoint_url: str | None = Field(default=None, max_length=2048)
@@ -164,7 +171,7 @@ class Recipe(StrictModel):
     storage_rebuild: StorageRebuild | None = None
     platform_migration: PlatformMigration | None = None
     ssh_access: SSHAccess | None = None
-    mount_policy: Literal["auto", "preserve"] = "auto"
+    mount_policy: MountPolicy = "auto"
     oci: OciConfig | None = None
 
     @field_validator("packages_install", "packages_remove")
@@ -211,7 +218,7 @@ class OciPlanRequest(StrictModel):
     allow_network: bool = False
     boot_migration: BootMigration | None = None
     platform_migration: PlatformMigration | None = None
-    mount_policy: Literal["auto", "preserve"] = "auto"
+    mount_policy: MountPolicy = "auto"
 
 
 class UefiPlanRequest(StrictModel):
@@ -222,7 +229,7 @@ class UefiPlanRequest(StrictModel):
 class StoragePlanRequest(StrictModel):
     storage_rebuild: StorageRebuild
     disk_size_gib: float | None = Field(default=None, gt=0, le=2048)
-    mount_policy: Literal["auto", "preserve"] = "auto"
+    mount_policy: MountPolicy = "auto"
 
 
 class PlatformPlanRequest(StrictModel):
@@ -231,7 +238,7 @@ class PlatformPlanRequest(StrictModel):
     target: Literal["oci", "aws", "azure", "gcp", "generic"] = "oci"
     oci: OciConfig | None = None
     boot_migration: BootMigration | None = None
-    mount_policy: Literal["auto", "preserve"] = "auto"
+    mount_policy: MountPolicy = "auto"
 
 
 class DestinationSelection(StrictModel):

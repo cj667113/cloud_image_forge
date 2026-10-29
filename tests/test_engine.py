@@ -456,7 +456,7 @@ class BuildTests(unittest.TestCase):
                 self.assertEqual(source.read_bytes(), original)
 
     def run_build(self, *, output_format="qcow2", compare_failure=False, virtual_size=10 * GIB,
-                  guest_arch="x86_64", architecture_change=False):
+                  guest_arch="x86_64", architecture_change=False, mount_policy="auto"):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         directory = Path(temp.name)
@@ -487,13 +487,21 @@ class BuildTests(unittest.TestCase):
             if compare_failure or architecture_change:
                 with self.assertRaisesRegex(EngineError, "guest CPU architecture" if architecture_change else "bytes differ"):
                     engine.build(source, directory / "build", info,
-                                 {"output_format": output_format, "sparsify": False}, lambda _: None)
+                                 {"output_format": output_format, "sparsify": False, "mount_policy": mount_policy}, lambda _: None)
                 result = None
             else:
                 result = engine.build(source, directory / "build", info,
-                                      {"output_format": output_format, "sparsify": False}, lambda _: None)
+                                      {"output_format": output_format, "sparsify": False, "mount_policy": mount_policy}, lambda _: None)
         self.assertEqual(source.read_bytes(), baseline)
         return result, commands
+
+    def test_labels_policy_is_carried_through_reconciliation_and_published_receipt(self):
+        result, commands = self.run_build(mount_policy="labels")
+        self.assertEqual(result["mount_reconciliation"]["policy"], "labels")
+        self.assertEqual(len(self.reconcile_mounts.call_args_list), 2)
+        self.assertTrue(all(call.args[2] == "labels" for call in self.reconcile_mounts.call_args_list))
+        self.verify_mounts.assert_called_once()
+        self.assertTrue(any(command[:2] == ["qemu-img", "compare"] for command in commands))
 
     def test_arm_export_retains_architecture_and_changes_block_publication(self):
         result, _ = self.run_build(guest_arch="aarch64")

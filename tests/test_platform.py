@@ -287,19 +287,43 @@ class PlanTests(unittest.TestCase):
         source["platform"]["kernels"]["second"] = {"modules": [], "builtin": []}
         self.assertTrue(any("automatic bundle" in error for error in plan_platform(source, profile)["blockers"]))
 
-    def test_mount_preserve_validates_but_does_not_normalize_existing_reference(self):
+    def test_mount_preserve_blocks_raw_names_independently_of_replacement(self):
         source = image()
         entry = source["platform"]["fstab"]["entries"][0]
         entry.update(source="/dev/sda1", reason="Resolved current filesystem identity")
         automatic = plan_platform(source, options())
         self.assertTrue(automatic["fstab_changes"])
         preserved = plan_platform(source, options(), mount_policy="preserve")
-        self.assertTrue(preserved["ready"], preserved["blockers"])
+        self.assertFalse(preserved["ready"])
+        self.assertTrue(any("verified stable" in error for error in preserved["blockers"]))
         self.assertFalse(preserved["fstab_changes"])
         entry.update(source="UUID=stale", reason="Reconciled against independently inspected root")
         preserved = plan_platform(source, options(), mount_policy="preserve")
         self.assertFalse(preserved["ready"])
-        self.assertTrue(any("does not resolve" in error for error in preserved["blockers"]))
+        self.assertTrue(any("verified stable" in error for error in preserved["blockers"]))
+
+    def test_hardware_mount_preserve_accepts_verified_stable_sources_only(self):
+        from forge.storage import reconcile_fstab
+        source = image()
+        inventory = [{"device": "/dev/vg/root", "filesystem": "ext4", "uuid": ROOT_UUID,
+                      "label": "Root FS", "lv_uuid": "verified-lv-id", "aliases": ["/dev/mapper/vg-root"]}]
+        for selector, ready in [("UUID=" + ROOT_UUID, True), (r"LABEL=Root\040FS", True),
+                                ("/dev/mapper/vg-root", True), ("/dev/vg/root", True),
+                                ("/dev/sda2", False), ("/dev/vda2", False)]:
+            with self.subTest(selector=selector):
+                inventory[0]["aliases"] = ["/dev/mapper/vg-root", "/dev/sda2", "/dev/vda2"]
+                text = f"{selector} / ext4 defaults 0 1\n"
+                evidence = reconcile_fstab(text, inventory, root_device="/dev/vg/root")
+                evidence.update(filesystems=deepcopy(inventory), root_device="/dev/vg/root", mounted={"/": "/dev/vg/root"})
+                source["platform"]["fstab"] = evidence
+                plan = plan_platform(source, options(), mount_policy="preserve")
+                self.assertEqual(plan["ready"], ready, plan["blockers"])
+                self.assertFalse(plan["fstab_changes"])
+        inventory.append({**inventory[0], "device": "/dev/other/root", "uuid": "other-uuid"})
+        source["platform"]["fstab"]["filesystems"] = inventory
+        source["platform"]["fstab"]["source_content"] = r"LABEL=Root\040FS / ext4 defaults 0 1" + "\n"
+        source["platform"]["fstab"]["sha256"] = hashlib.sha256(source["platform"]["fstab"]["source_content"].encode()).hexdigest()
+        self.assertFalse(plan_platform(source, options(), mount_policy="preserve")["ready"])
 
     def test_ubuntu_dracut_archive_overrides_update_initramfs_command_name(self):
         source = image()
@@ -710,6 +734,21 @@ class IscsiInitramfsTests(unittest.TestCase):
 
 
 class VerificationTests(unittest.TestCase):
+    def test_label_policy_survives_platform_preparation_and_final_verification(self):
+        source = image()
+        source["platform"]["fstab"] = _fstab_evidence(Guest({"/etc/fstab": FSTAB}), "/dev/sda1")
+        before = deepcopy(source)
+        plan = plan_platform(source, options(), mount_policy="labels")
+        self.assertTrue(plan["ready"], plan["blockers"])
+        self.assertEqual(plan["fstab_content"], "LABEL=root / ext4 defaults 0 1\n")
+        self.assertEqual(source, before)
+        # Full inspection still produces the default UUID preview. Final
+        # verification must re-evaluate the selected label policy, not undo it.
+        source["platform"]["fstab"] = _fstab_evidence(Guest({"/etc/fstab": plan["fstab_content"]}), "/dev/sda1")
+        self.assertTrue(verify_platform(source, options(), mount_policy="labels")["ready"])
+        self.assertFalse(verify_platform(source, options(), mount_policy="auto")["ready"])
+        self.assertEqual(_adapt_args([], plan, options()), ["root=UUID=" + ROOT_UUID])
+
     def test_generated_mapper_and_uuid_must_both_resolve_to_actual_root(self):
         source = image()
         evidence = source["platform"]

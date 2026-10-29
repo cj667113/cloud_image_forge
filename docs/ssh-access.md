@@ -4,8 +4,8 @@ The **Access** wizard step is optional. Leaving it unchanged preserves the image
 
 ## Choose the access changes
 
-- **Disable SSH password login** disables both password and keyboard-interactive authentication. It can be selected independently of key uploads when the image already has suitable keys or the cloud provider will provision them.
-- **Add user keys** appends public keys to an existing local account. Select an inspected username or enter one manually. Refresh inspection to populate the account list for an older import.
+- **Disable password login** disables both password and keyboard-interactive authentication. It can be selected independently of key uploads when the image already has suitable keys or the cloud provider will provision them.
+- **Add user** adds a user card that appends public keys to an existing local account. Select an inspected username or enter one manually. Refresh inspection to populate the account list for an older import.
 - **Create this user** creates a local account with a home directory, an unusable password and no added administrator privileges. It requires an unused username and at least one public key.
 
 Paste one OpenSSH public key per line or select `.pub` files. Supported keys are Ed25519, RSA of 2048–8192 bits, and ECDSA using NIST P-256/P-384/P-521. Private keys, certificates, and newly supplied `authorized_keys` options are rejected. Existing key lines and their restrictions are retained; duplicate key material is not appended again. Each recipe allows up to 16 users and 32 keys per user. Review shows key counts and SHA-256 fingerprints rather than full key material.

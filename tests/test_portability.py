@@ -77,6 +77,23 @@ def test_observed_generic_oci_existing_configuration_passes_without_rewrites():
     assert source == before
 
 
+def test_preserve_accepts_only_uniquely_proven_existing_label_mounts():
+    from forge.storage import reconcile_fstab
+    source = image()
+    device = deepcopy(source["platform"]["portability"]["local_devices"][0])
+    device["label"] = "Root FS"
+    text = r"LABEL=Root\040FS / xfs defaults 0 1" + "\n"
+    fstab = reconcile_fstab(text, [device], root_device=device["device"])
+    fstab.update(filesystems=[device], root_device=device["device"], mounted={"/": device["device"]})
+    source["platform"]["fstab"] = fstab
+    before = deepcopy(source)
+    result = plan_platform(source, options(), mount_policy="labels")
+    assert result["ready"], result["blockers"]
+    assert source == before and result["fstab_changes"] == []
+    fstab["filesystems"].append({**device, "device": "/dev/other/root", "uuid": "other-uuid"})
+    assert not plan_platform(source, options(), mount_policy="labels")["ready"]
+
+
 def test_preserve_and_reconfigure_allow_same_machine_type():
     assert plan_platform(image(), options(source="vm"))["ready"]
     result = plan_platform(image(), options(strategy="reconfigure", source="vm"))

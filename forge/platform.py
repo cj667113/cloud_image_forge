@@ -508,8 +508,14 @@ def plan_platform(inspection, options, allow_network=False, oci_config=None, tar
         return plan
     arch = normalize_arch(inspection.get("os", {}).get("arch"))
     plan.update(architecture=arch, serial_device=_serial_device(arch))
-    if mount_policy not in {"auto", "preserve"}:
-        plan["blockers"].append("Mount policy must be auto or preserve.")
+    if mount_policy not in {"auto", "labels", "preserve"}:
+        plan["blockers"].append("Mount policy must be auto, labels or preserve.")
+    if mount_policy == "labels" and plan["strategy"] == "preserve":
+        from .storage import plan_mounts
+        mounts = plan_mounts(inspection, mount_policy)
+        plan["blockers"].extend(mounts.get("errors", []))
+        plan["warnings"].extend(mounts.get("warnings", []))
+        plan["mount_entries"] = mounts.get("entries", [])
     if plan["strategy"] == "preserve":
         return _plan_preserve(inspection, options, plan, oci_config, target_provider, boot_migration, allow_network)
     if plan["strategy"] != "reconfigure":
@@ -638,19 +644,30 @@ def plan_platform(inspection, options, allow_network=False, oci_config=None, tar
     plan["packages"] = sorted(packages)
     if packages:
         actions.append("Install guest repository packages: " + ", ".join(sorted(packages)))
-    fstab = evidence.get("fstab", {})
+    from .storage import mount_plan_for_policy
+    fstab = mount_plan_for_policy(evidence.get("fstab", {}), mount_policy,
+                                  inspection.get("files", {}).get("/etc/fstab"))
     blockers.extend(fstab.get("errors", []))
     plan["root_uuid"] = fstab.get("root_uuid")
+    plan["fstab_content"] = fstab.get("content")
+    plan["mount_entries"] = fstab.get("entries", [])
+    warnings.extend(fstab.get("warnings", []))
     if not UUID.fullmatch(plan["root_uuid"] or ""):
         blockers.append("A unique root filesystem UUID is required.")
     plan["fstab_changes"] = [{"line": item["line"], "mountpoint": item["mountpoint"], "from": item["source"], "to": item["replacement"]}
                              for item in fstab.get("entries", []) if item.get("replacement") and item["source"] != item["replacement"]]
     if mount_policy == "preserve":
+        from .portability import stable_mount_source
+        devices = evidence.get("portability", {}).get("local_devices") or inspection.get("partitions", [])
         for item in fstab.get("entries", []):
-            if item.get("reason", "").startswith("Reconciled"):
-                blockers.append(f"Preserved mount {item['mountpoint']} does not resolve through its existing reference; select automatic mount reconciliation or repair it explicitly.")
+            if item.get("optional") or item.get("preserve") and item.get("mountpoint") != "/":
+                continue
+            if item.get("reason", "").startswith("Reconciled") or not stable_mount_source(item, fstab, devices):
+                blockers.append(f"Preserved mount {item['mountpoint']} needs a verified stable label, UUID or LVM name for hardware preparation; select automatic mount reconciliation or repair it explicitly.")
         plan["fstab_changes"] = []
         actions.append("Validate existing local mount references without rewriting fstab; use the actual root filesystem UUID for boot arguments.")
+    elif mount_policy == "labels":
+        actions.append("Prefer unique existing filesystem labels for local fstab mounts, with explicit UUID fallback; retain filesystem identities and the verified UUID root boot argument.")
     else:
         actions.append("Use existing filesystem UUIDs for local fstab mounts and the root boot argument; retain mount options and filesystem identities.")
     actions.append("Build generic initramfs for every non-rescue installed kernel and verify each required driver; preserve unrelated installed drivers.")
@@ -901,7 +918,7 @@ def verify_platform(inspection, options, *, oci_config=None, target_provider="oc
     blockers = plan["blockers"]
     evidence = inspection.get("platform") or {}
     if plan["fstab_changes"]:
-        blockers.append("Local fstab entries are not all using the prepared filesystem UUIDs.")
+        blockers.append("Local fstab entries do not match the selected mount reference policy.")
     required = set(plan["required_modules"])
     proven = (receipt or {}).get("verified_initrds", {})
     for version, kernel in evidence.get("kernels", {}).items():
@@ -989,8 +1006,8 @@ def prepare_platform(work: Path, inspection, options, allow_network, log, *, oci
             fstab = _read(g, "/etc/fstab")
             if hashlib.sha256(fstab.encode()).hexdigest() != evidence["fstab"]["sha256"]:
                 raise ValueError("fstab changed after platform inspection.")
-            changed = ((evidence["fstab"].get("content") or _fstab_text(fstab, plan["fstab_changes"]))
-                       if mount_policy == "auto" else fstab)
+            changed = ((plan.get("fstab_content") or _fstab_text(fstab, plan["fstab_changes"]))
+                       if mount_policy != "preserve" else fstab)
             _validate_fstab(changed, g)
             if changed != fstab:
                 _write(g, "/etc/fstab", changed, backup)

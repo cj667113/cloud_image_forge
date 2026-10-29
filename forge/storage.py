@@ -30,6 +30,7 @@ ARCHIVE_OPTIONS = {"compress": "gzip", "xattrs": True, "selinux": True, "acls": 
 QUOTA_OPTIONS = {"quota", "qnoenforce", "uquota", "usrquota", "uqnoenforce", "gquota", "grpquota",
                  "gqnoenforce", "pquota", "prjquota", "pqnoenforce", "usrjquota", "grpjquota", "jqfmt"}
 LVM_PIN_ERROR = "Boot or mount configuration pins internal LVM UUIDs; this workflow preserves names and filesystem UUIDs only"
+MOUNT_POLICIES = {"auto", "labels", "preserve"}
 
 
 class StorageError(RuntimeError):
@@ -45,6 +46,16 @@ def _fstab_unescape(value):
     if any(character in value for character in "\0\r\n"):
         raise StorageError("Mount references cannot contain NUL or line breaks")
     return value
+
+
+def _label_reference(label):
+    # Existing labels only. Quotes/backslashes/control characters have differing
+    # parser behavior across fstab consumers; prefer the already verified UUID.
+    if (not isinstance(label, str) or not label or len(label.encode("utf-8")) > 256
+            or any(character in label for character in "\\\"'")
+            or any(not character.isprintable() and character != "\t" for character in label)):
+        return None
+    return "LABEL=" + label.replace(" ", r"\040").replace("\t", r"\011")
 
 
 def _filesystem_pairs(before, after):
@@ -71,7 +82,7 @@ def _filesystem_pairs(before, after):
     return [pair for pair in pairs if counts[pair["after"]["device"]] == 1]
 
 
-def reconcile_fstab(text, filesystems, *, root_device, mounted=None, previous_filesystems=None):
+def reconcile_fstab(text, filesystems, *, root_device, mounted=None, previous_filesystems=None, policy="auto"):
     """Plan UUID references using actual filesystems and an inspected OS root.
 
     ``mounted`` is an independently observed mountpoint→device map, not fstab's
@@ -79,11 +90,15 @@ def reconcile_fstab(text, filesystems, *, root_device, mounted=None, previous_fi
     ``root_device``. Other stale references require an actual mount or a unique
     before→after GPT/LV identity. Filesystem UUIDs are never generated/changed.
     """
-    result = {"version": 1, "ready": False, "errors": [], "warnings": [], "entries": [], "changes": [],
+    result = {"version": 1, "policy": policy, "ready": False, "errors": [], "warnings": [], "entries": [], "changes": [],
+              "source_content": text,
               "content": text, "sha256": hashlib.sha256(text.encode()).hexdigest(), "root_uuid": None,
               "uuid_map": [], "root_uuid_changed": False, "boot_update_required": False,
               "boot_reference_check_required": False}
     errors = result["errors"]
+    if policy not in {"auto", "labels"}:
+        errors.append("Mount reference generation requires auto or labels policy")
+        return result
     if len(text.encode()) > 2 * MIB or len(text.splitlines()) > 4096 or "\0" in text:
         errors.append("fstab exceeds the bounded text/line limit or contains NUL bytes")
         return result
@@ -241,11 +256,26 @@ def reconcile_fstab(text, filesystems, *, root_device, mounted=None, previous_fi
             continue
         if expected and current["device"] != expected["device"]:
             errors.append(f"fstab line {number}: identity map conflicts with the observed {mount}")
-        replacement = "UUID=" + current["uuid"]
-        entry.update({"device": current["device"], "uuid": current["uuid"], "replacement": replacement, "reason": reason})
+        replacement, reference_kind, fallback = "UUID=" + current["uuid"], "uuid", None
+        if policy == "labels":
+            label = current.get("label")
+            label_reference = _label_reference(label)
+            if not label:
+                fallback = "Filesystem has no label; using its existing UUID"
+            elif label_reference is None:
+                fallback = "Existing label cannot be represented safely; using its existing UUID"
+            elif len(label_index.get(label, [])) != 1:
+                fallback = "Existing label is not unique on this disk; using its existing UUID"
+            else:
+                replacement, reference_kind = label_reference, "label"
+            if fallback:
+                result["warnings"].append(f"{mount}: {fallback}")
+        entry.update({"device": current["device"], "uuid": current["uuid"], "replacement": replacement, "reason": reason,
+                      "reference_kind": reference_kind, "fallback_reason": fallback})
         if fields[0] != replacement:
             result["changes"].append({"line": number, "mountpoint": mount, "from": fields[0], "to": replacement,
-                                       "device": current["device"], "reason": reason})
+                                       "device": current["device"], "reason": reason,
+                                       "reference_kind": reference_kind, "fallback_reason": fallback})
             if (mount in {"/", "/boot", "/boot/efi", "/efi"} or current.get("partition_type") == EFI_GUID) and reason.startswith("Reconciled"):
                 result["boot_reference_check_required"] = True
             changed_lines.append(line[:tokens[0].start()] + replacement + line[tokens[0].end():])
@@ -260,6 +290,52 @@ def reconcile_fstab(text, filesystems, *, root_device, mounted=None, previous_fi
     if result["ready"]:
         result["content"] = "".join(changed_lines)
     return result
+
+
+def mount_plan_for_policy(evidence, policy="auto", source_text=None, *, require_original=False):
+    """Pure policy preview from verified original text and inspected identities.
+
+    Older UUID previews remain usable. The new label policy requires complete
+    identity evidence and exact original fstab bytes, never reconstructed text.
+    """
+    if policy not in MOUNT_POLICIES:
+        return {"version": 1, "policy": policy, "ready": False, "errors": ["Mount policy must be auto, labels or preserve"],
+                "warnings": [], "entries": [], "changes": []}
+    evidence = deepcopy(evidence or {})
+    text = evidence.get("source_content", source_text)
+    complete = (isinstance(text, str) and len(text.encode()) <= MIB
+                and hashlib.sha256(text.encode()).hexdigest() == evidence.get("sha256")
+                and bool(evidence.get("filesystems")) and bool(evidence.get("root_device"))
+                and isinstance(evidence.get("mounted"), dict))
+    if complete:
+        result = reconcile_fstab(text, evidence["filesystems"], root_device=evidence["root_device"],
+                                 mounted=evidence["mounted"], policy="labels" if policy == "labels" else "auto")
+        for key in ("filesystems", "root_device", "mounted", "file_state"):
+            if key in evidence:
+                result[key] = deepcopy(evidence[key])
+        result["warnings"] = list(dict.fromkeys(evidence.get("warnings", []) + result["warnings"]))
+    elif require_original or policy == "labels" or not evidence:
+        return {"version": 1, "policy": policy, "ready": False,
+                "errors": ["Mount policy preview needs verified original fstab and filesystem identity evidence; refresh inspection"],
+                "warnings": [], "entries": [], "changes": [], "root_uuid": evidence.get("root_uuid")}
+    else:
+        result = evidence
+    result["policy"] = policy
+    result["mounts_validated"] = bool(result.get("ready"))
+    if policy == "preserve":
+        result["changes"] = []
+        if complete:
+            result["content"] = text
+        for entry in result.get("entries", []):
+            entry["replacement"] = entry["source"]
+        if result.get("errors"):
+            result.setdefault("warnings", []).append("Existing unresolved mount references will be retained, not repaired or certified")
+    return result
+
+
+def plan_mounts(inspection, policy="auto", *, require_original=False):
+    evidence = inspection.get("mount_reconciliation") or inspection.get("platform", {}).get("fstab", {})
+    return mount_plan_for_policy(evidence, policy, inspection.get("files", {}).get("/etc/fstab"), require_original=require_original)
 
 
 def _prior_mount_filesystems(inspection):
@@ -367,7 +443,7 @@ def _fstab_state(g):
                   "mode": stat["st_mode"] & 0o7777, "uid": stat["st_uid"], "gid": stat["st_gid"]}
 
 
-def inspect_mount_references(g, root, partitions=None, previous_inspection=None):
+def inspect_mount_references(g, root, partitions=None, previous_inspection=None, *, policy="auto"):
     """Read-only preview, with the inspected root already mounted.
 
     ``partitions`` is accepted for the platform inspector's shared interface but
@@ -393,7 +469,7 @@ def inspect_mount_references(g, root, partitions=None, previous_inspection=None)
         for item in filesystems:
             item["aliases"] = sorted(set(item["aliases"]) - {item["device"]})
         result = reconcile_fstab(text, filesystems, root_device=root_device, mounted=mounted,
-                                 previous_filesystems=_prior_mount_filesystems(previous_inspection))
+                                 previous_filesystems=_prior_mount_filesystems(previous_inspection), policy=policy)
         result.update(filesystems=filesystems, root_device=root_device, mounted=mounted, file_state=state)
         result["warnings"] = list(dict.fromkeys(warnings + result["warnings"]))
         return result
@@ -403,12 +479,12 @@ def inspect_mount_references(g, root, partitions=None, previous_inspection=None)
                 "root_uuid": None, "boot_update_required": False, "boot_reference_check_required": False}
 
 
-def _inspect_mount_image(path, previous_inspection=None):
+def _inspect_mount_image(path, previous_inspection=None, *, policy="auto"):
     from .engine import _guest, _roots
     with _guest(path, "qcow2", readonly=True) as g:
         root = _roots(g)
         g.mount_ro(root, "/")
-        return inspect_mount_references(g, root, previous_inspection=previous_inspection)
+        return inspect_mount_references(g, root, previous_inspection=previous_inspection, policy=policy)
 
 
 def reconcile_mounts(work: Path, previous_inspection=None, policy="auto", log=lambda message: None):
@@ -419,35 +495,37 @@ def reconcile_mounts(work: Path, previous_inspection=None, policy="auto", log=la
     boot filesystem UUID changes require a separate verified boot update and
     are deliberately refused here; transport changes do not alter UUIDs.
     """
-    if policy not in {"auto", "preserve"}:
-        raise StorageError("Mount policy must be auto or preserve")
-    plan = _inspect_mount_image(work, previous_inspection)
+    if policy not in MOUNT_POLICIES:
+        raise StorageError("Mount policy must be auto, labels or preserve")
+    generation_policy = "labels" if policy == "labels" else "auto"
+    plan = _inspect_mount_image(work, previous_inspection, policy=generation_policy)
     if not plan.get("file_state"):
         raise StorageError("; ".join(plan["errors"]))
-    if policy == "auto" and not plan["ready"]:
+    if policy != "preserve" and not plan["ready"]:
         raise StorageError("; ".join(plan["errors"]))
-    if policy == "auto" and plan["boot_update_required"]:
+    if policy != "preserve" and plan["boot_update_required"]:
         raise StorageError("A boot filesystem UUID changed: update and verify its GRUB and initramfs references before mount reconciliation")
-    changed = policy == "auto" and bool(plan["changes"])
+    changed = policy != "preserve" and bool(plan["changes"])
     if changed:
         from .engine import _guest, _roots, _write_guest, _relabel_edited_files
         with _guest(work, "qcow2", readonly=False) as g:
             root = _roots(g)
             g.mount(root, "/")
-            current = inspect_mount_references(g, root, previous_inspection=previous_inspection)
+            current = inspect_mount_references(g, root, previous_inspection=previous_inspection, policy=generation_policy)
             if (not current["ready"] or current["file_state"] != plan["file_state"]
                     or current["filesystems"] != plan["filesystems"] or current["root_uuid"] != plan["root_uuid"]):
                 raise StorageError("Mount identities or fstab changed after reconciliation preflight")
             _write_guest(g, "/etc/fstab", plan["content"])
             _relabel_edited_files(g, ["/etc/fstab"])
-        log(f"Reconciled {len(plan['changes'])} local mount reference(s) against actual filesystem UUIDs")
-    final = _inspect_mount_image(work)
+        log(f"Reconciled {len(plan['changes'])} local mount reference(s) against actual filesystem identities")
+    final = _inspect_mount_image(work, policy=generation_policy)
     expected_hash = hashlib.sha256(plan["content"].encode()).hexdigest() if changed else plan["file_state"]["sha256"]
     if not final.get("file_state") or final["file_state"]["sha256"] != expected_hash:
         raise StorageError("Mount reconciliation readback did not match the expected fstab")
     receipt = {"version": 1, "policy": policy, "changed": changed,
                "changes": plan["changes"] if changed else [], "uuid_map": plan["uuid_map"],
                "root_uuid": final["root_uuid"], "file_state": final["file_state"], "filesystems": final["filesystems"],
+               "entries": final["entries"],
                "mounts_validated": final["ready"], "warnings": list(plan["warnings"]),
                "boot_reference_check_required": changed and plan["boot_reference_check_required"]}
     if policy == "preserve" and plan["errors"]:
@@ -463,7 +541,10 @@ def verify_mounts(work: Path, receipt, *, inspection=None):
     blockers = []
     if not receipt or receipt.get("version") != 1 or not receipt.get("file_state") or not receipt.get("filesystems"):
         return {"ready": False, "blockers": ["Mount verification receipt is missing or incomplete"]}
-    current = inspection if inspection is not None else _inspect_mount_image(work)
+    policy = receipt.get("policy", "auto")
+    if policy not in MOUNT_POLICIES:
+        return {"ready": False, "blockers": ["Mount verification receipt has an unsupported policy"]}
+    current = inspection if inspection is not None else _inspect_mount_image(work, policy="labels" if policy == "labels" else "auto")
     if current.get("file_state") != receipt["file_state"]:
         blockers.append("fstab content or ownership/mode changed after mount reconciliation")
     if current.get("root_uuid") != receipt.get("root_uuid"):
@@ -473,11 +554,12 @@ def verify_mounts(work: Path, receipt, *, inspection=None):
     after = {item["device"]: tuple(item.get(field) for field in identity_fields) for item in current.get("filesystems", [])}
     if before != after:
         blockers.append("Output filesystem identities changed after mount reconciliation")
-    if receipt.get("policy") == "auto" and (not current.get("ready") or current.get("changes")):
+    if policy != "preserve" and (not current.get("ready") or current.get("changes")):
         blockers.extend(current.get("errors", []))
-        blockers.append("Output local mount references no longer match their reconciled UUIDs")
+        blockers.append("Output local mount references no longer match the selected policy and filesystem identities")
     return {"ready": not blockers, "blockers": list(dict.fromkeys(blockers)),
             "root_uuid": current.get("root_uuid"), "filesystems": current.get("filesystems", []),
+            "entries": current.get("entries", []),
             "mounts_validated": current.get("ready", False), "actual_file_state": current.get("file_state")}
 
 
@@ -784,12 +866,15 @@ def plan_rebuild(inspection: dict, options: dict | None, disk_size_gib=None, *, 
         errors.append("Storage rebuild evidence is missing; refresh inspection")
         return result
     source_errors = list(storage.get("errors", []))
-    if mount_policy not in {"auto", "preserve"}:
-        errors.append("Mount policy must be auto or preserve")
+    if mount_policy not in MOUNT_POLICIES:
+        errors.append("Mount policy must be auto, labels or preserve")
     pins = storage.get("lvm_identity_pins", {})
-    mount = inspection.get("mount_reconciliation") or inspection.get("platform", {}).get("fstab", {})
+    mount = plan_mounts(inspection, mount_policy)
+    if mount_policy == "labels":
+        errors.extend(mount.get("errors", []))
+        warnings.extend(mount.get("warnings", []))
     initrds_checked = bool(storage.get("initramfs")) and all(item.get("status") == "checked" for item in storage["initramfs"])
-    if (mount_policy == "auto" and LVM_PIN_ERROR in source_errors
+    if (mount_policy != "preserve" and LVM_PIN_ERROR in source_errors
             and pins.get("version") == 1 and pins.get("config_scan_complete")
             and initrds_checked
             and pins.get("paths") == ["/etc/fstab"] and mount.get("ready") and mount.get("changes")

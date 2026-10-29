@@ -125,6 +125,37 @@ def _resolve_root(value, devices, root_uuid):
     return len(matches) == 1 and matches[0].get("mountpoint") == "/" and matches[0].get("uuid") == root_uuid
 
 
+def stable_mount_source(entry, fstab, devices=()):
+    """Prove a retained selector independently of a suggested replacement.
+
+    Raw appliance device names never establish transport portability, even
+    when they currently resolve. LVM names need actual LV metadata/aliases.
+    """
+    from .storage import _fstab_unescape, StorageError
+    records = fstab.get("filesystems") or devices
+    identity = entry.get("uuid") or (fstab.get("root_uuid") if entry.get("mountpoint") == "/" else None)
+    candidates = [item for item in records if identity and (item.get("uuid") or "").lower() == identity.lower()]
+    if len(candidates) != 1 or (entry.get("device") and entry["device"] != candidates[0].get("device")):
+        return False
+    try:
+        source = _fstab_unescape(entry.get("source", ""))
+    except StorageError:
+        return False
+    for prefix, field in (("UUID=", "uuid"), ("/dev/disk/by-uuid/", "uuid"),
+                          ("LABEL=", "label"), ("/dev/disk/by-label/", "label")):
+        if source.startswith(prefix):
+            value = source[len(prefix):]
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            selected = [item for item in records if value and
+                        ((item.get(field) or "").lower() == value.lower() if field == "uuid" else item.get(field) == value)]
+            return len(selected) == 1 and selected[0].get("device") == candidates[0].get("device")
+    candidate = candidates[0]
+    named_lv = bool(re.fullmatch(r"/dev/mapper/[^/]+|/dev/(?!disk/|mapper/)[^/]+/[^/]+", source))
+    return (named_lv and bool(candidate.get("is_lv") or candidate.get("lv_uuid"))
+            and source in {candidate.get("device"), *candidate.get("aliases", [])})
+
+
 def _boot_entries(evidence):
     from .platform import _boot_args, _grub_commands
     kernels = evidence.get("kernels", {})
@@ -317,14 +348,10 @@ def assess_portability(inspection, options, target_provider="oci"):
     root_uuid = fstab.get("root_uuid")
     mounts = list(fstab.get("errors", []))
     for entry in fstab.get("entries", []):
-        source = entry.get("source", "")
         if entry.get("optional") or entry.get("preserve") and entry.get("mountpoint") != "/":
             continue
-        candidates = [item for item in devices if item.get("uuid") == entry.get("uuid")]
-        stable = source.startswith("UUID=") and len(candidates) == 1 and source[5:].lower() == (entry.get("uuid") or "").lower()
-        stable |= len(candidates) == 1 and candidates[0].get("is_lv", False) and source in candidates[0].get("aliases", [])
-        if not stable:
-            mounts.append(f"Mount {entry.get('mountpoint')}: existing source is not a verified local filesystem UUID or LVM name.")
+        if not stable_mount_source(entry, fstab, devices):
+            mounts.append(f"Mount {entry.get('mountpoint')}: existing source is not a verified unique filesystem label, UUID or LVM name.")
     repeated = set()
     seen = set()
     for entry in fstab.get("entries", []):
@@ -338,7 +365,7 @@ def assess_portability(inspection, options, target_provider="oci"):
         result["warnings"].append("Identical duplicate swap entries are retained: " + ", ".join(sorted(repeated)) + ". Their presence alone is not treated as a boot failure.")
     if not root_uuid or not any(item.get("mountpoint") == "/" and item.get("uuid") == root_uuid for item in devices):
         mounts.append("A unique local root filesystem could not be resolved.")
-    check("mounts", "Stable local mounts", "blocked" if mounts else "ready", mounts or ["Existing UUID/LVM mount identities resolve to this disk; rewriting fstab is unnecessary."])
+    check("mounts", "Stable local mounts", "blocked" if mounts else "ready", mounts or ["Existing label/UUID/LVM mount identities resolve to this disk; rewriting fstab is unnecessary."])
     boot, network, nic = options.get("boot_attachment"), options.get("network_attachment"), options.get("nic_driver")
     from .oci_guest import verified_nic_bundle
     nic_modules = verified_nic_bundle(evidence.get("kernels", {})) if nic == "auto" else [nic] if nic in NIC_DRIVERS else []

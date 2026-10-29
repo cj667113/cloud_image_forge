@@ -279,7 +279,7 @@ function wizardRenderReview() {
   startup.push(...recipe.files.filter(file => /\/cron|\/systemd\//.test(file.path)).map(file => `Edit ${file.path}`));
   add('Startup','startup',startup.length ? startup : ['Unchanged'],Boolean(startup.length));
   add('SSH access','access',sshAccessReview(recipe.ssh_access),Boolean(recipe.ssh_access));
-  add('Mounts','mounts',[recipe.mount_policy==='auto'?'Use filesystem UUIDs for local mounts':'Keep current mount identifiers',...(recipe.files.some(file=>file.path==='/etc/fstab')?['Apply manual fstab edits before the mount policy']:[])],recipe.mount_policy==='auto'||recipe.files.some(file=>file.path==='/etc/fstab'));
+  add('Mounts','mounts',[{auto:'Use filesystem UUIDs for local mounts',labels:'Prefer unique existing labels; use verified UUIDs where unavailable',preserve:'Keep current mount references'}[recipe.mount_policy],...(recipe.files.some(file=>file.path==='/etc/fstab')?['Apply manual fstab edits before the mount policy']:[])],recipe.mount_policy!=='preserve'||recipe.files.some(file=>file.path==='/etc/fstab'));
   const boot = [recipe.boot_migration ? `Migrate BIOS to UEFI; requested ESP ${recipe.boot_migration.esp_size_mib} MiB` : 'Keep existing firmware arrangement'];
   if (recipe.kernel_default) boot.push(`Default kernel: ${recipe.kernel_default}`);
   if (recipe.kernel_args) boot.push(`Kernel arguments: ${recipe.kernel_args}`);

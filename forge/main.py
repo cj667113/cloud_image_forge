@@ -20,7 +20,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .config import Settings
 from .jobs import Jobs
 from .models import (ObjectLocation, Recipe, OciPlanRequest, OciSchemaRequest, UefiPlanRequest,
-                     StoragePlanRequest, PlatformPlanRequest, DestinationSelection)
+                     StoragePlanRequest, PlatformPlanRequest, DestinationSelection, MountPlanRequest)
 from .oci import catalog as oci_catalog, compatibility_plan
 from .store import Store
 from . import transfers
@@ -246,6 +246,15 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
                 raise HTTPException(422, "Requested virtual size exceeds FORGE_MAX_VIRTUAL_GIB")
             return plan_rebuild(image["inspection"], body.storage_rebuild.model_dump(), body.disk_size_gib,
                                 mount_policy=body.mount_policy)
+
+    @app.post("/api/images/{image_id}/mounts/plan")
+    def plan_mount_references(image_id: str, body: MountPlanRequest):
+        from .storage import plan_mounts
+        with app.state.jobs.inspection_lock:
+            image = get_record("image", image_id)
+            if image["status"] != "ready" or image.get("inspection_status") in {"queued", "running"}:
+                raise HTTPException(409, "Wait for successful inspection before planning mount references")
+            return plan_mounts(image["inspection"], body.mount_policy, require_original=True)
 
     @app.post("/api/images/{image_id}/platform/plan")
     def plan_machine(image_id: str, body: PlatformPlanRequest):

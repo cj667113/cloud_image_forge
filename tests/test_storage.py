@@ -72,6 +72,22 @@ def fstab_pinned():
 
 
 class PlanTests(unittest.TestCase):
+    def test_label_preview_can_remove_only_verified_fstab_lvm_pins(self):
+        from forge.storage import reconcile_fstab
+        image = fstab_pinned()
+        original = "/dev/disk/by-id/dm-uuid-LVM-vgidentitylvidentity / xfs defaults 0 1\n"
+        inventory = deepcopy(image["storage"]["filesystems"])
+        root = inventory[-1]
+        root["aliases"] = [original.split()[0]]
+        evidence = reconcile_fstab(original, inventory, root_device=root["device"])
+        evidence.update(filesystems=inventory, root_device=root["device"], mounted={"/": root["device"]})
+        image["mount_reconciliation"] = evidence
+        result = plan_rebuild(image, OPTIONS, 10, mount_policy="labels")
+        self.assertTrue(result["ready"], result["blockers"])
+        self.assertEqual(result["projected_mount_changes"][0]["to"], "LABEL=ROOT")
+        image["storage"]["lvm_identity_pins"]["paths"].append("/boot/grub/grub.cfg")
+        self.assertFalse(plan_rebuild(image, OPTIONS, 10, mount_policy="labels")["ready"])
+
     def test_only_verified_fstab_pins_can_be_projected_for_auto_preview(self):
         image = fstab_pinned()
         original = deepcopy(image)

@@ -89,12 +89,43 @@ def test_mount_policy_and_same_type_hardware_preparation_are_strict():
     from forge.models import Recipe, PlatformMigration, PlatformPlanRequest, OciPlanRequest, StoragePlanRequest
     assert Recipe().mount_policy == "auto"
     assert Recipe(mount_policy="preserve").mount_policy == "preserve"
+    assert Recipe(mount_policy="labels").mount_policy == "labels"
     with pytest.raises(ValidationError):
         Recipe(mount_policy="guess")
     profile = PlatformMigration(enabled=True, source="vm", target="vm", nic_driver="auto")
     assert PlatformPlanRequest(platform_migration=profile, mount_policy="preserve").mount_policy == "preserve"
     assert OciPlanRequest(oci={}, mount_policy="preserve").mount_policy == "preserve"
     assert StoragePlanRequest(storage_rebuild={}, mount_policy="preserve").mount_policy == "preserve"
+
+
+def test_mount_policy_preview_is_pure_strict_and_uses_cached_original_identity_proof(client):
+    from tests.test_mount_reconciliation import MountedGuest
+    from forge.storage import inspect_mount_references
+    image_id = imported(client)
+    guest = MountedGuest()
+    evidence = inspect_mount_references(guest, "/dev/vg/root")
+    evidence.pop("source_content")  # compatible older inspection text fallback
+    record = client.app.state.store.get("image", image_id)
+    inspection = {**record["inspection"], "mount_reconciliation": evidence,
+                  "files": {"/etc/fstab": guest.text}}
+    client.app.state.store.update("image", image_id, inspection=inspection)
+    before = client.app.state.store.get("image", image_id)
+    jobs = client.get("/api/jobs").json()
+    response = client.post(f"/api/images/{image_id}/mounts/plan", json={"mount_policy": "labels"})
+    assert response.status_code == 200 and response.json()["ready"]
+    assert response.json()["entries"][0]["replacement"] == "LABEL=ROOT"
+    assert client.get("/api/jobs").json() == jobs
+    assert client.app.state.store.get("image", image_id) == before
+    assert Path(before["source_path"]).read_bytes() == b"test-source"
+    for body in ({"mount_policy": "unsafe"}, {"mount_policy": "labels", "create_labels": True}):
+        assert client.post(f"/api/images/{image_id}/mounts/plan", json=body).status_code == 422
+    inspection["files"]["/etc/fstab"] += "# mismatched cache\n"
+    client.app.state.store.update("image", image_id, inspection=inspection)
+    result = client.post(f"/api/images/{image_id}/mounts/plan", json={"mount_policy": "labels"}).json()
+    assert not result["ready"] and any("refresh inspection" in item for item in result["errors"])
+    for status in ("queued", "running"):
+        client.app.state.store.update("image", image_id, inspection_status=status)
+        assert client.post(f"/api/images/{image_id}/mounts/plan", json={}).status_code == 409
 
 
 def test_import_build_download_persist_and_preserve_source(client, tmp_path):

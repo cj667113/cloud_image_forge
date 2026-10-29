@@ -6,7 +6,8 @@ from pathlib import Path
 import pytest
 
 from forge.storage import (StorageError, inspect_mount_references, reconcile_fstab,
-                           reconcile_mounts, verify_mounts, verify_mount_boot_references)
+                           reconcile_mounts, verify_mounts, verify_mount_boot_references,
+                           plan_mounts)
 
 
 def filesystems():
@@ -35,6 +36,54 @@ def test_transport_normalization_preserves_uuid_and_every_other_byte():
     assert result["ready"]
     assert result["content"] == source.replace("/dev/mapper/vg-root", "UUID=root-current")
     assert inventory == old and not result["boot_update_required"] and not result["root_uuid_changed"]
+
+
+def test_labels_policy_uses_existing_unique_labels_and_preserves_surrounding_text():
+    source = "# unchanged\r\n  /dev/mapper/vg-root\t/ ext4 defaults 0 1 # root\r\nUUID=data-current /data xfs defaults 0 2\n"
+    inventory, before = filesystems(), filesystems()
+    result = plan(source, filesystems=inventory, policy="labels")
+    assert result["ready"]
+    assert result["content"] == source.replace("/dev/mapper/vg-root", "LABEL=ROOT").replace("UUID=data-current", r"LABEL=Data\040Vol")
+    assert all(entry["reference_kind"] == "label" and entry["fallback_reason"] is None for entry in result["entries"])
+    assert inventory == before and result["root_uuid"] == "root-current"
+    assert not result["boot_update_required"]
+
+
+@pytest.mark.parametrize("label,reason", [("", "no label"), ("BOOT", "not unique"), ('root"name', "safely"),
+                                         (r"root\name", "safely"), ("root\nname", "safely"), ("root\u2028name", "safely")])
+def test_label_fallback_is_explicit_even_when_existing_uuid_needs_no_edit(label, reason):
+    inventory = filesystems()
+    inventory[0]["label"] = label
+    result = plan(ROOT, filesystems=inventory, policy="labels")
+    assert result["ready"] and result["content"] == ROOT and not result["changes"]
+    entry = result["entries"][0]
+    assert entry["reference_kind"] == "uuid" and reason in entry["fallback_reason"]
+    assert any(reason in warning for warning in result["warnings"])
+
+
+def test_tab_label_is_octal_escaped_and_case_sensitive_uniqueness_is_retained():
+    inventory = filesystems()
+    inventory[0]["label"] = "Root\tFS"
+    inventory[1]["label"] = "root\tFS"
+    result = plan(ROOT, filesystems=inventory, policy="labels")
+    assert result["ready"] and result["content"].startswith(r"LABEL=Root\011FS ")
+    assert plan(result["content"], filesystems=inventory, policy="labels")["changes"] == []
+
+
+def test_label_preference_does_not_guess_an_ambiguous_or_wrong_original_reference():
+    inventory = filesystems()
+    inventory[0]["label"] = "BOOT"
+    assert not plan("LABEL=BOOT / ext4 defaults 0 1\n", filesystems=inventory, policy="labels")["ready"]
+    assert not plan("UUID=boot-current / ext4 defaults 0 1\n", policy="labels")["ready"]
+    inventory[1]["uuid"] = "root-current"
+    assert not plan(ROOT, filesystems=inventory, policy="labels")["ready"]
+
+
+def test_label_repair_still_requires_independent_root_and_boot_verification():
+    result = plan("UUID=stale-root / ext4 defaults 0 1\n", policy="labels")
+    assert result["ready"] and result["content"].startswith("LABEL=ROOT ")
+    assert result["boot_reference_check_required"]
+    assert not plan("UUID=stale-root / ext4 defaults 0 1\n", policy="labels", root_device="/dev/unknown")["ready"]
 
 
 def test_stale_root_uuid_repaired_only_from_independent_root():
@@ -277,6 +326,67 @@ def test_reconciliation_edits_work_only_relabels_and_verifies_readback(monkeypat
     assert verify_mounts(work, receipt)["ready"]
     guest.text += "# late edit\n"
     assert not verify_mounts(work, receipt)["ready"]
+
+
+def test_label_preview_accepts_only_hash_verified_original_text_and_complete_identity_evidence():
+    guest = MountedGuest()
+    evidence = inspect_mount_references(guest, "/dev/vg/root")
+    original = deepcopy(evidence)
+    image = {"mount_reconciliation": evidence, "files": {"/etc/fstab": guest.text}}
+    result = plan_mounts(image, "labels")
+    assert result["ready"] and result["content"].startswith("LABEL=ROOT ")
+    assert evidence == original
+    del evidence["source_content"]
+    assert plan_mounts(image, "labels")["ready"]  # older record has exact inspection.files text
+    image["files"]["/etc/fstab"] += "# changed cached text\n"
+    assert not plan_mounts(image, "labels")["ready"]
+    image["files"]["/etc/fstab"] = guest.text
+    del evidence["mounted"]
+    assert not plan_mounts(image, "labels")["ready"]
+
+
+def test_label_writes_preserve_source_and_final_checks_detect_changed_labels_or_uuid(monkeypatch, tmp_path):
+    source, work = tmp_path / "source", tmp_path / "work"
+    source.write_bytes(b"source unchanged")
+    work.write_bytes(b"working copy")
+    guest = MountedGuest()
+    calls = harness(monkeypatch, guest)
+    receipt = reconcile_mounts(work, policy="labels")
+    assert guest.text == "LABEL=ROOT / ext4 defaults 0 1\n"
+    assert receipt["policy"] == "labels" and receipt["entries"][0]["reference_kind"] == "label"
+    assert source.read_bytes() == b"source unchanged" and all(path != str(source) for path, _ in calls)
+    assert verify_mounts(work, receipt)["ready"]
+    guest.inventory[0]["label"] = "CHANGED"
+    assert not verify_mounts(work, receipt)["ready"]
+    guest.inventory[0]["label"] = "ROOT"
+    guest.inventory[1]["label"] = "ROOT"
+    assert not verify_mounts(work, receipt)["ready"]
+    guest.inventory[1]["label"] = "BOOT"
+    guest.inventory[0]["uuid"] = "new-root"
+    assert not verify_mounts(work, receipt)["ready"]
+
+
+def test_label_change_between_readonly_preview_and_write_never_applies_stale_plan(monkeypatch):
+    guest = MountedGuest()
+    calls = harness(monkeypatch, guest)
+    original = guest.mount
+    def change(root, mount):
+        original(root, mount)
+        guest.inventory[0]["label"] = "CHANGED"
+    guest.mount = change
+    with pytest.raises(StorageError, match="changed after reconciliation preflight"):
+        reconcile_mounts(Path("work"), policy="labels")
+    assert not any(call[0] == "write" for call in calls) and guest.text == ROOT
+
+
+def test_labels_do_not_bypass_boot_uuid_change_guard(monkeypatch):
+    guest = MountedGuest("UUID=root-before / ext4 defaults 0 1\n")
+    calls = harness(monkeypatch, guest)
+    previous = {"mount_reconciliation": {"version": 1, "filesystems": filesystems()}}
+    previous["mount_reconciliation"]["filesystems"][0]["uuid"] = "root-before"
+    with pytest.raises(StorageError, match="GRUB and initramfs"):
+        reconcile_mounts(Path("work"), previous, policy="labels")
+    assert calls == [("work", True)]
 
 
 def test_preserve_is_readonly_and_does_not_certify_unresolved_mounts(monkeypatch):
