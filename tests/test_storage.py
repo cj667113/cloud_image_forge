@@ -471,10 +471,12 @@ class ExecutorTests(unittest.TestCase):
             self.assertFalse(output.exists())
             self.assertEqual(source.read_bytes(), b"source")
 
-    def run_rebuild(self, root, corrupt=False, fail_restore=False, arch="x86_64"):
+    def run_rebuild(self, root, corrupt=False, fail_restore=False, arch="x86_64", linux_data_pv=False):
         root = root.resolve()
         image = inspected()
         image["os"]["arch"] = arch
+        if linux_data_pv:
+            image["storage"]["layout"]["partitions"][-1]["type"] = LINUX_GUID
         if arch == "aarch64":
             image["boot"]["efi_loaders"] = [{"architecture": arch}]
         # Keep the raw-copy fixture small while exercising the same exact-length
@@ -541,6 +543,9 @@ class ExecutorTests(unittest.TestCase):
         if not fail_restore:
             write_guest = guests[1]
             self.assertEqual(write_guest.lvcreate.call_args.args, ("root", "ocivolume", 7680))
+            write_guest.pvcreate.assert_called_once_with("/dev/sda3")
+            if linux_data_pv:
+                self.assertIn(("/dev/sda", 3, LINUX_GUID), [call.args for call in write_guest.part_set_gpt_type.call_args_list])
             self.assertNotIn("/dev/sda1", [call.args[1] for call in write_guest.mkfs.call_args_list])
             self.assertNotIn("/dev/sda2", [call.args[0] for call in write_guest.set_label.call_args_list],
                              "Fresh XFS with an empty source label must retain its default blank label")
@@ -551,6 +556,10 @@ class ExecutorTests(unittest.TestCase):
     def test_success_verifies_copy_keeps_source_and_never_formats_efi(self):
         with tempfile.TemporaryDirectory() as folder:
             self.run_rebuild(Path(folder))
+
+    def test_rebuild_creates_proved_pv_under_preserved_linux_data_gpt_type(self):
+        with tempfile.TemporaryDirectory() as folder:
+            self.run_rebuild(Path(folder), linux_data_pv=True)
 
     def test_arm_rebuild_uses_matching_boot_detection_without_guest_commands(self):
         with tempfile.TemporaryDirectory() as folder:

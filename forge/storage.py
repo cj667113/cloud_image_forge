@@ -12,6 +12,7 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shlex
 import shutil
 import tarfile
 import tempfile
@@ -863,6 +864,171 @@ def _lvm_errors(lvm, partitions, filesystems):
     return errors
 
 
+def _lvm_partition_view(lvm, partitions):
+    """Recognize proved PVs without changing their on-disk partition type."""
+    names = {pv.get("pv_name") for pv in lvm.get("pvs", [])}
+    return [{**part, "type": LVM_GUID if (
+        part.get("type") == 0x8e or (part.get("type") == LINUX_GUID
+        and part.get("filesystem") == "LVM2_member" and part.get("device") in names)
+    ) else part.get("type")} for part in partitions]
+
+
+def _lvm_identifiers(storage):
+    return [str(item[key]).replace("-", "")
+            for group, key in (("pvs", "pv_uuid"), ("vgs", "vg_uuid"), ("lvs", "lv_uuid"))
+            for item in storage.get("lvm", {}).get(group, []) if item.get(key)]
+
+
+def _normalize_grub_lvm(content, storage):
+    """Normalize only GRUB's exact paired UUID-search/hint fallback block.
+
+    Both existing branches already execute the same UUID search. Standalone
+    device assignments, shell expressions and other references remain blocked.
+    """
+    if not isinstance(content, str) or len(content.encode()) > MIB or "\0" in content:
+        raise StorageError("Generated GRUB configuration is missing or exceeds the normalization limit")
+    vgs = storage.get("lvm", {}).get("vgs", [])
+    filesystems = storage.get("filesystems", [])
+    if len(vgs) != 1:
+        raise StorageError("GRUB LVM references require one verified volume group")
+    mapping = {}
+    for lv in storage.get("lvm", {}).get("lvs", []):
+        matches = [fs for fs in filesystems if fs.get("device") == lv.get("device") and fs.get("kind") == "lv"]
+        if len(matches) != 1 or sum(fs.get("uuid") == matches[0].get("uuid") for fs in filesystems) != 1:
+            raise StorageError("GRUB LVM reference does not identify one unique filesystem")
+        identifier = str(UUID(matches[0]["uuid"]))
+        vg_id, lv_id = str(vgs[0].get("vg_uuid", "")).replace("-", ""), str(lv.get("lv_uuid", "")).replace("-", "")
+        if not all(re.fullmatch(r"[A-Za-z0-9]{32}", value) for value in (vg_id, lv_id)):
+            raise StorageError("GRUB LVM reference lacks valid inspected internal identities")
+        mapping[(vg_id, lv_id)] = {"device": lv["device"], "uuid": identifier}
+    lines = content.splitlines(keepends=True)
+    changed = []
+    for index, line in enumerate(lines):
+        match = re.fullmatch(r"([ \t]*)set[ \t]+root=(?:'(?P<quoted>lvmid/[A-Za-z0-9-]+/[A-Za-z0-9-]+)'|(?P<plain>lvmid/[A-Za-z0-9-]+/[A-Za-z0-9-]+))[ \t]*\n?", line)
+        if not match:
+            continue
+        token = match["quoted"] or match["plain"]
+        ids = tuple(value.replace("-", "") for value in token.split("/")[1:])
+        target = mapping.get(ids)
+        if target is None or index + 5 >= len(lines):
+            raise StorageError("GRUB LVM device cannot be mapped to a preserved filesystem UUID")
+        expected = ["search", "--no-floppy", "--fs-uuid", "--set=root"]
+        try:
+            hinted = shlex.split(lines[index+2], comments=True)
+            plain = shlex.split(lines[index+4], comments=True)
+        except ValueError as exc:
+            raise StorageError("Generated GRUB UUID-search syntax is unsupported") from exc
+        if (lines[index+1].strip() != "if [ x$feature_platform_search_hint = xy ]; then"
+                or lines[index+3].strip() != "else" or lines[index+5].strip() != "fi"
+                or hinted != expected + ["--hint=" + token, target["uuid"]]
+                or plain != expected + [target["uuid"]]):
+            raise StorageError("GRUB LVM reference is outside a verified paired filesystem-UUID search block")
+        command = " ".join(expected + [target["uuid"]])
+        lines[index] = match[1] + command + "\n"
+        prefix = re.match(r"[ \t]*", lines[index+2])[0]
+        lines[index+2] = prefix + command + "\n"
+        changed.append({"line": index + 1, **target, "reason": "Replace internal LVM device hint with the existing unique filesystem UUID search"})
+    normalized = "".join(lines)
+    if not changed or any(value in _active(normalized).replace("-", "") for value in _lvm_identifiers(storage)):
+        raise StorageError("Unrecognized internal LVM references remain in generated GRUB configuration")
+    return normalized, changed
+
+
+def _project_rebuild_references(inspection, mount, mount_policy):
+    storage = inspection.get("storage", {})
+    pins = storage.get("lvm_identity_pins", {})
+    if (pins.get("version") != 1 or not pins.get("config_scan_complete")
+            or not storage.get("initramfs")
+            or any(item.get("status") != "checked" for item in storage["initramfs"])):
+        return None
+    paths = pins.get("paths", [])
+    if not paths or len(paths) != len(set(paths)):
+        return None
+    projected = {"mount_changes": [], "boot_updates": []}
+    for path in paths:
+        if path == "/etc/fstab":
+            if (mount_policy == "preserve" or not mount.get("ready") or not mount.get("changes")
+                    or pins.get("fstab_sha256") != mount.get("sha256") or not isinstance(mount.get("content"), str)
+                    or any(value in _active(mount["content"]).replace("-", "") for value in _lvm_identifiers(storage))):
+                return None
+            projected["mount_changes"] = deepcopy(mount["changes"])
+        elif path in {"/boot/grub/grub.cfg", "/boot/grub2/grub.cfg"}:
+            content = inspection.get("platform", {}).get("generated_grub", {}).get(path)
+            try:
+                normalized, changes = _normalize_grub_lvm(content, storage)
+            except (StorageError, ValueError, KeyError):
+                return None
+            projected["boot_updates"].append({"path": path, "source_sha256": hashlib.sha256(content.encode()).hexdigest(),
+                "sha256": hashlib.sha256(normalized.encode()).hexdigest(), "content": normalized,
+                "changes": changes, "old_identifiers": _lvm_identifiers(storage)})
+        else:
+            return None
+    return projected
+
+
+def normalize_rebuild_boot_references(work: Path, inspection, updates, log):
+    """Apply a hash-bound projected rewrite to the disposable working copy.
+
+    Rebuild subsequently re-inspects this normalized disk and archives it as
+    the baseline. This helper never receives or writes the imported source.
+    """
+    receipt = {"changed": False, "files": []}
+    if not updates:
+        return receipt
+    from .engine import _guest, _roots, _mount
+    with _guest(work, "qcow2", readonly=False) as g:
+        _mount(g, _roots(g), False)
+        actual = deepcopy(inspection["storage"])
+        lvm = {"pvs": g.pvs_full(), "vgs": g.vgs_full(), "lvs": g.lvs_full()}
+        if len(lvm["vgs"]) != 1:
+            raise StorageError("Working LVM inventory changed before GRUB reference normalization")
+        for lv in lvm["lvs"]:
+            lv["device"] = f"/dev/{lvm['vgs'][0]['vg_name']}/{lv['lv_name']}"
+        actual["lvm"] = lvm
+        inventory = g.list_filesystems()
+        uuids = {device: g.vfs_uuid(device) for device, fs in inventory.items() if fs in FILESYSTEMS | {"vfat", "fat", "msdos"}}
+        for fs in actual["filesystems"]:
+            if uuids.get(fs["device"]) != fs["uuid"]:
+                raise StorageError("Filesystem identity changed before GRUB reference normalization")
+        if len(set(uuids.values())) != len(uuids):
+            raise StorageError("Duplicate filesystem UUIDs prevent GRUB reference normalization")
+        pending = []
+        for update in updates:
+            path = update["path"]
+            if path not in {"/boot/grub/grub.cfg", "/boot/grub2/grub.cfg"}:
+                raise StorageError("Unexpected generated GRUB normalization path")
+            if any(g.is_symlink(str(parent)) for parent in [PurePosixPath(path), *PurePosixPath(path).parents]) or not g.is_file(path):
+                raise StorageError("Generated GRUB normalization requires an existing regular path without symlinks")
+            metadata = g.statns(path)
+            if metadata["st_nlink"] != 1:
+                raise StorageError("Hardlinked GRUB configuration cannot be normalized safely")
+            if g.filesize(path) > MIB:
+                raise StorageError("Generated GRUB configuration exceeds the normalization limit")
+            raw = g.read_file(path)
+            try:
+                content = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+            except UnicodeDecodeError as exc:
+                raise StorageError("Generated GRUB configuration is not valid UTF-8 text") from exc
+            if hashlib.sha256(content.encode()).hexdigest() != update["source_sha256"]:
+                raise StorageError("Generated GRUB configuration changed after its normalization preview")
+            normalized, changes = _normalize_grub_lvm(content, actual)
+            if normalized != update["content"] or hashlib.sha256(normalized.encode()).hexdigest() != update["sha256"]:
+                raise StorageError("GRUB reference normalization no longer matches the inspected filesystem mapping")
+            pending.append((update, metadata, normalized, changes))
+        for update, metadata, content, changes in pending:
+            path = update["path"]
+            log(f"Replacing verified internal LVM search hints with preserved filesystem UUIDs in {path}")
+            g.write(path, content.encode())
+            g.chown(metadata["st_uid"], metadata["st_gid"], path)
+            g.chmod(metadata["st_mode"] & 0o7777, path)
+            if g.checksum("sha256", path) != update["sha256"]:
+                raise StorageError("Normalized GRUB configuration failed readback verification")
+            receipt["files"].append({key: deepcopy(update[key]) for key in ("path", "source_sha256", "sha256", "changes", "old_identifiers")})
+        g.sync()
+    receipt["changed"] = True
+    return receipt
+
+
 def plan_storage(inspection, options, disk_size_gib=None, *, mount_policy="auto"):
     """Choose fixed-start growth or the existing verified shrink/rebuild path."""
     if not options or not options.get("enabled"):
@@ -901,10 +1067,10 @@ def verify_storage(inspection, plan, *, expected_disk_size=None):
     return verify_rebuild(inspection, plan, expected_disk_size=expected_disk_size)
 
 
-def plan_rebuild(inspection: dict, options: dict | None, disk_size_gib=None, *, mount_policy="auto") -> dict:
+def plan_rebuild(inspection: dict, options: dict | None, disk_size_gib=None, *, mount_policy="auto", project_references=True) -> dict:
     requested = bool(options and options.get("enabled"))
     result = {"requested": requested, "ready": False, "blockers": [], "warnings": [],
-              "changes": [], "layout": {}, "filesystems": [], "estimated_temporary_bytes": 0, "projected_mount_changes": [],
+              "changes": [], "layout": {}, "filesystems": [], "estimated_temporary_bytes": 0, "projected_mount_changes": [], "projected_boot_updates": [],
               "source_architecture": normalize_arch(inspection.get("os", {}).get("arch"))}
     if not requested:
         return result
@@ -916,23 +1082,16 @@ def plan_rebuild(inspection: dict, options: dict | None, disk_size_gib=None, *, 
     source_errors = list(storage.get("errors", []))
     if mount_policy not in MOUNT_POLICIES:
         errors.append("Mount policy must be auto, labels or preserve")
-    pins = storage.get("lvm_identity_pins", {})
     mount = plan_mounts(inspection, mount_policy)
     if mount_policy == "labels":
         errors.extend(mount.get("errors", []))
         warnings.extend(mount.get("warnings", []))
-    initrds_checked = bool(storage.get("initramfs")) and all(item.get("status") == "checked" for item in storage["initramfs"])
-    if (mount_policy != "preserve" and LVM_PIN_ERROR in source_errors
-            and pins.get("version") == 1 and pins.get("config_scan_complete")
-            and initrds_checked
-            and pins.get("paths") == ["/etc/fstab"] and mount.get("ready") and mount.get("changes")
-            and pins.get("fstab_sha256") == mount.get("sha256") and isinstance(mount.get("content"), str)):
-        identifiers = [str(item[key]).replace("-", "") for group, key in (("pvs", "pv_uuid"), ("vgs", "vg_uuid"), ("lvs", "lv_uuid"))
-                       for item in storage.get("lvm", {}).get(group, []) if item.get(key)]
-        if identifiers and not any(identifier in _active(mount["content"]).replace("-", "") for identifier in identifiers):
-            source_errors = [error for error in source_errors if error != LVM_PIN_ERROR]
-            result["projected_mount_changes"] = deepcopy(mount["changes"])
-            warnings.append("Automatic mount reconciliation will remove fstab-only LVM-ID references before rebuild; the executor must re-inspect the actual changed working disk. Boot/initramfs pins remain blocked.")
+    projection = _project_rebuild_references(inspection, mount, mount_policy) if project_references and LVM_PIN_ERROR in source_errors else None
+    if projection is not None:
+        source_errors = [error for error in source_errors if error != LVM_PIN_ERROR]
+        result["projected_mount_changes"] = projection["mount_changes"]
+        result["projected_boot_updates"] = projection["boot_updates"]
+        warnings.append("Before rebuilding, normalize verified fstab references and paired GRUB LVM search hints to preserved filesystem identities. Unrecognized boot references and initramfs pins remain blocked; the changed working disk is checked again before archiving.")
     errors.extend(source_errors)
     warnings.extend(storage.get("warnings", []))
     old = storage.get("layout") or {}
@@ -970,9 +1129,11 @@ def plan_rebuild(inspection: dict, options: dict | None, disk_size_gib=None, *, 
         UUID(bytes_le=bytes.fromhex(old["disk_identity"]))
     except (KeyError, ValueError, TypeError):
         errors.append("Disk GPT identity is unavailable")
-    errors.extend(_lvm_errors(storage.get("lvm", {}), parts, filesystems))
+    lvm = storage.get("lvm", {})
+    errors.extend(_lvm_errors(lvm, _lvm_partition_view(lvm, parts), filesystems))
+    pv_devices = {pv.get("pv_name") for pv in lvm.get("pvs", [])}
     known = {item["device"]: item for item in filesystems}
-    if len(known) != len(filesystems) or any(part["device"] not in known and part.get("type") != LVM_GUID for part in parts):
+    if len(known) != len(filesystems) or any(part["device"] not in known and part["device"] not in pv_devices for part in parts):
         errors.append("Every partition and logical volume must be accounted for exactly once")
     uuids = [item.get("uuid") for item in filesystems]
     labels = [item.get("label") for item in filesystems if item.get("label")]
@@ -1017,19 +1178,20 @@ def plan_rebuild(inspection: dict, options: dict | None, disk_size_gib=None, *, 
     cursor = parts[0]["start"]
     planned = []
     for part in parts:
-        size = part["size"] if part["type"] == EFI_GUID else sum(lv["size"] for lv in lvs) + 16 * MIB if part["type"] == LVM_GUID else known[part["device"]]["selected_size_mib"] * MIB
+        size = part["size"] if part["type"] == EFI_GUID else sum(lv["size"] for lv in lvs) + 16 * MIB if part["device"] in pv_devices else known[part["device"]]["selected_size_mib"] * MIB
         start = cursor if part["type"] == EFI_GUID else _ceil(cursor)
         planned.append({**part, "start": start, "end": start + size - 1, "size": size})
         cursor = start + size
     minimum = _ceil(cursor + 2 * MIB)
     if target < minimum:
         errors.append(f"Selected filesystems require a disk of at least {minimum / GIB:.3f} GiB; target is too small")
-    if planned[-1]["type"] == LVM_GUID and target >= minimum:
+    if planned[-1]["device"] in pv_devices and target >= minimum:
         planned[-1]["end"] = target - 2 * MIB - 1
         planned[-1]["size"] = planned[-1]["end"] - planned[-1]["start"] + 1
     result["layout"] = {"partition_table": "gpt", "disk_size_before": inspection["virtual_size"],
                         "disk_size_after": target, "minimum_disk_size": minimum,
-                        "disk_identity": old["disk_identity"], "partitions": planned, "lvs": lvs}
+                        "disk_identity": old["disk_identity"], "partitions": planned, "lvs": lvs,
+                        "pv_device": next(iter(pv_devices)) if pv_devices else None}
     used = [item.get("used", 0) for item in filesystems if item.get("editable")]
     result["estimated_temporary_bytes"] = sum(used) * 2 + max(used, default=0) + parts[0]["size"] + 512 * MIB
     warnings.extend(["This preview is source-based; archive contents and capacity are checked again before creating the new disk.",
@@ -1040,6 +1202,8 @@ def plan_rebuild(inspection: dict, options: dict | None, disk_size_gib=None, *, 
     result["changes"] = ["Create a new GPT QCOW2 disk and preserve the original working disk until verification succeeds",
                          "Copy the EFI partition byte for byte; recreate XFS/ext filesystems and restore files, ownership, ACLs, xattrs and SELinux contexts",
                          "Verify file contents and archived metadata, filesystem identities, EFI bytes and new partition boundaries"]
+    if result["projected_boot_updates"]:
+        result["changes"].insert(0, "Normalize verified paired GRUB LVM device hints to the existing filesystem UUID search before archiving")
     result["ready"] = not errors
     return result
 
@@ -1119,6 +1283,26 @@ def verify_rebuild(inspection: dict, plan: dict, *, expected_disk_size=None) -> 
     if (len(actual_lvs) != len(expected_lvs)
             or {item.get("device"): item.get("lv_size") for item in actual_lvs} != expected_lvs):
         errors.append("Final logical volume names or sizes differ from the rebuild plan")
+    if expected.get("pv_device") and [pv.get("pv_name") for pv in evidence.get("lvm", {}).get("pvs", [])] != [expected["pv_device"]]:
+        errors.append("Final physical volume does not match the verified rebuild container")
+    generated = inspection.get("platform", {}).get("generated_grub", {})
+    for update in plan.get("projected_boot_updates", []):
+        content = generated.get(update["path"])
+        if not isinstance(content, str) or any(value in _active(content).replace("-", "") for value in update["old_identifiers"]):
+            errors.append("Final generated GRUB configuration retains stale internal LVM references or cannot be verified")
+            continue
+        # Later intentional GRUB regeneration may add valid new LVM hints.
+        # It must retain a literal search for each preserved filesystem UUID.
+        searches = []
+        for line in content.splitlines():
+            try:
+                words = shlex.split(line, comments=True)
+            except ValueError:
+                continue
+            if words and words[0] == "search" and "--fs-uuid" in words and "--set=root" in words:
+                searches.extend(words[-1:])
+        if any(change["uuid"] not in searches for change in update["changes"]):
+            errors.append("Final generated GRUB configuration lost its preserved filesystem UUID search")
     result["ready"] = result["verified"] = not errors
     return result
 
@@ -1265,7 +1449,7 @@ def rebuild(source_work: Path, destination: Path, inspection: dict, recipe: dict
     fresh = ImageEngine().inspect(source_work)
     # Projection is preview-only. The actual source must already have had its
     # fstab reconciled and freshly inspected before rebuilding LVM identities.
-    plan = plan_rebuild(fresh, options, recipe.get("disk_size_gib"), mount_policy="preserve")
+    plan = plan_rebuild(fresh, options, recipe.get("disk_size_gib"), mount_policy="preserve", project_references=False)
     if not plan["ready"]:
         raise StorageError("Storage rebuild blocked: " + " ".join(plan["blockers"]))
     if fresh["format"] != "qcow2":
@@ -1327,7 +1511,7 @@ def rebuild(source_work: Path, destination: Path, inspection: dict, recipe: dict
                     g.part_set_gpt_attributes("/dev/sda", number, part.get("attributes", 0))
                     g.part_set_name("/dev/sda", number, part.get("name", ""))
                 if layout["lvs"]:
-                    pv = next(part["device"] for part in layout["partitions"] if part["type"] == LVM_GUID)
+                    pv = layout["pv_device"]
                     vg = fresh["storage"]["lvm"]["vgs"][0]["vg_name"]
                     g.pvcreate(pv)
                     g.vgcreate(vg, [pv])

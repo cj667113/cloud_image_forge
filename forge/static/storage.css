@@ -1,106 +1,125 @@
-/* A single sizing surface: capacity, filesystem rows, then validation. */
+/* Keep disk sizing and every filesystem on one shared, bounded surface. */
+#storage-studio{max-width:960px;margin-inline:auto}
 #storage-studio .storage-sizing-card{border:1px solid var(--line);border-radius:12px;background:var(--white);overflow:hidden}
-#storage-studio .storage-card-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:19px 21px;border-bottom:1px solid var(--line)}
+#storage-studio .storage-card-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:19px 24px;border-bottom:1px solid var(--line)}
 #storage-studio .storage-card-heading h3{font-size:15px;font-weight:600;margin:0;color:var(--ink)}
 #storage-studio .storage-card-heading .check-field{margin:0;gap:8px;align-items:center;font-size:12px;flex-wrap:wrap}
 #storage-studio .storage-card-heading .help-anchor{margin-left:0}
-#storage-studio .storage-capacity-editor{padding:19px 21px 20px;background:#faf8f4;border-bottom:1px solid var(--line)}
-#storage-studio .storage-summary{padding:0;margin:0 0 17px;border:0;border-radius:0;background:none;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr) auto;gap:0 16px}
-#storage-studio .storage-summary strong{font-size:21px;font-variant-numeric:tabular-nums}
+#storage-studio .storage-capacity-editor{padding:20px 24px;background:#faf8f4;border-bottom:1px solid var(--line)}
+#storage-studio .storage-summary{padding:0;margin:0 0 20px;border:0;border-radius:0;background:none;grid-template-columns:150px 20px 150px minmax(0,1fr);gap:0 16px}
+#storage-studio .storage-summary strong{font-size:22px;font-variant-numeric:tabular-nums}
+#storage-studio .storage-summary .storage-saving{justify-self:end}
 #storage-studio .storage-summary .storage-saving strong{font-size:11px;font-weight:500;padding:4px 9px}
-#storage-studio .storage-capacity-rail{height:6px;margin-top:13px}
-#storage-studio .storage-capacity-controls{display:flex;align-items:flex-end;gap:13px;flex-wrap:wrap}
+#storage-studio .storage-capacity-rail{height:6px;margin-top:14px}
+#storage-studio .storage-capacity-controls{display:flex;align-items:flex-end;gap:20px;flex-wrap:wrap}
 .storage-capacity-modes{border:0;padding:0;margin:0;min-width:0}
 .storage-capacity-modes legend{font-size:11px;color:var(--muted);padding:0;margin:0 0 6px}
 .storage-capacity-modes>div{display:flex;background:#eee9e2;padding:3px;border:1px solid #e0d8ce;border-radius:7px}
 .storage-capacity-modes label{position:relative;cursor:pointer;margin:0}
 .storage-capacity-modes input{position:absolute;opacity:0;width:1px;height:1px}
-.storage-capacity-modes span{display:block;border-radius:4px;padding:8px 12px;font-size:11px;line-height:1.3;color:#665e55;white-space:nowrap}
+.storage-capacity-modes span{display:block;border-radius:4px;padding:9px 13px;font-size:11px;line-height:1.3;color:#665e55;white-space:nowrap}
 .storage-capacity-modes input:checked+span{background:var(--white);color:var(--ink);box-shadow:0 1px 3px #33271916}
 .storage-capacity-modes input:focus-visible+span{outline:2px solid var(--accent);outline-offset:2px}
-#storage-capacity-field{flex:1;min-width:160px;max-width:245px}
+#storage-capacity-field{flex:0 1 210px;min-width:160px}
 #storage-capacity-field .field-label{font-size:11px;color:var(--muted);font-weight:400;margin-bottom:5px;min-height:16px}
 #storage-capacity-field .field-label .help-toggle{height:21px;width:21px;min-width:21px;font-size:10px}
 #storage-capacity-field .capacity-input{grid-template-columns:minmax(0,1fr) 65px}
-#storage-capacity-field input,#storage-capacity-field select{min-height:36px;padding-top:7px;padding-bottom:7px;font-size:12px}
-.storage-fit-action{display:flex;align-items:center;gap:3px;min-height:38px;margin-left:auto}
-#storage-studio #storage-fit-button{min-width:0;min-height:36px;margin:0;font-size:11px;padding:8px 10px}
+#storage-capacity-field input,#storage-capacity-field select{min-height:38px;padding-top:7px;padding-bottom:7px;font-size:12px}
+.storage-fit-action{display:flex;align-items:center;gap:3px;min-height:40px}
+#storage-studio #storage-fit-button{min-width:0;min-height:38px;margin:0;font-size:11px;padding:8px 10px}
 .storage-fit-action>.help-anchor{margin:0}
 .storage-fit-action:has(>#storage-fit-button[hidden]){display:none}
-#storage-studio .storage-filesystems-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 21px 10px}
+#storage-studio .storage-filesystems-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:19px 24px 6px}
 #storage-studio .storage-filesystems-heading h4{font-size:12px;font-weight:600;margin:0;color:var(--ink)}
 .storage-usage-key{display:flex;align-items:center;gap:3px;font-size:10px;color:var(--muted)}
 .storage-usage-key .help-toggle{height:23px;width:23px;min-width:23px;font-size:10px}
 #storage-studio .filesystem-list{border:0;border-radius:0;overflow:visible}
-#storage-studio .filesystem-row{grid-template-columns:minmax(0,1fr) minmax(220px,1.1fr);gap:9px 25px;padding:13px 21px;border-bottom:1px solid #eee9e2}
-#storage-studio .filesystem-heading strong{font-size:12px}
+#storage-studio .filesystem-row{grid-template-columns:minmax(140px,1fr) 104px 174px;align-items:center;gap:14px 24px;padding:18px 24px;border-bottom:1px solid #eee9e2}
+#storage-studio .filesystem-heading{grid-column:1;grid-row:1}
+#storage-studio .filesystem-heading strong{font-size:13px}
 #storage-studio .filesystem-heading .help-toggle{height:24px;width:24px;min-width:24px;font-size:10px}
 #storage-studio .filesystem-kind{font-size:11px}
-#storage-studio .filesystem-size-choice{gap:12px}
+#storage-studio .filesystem-size-choice{display:contents}
+#storage-studio .filesystem-original{grid-column:2;grid-row:1;text-align:left;gap:6px}
 #storage-studio .filesystem-original small{font-size:10px}
-#storage-studio .filesystem-original strong{font-size:12px}
-#storage-studio .filesystem-auto-target{display:grid;gap:5px;padding-left:12px;border-left:1px solid var(--line);text-align:right;white-space:nowrap}
-#storage-studio .filesystem-auto-target small{font-size:10px;font-weight:400;color:var(--muted)}
-#storage-studio .filesystem-auto-target strong{font-size:12px;font-weight:600;color:var(--teal-dark);font-variant-numeric:tabular-nums}
-#storage-studio .filesystem-target .size-field{display:grid;grid-template-columns:minmax(0,1fr) 60px}
-#storage-studio .size-field input,#storage-studio .size-field select{width:100%;min-width:0}
-#storage-studio .filesystem-visual{grid-column:1/-1}
-#storage-studio.resizing .filesystem-visual{grid-column:1;align-self:center}
-#storage-studio .fs-track{height:6px}
-#storage-studio .filesystem-usage{font-size:11px;margin-top:5px}
-#storage-studio .filesystem-resize{grid-column:2;grid-row:2;gap:10px;align-self:center}
-#storage-studio .filesystem-minimum{font-size:11px}
+#storage-studio .filesystem-original strong{font-size:13px;font-variant-numeric:tabular-nums}
+#storage-studio .filesystem-target,#storage-studio .filesystem-auto-target,#storage-studio .filesystem-locked{grid-column:3;grid-row:1;min-width:0}
+#storage-studio .filesystem-auto-target{display:grid;gap:6px;text-align:left;white-space:nowrap}
+#storage-studio .filesystem-auto-target small,#storage-studio .filesystem-locked small{font-size:10px;font-weight:400;color:var(--muted)}
+#storage-studio .filesystem-auto-target strong{font-size:13px;font-weight:600;color:var(--teal-dark);font-variant-numeric:tabular-nums}
+#storage-studio .filesystem-target{gap:6px}
+#storage-studio .filesystem-target .size-field{display:grid;grid-template-columns:minmax(0,1fr) 62px;width:100%}
+#storage-studio .size-field input,#storage-studio .size-field select{width:100%;min-width:0;min-height:38px}
+#storage-studio .size-field input{text-align:left;padding-left:10px;font-variant-numeric:tabular-nums}
+#storage-studio .filesystem-locked{display:grid;gap:6px;align-items:start;font-size:12px}
+#storage-studio .filesystem-locked>span{display:flex;align-items:center;gap:4px;min-height:38px}
+#storage-studio .filesystem-meter{grid-column:1/-1;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px 16px;min-width:0}
+#storage-studio .filesystem-visual,#storage-studio .filesystem-resize{display:contents}
+#storage-studio .fs-track{grid-column:1/-1;grid-row:1;height:7px}
+#storage-studio .slider-field{grid-column:1/-1;grid-row:2;width:100%;margin:0}
+#storage-studio .slider-field input{width:100%;margin:0;display:block}
+#storage-studio .filesystem-usage{grid-column:1;grid-row:3;justify-content:flex-start;gap:12px;flex-wrap:wrap;font-size:11px;margin:0;min-width:0}
+#storage-studio .filesystem-minimum{grid-column:2;grid-row:3;font-size:11px;justify-content:flex-end}
 #storage-studio .filesystem-minimum .help-toggle{height:22px;width:22px;min-width:22px;font-size:10px}
 #storage-studio .filesystem-alert{grid-column:1/-1}
-#storage-studio .filesystem-total-change{padding:0 21px 11px;margin:8px 0 0}
-#storage-studio .storage-evidence-notice{margin:16px 21px 0}
-#storage-studio #storage-plan-controls{padding:15px 21px 19px;border-top:1px solid var(--line);background:#fcfaf7}
+#storage-studio .filesystem-total-change{padding:0 24px 11px;margin:8px 0 0}
+#storage-studio .storage-evidence-notice{margin:16px 24px 0}
+#storage-studio #storage-plan-controls{padding:17px 24px 20px;border-top:1px solid var(--line);background:#fcfaf7}
 #storage-studio .plan-action-row{display:flex;flex-direction:row;align-items:center;justify-content:flex-start;margin:0;gap:6px}
 #storage-studio #storage-plan-button{width:auto;min-height:40px}
 #storage-studio .studio-plan:empty{display:none}
+#storage-studio .plan-facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;font-size:11px}
+#storage-studio .plan-facts strong{font-size:12px;line-height:1.5}
 #storage-studio .storage-layout-details{margin-top:14px}
-@media(max-width:900px){
-  #storage-studio .storage-summary{grid-template-columns:minmax(0,1fr) auto minmax(0,1fr)}
-  #storage-studio .storage-summary>.storage-saving{grid-column:1/-1;margin-top:9px}
-  #storage-studio .storage-capacity-controls{gap:12px}
-  .storage-fit-action{margin-left:0}
+@media(max-width:1100px){
+  #storage-studio .storage-summary{grid-template-columns:120px 20px 120px minmax(0,1fr)}
+  #storage-studio .filesystem-row{grid-template-columns:minmax(100px,1fr) 90px 156px;gap:13px 18px}
+  #storage-studio .storage-capacity-controls{gap:14px}
 }
 @media(max-width:680px){
   #storage-studio .storage-card-heading{padding:15px;align-items:flex-start;flex-direction:column;gap:9px}
   #storage-studio .storage-card-heading h3{font-size:14px}
   #storage-studio .storage-card-heading .check-field{font-size:11px}
   #storage-studio .storage-capacity-editor{padding:15px}
-  #storage-studio .storage-summary{gap:0 10px;margin-bottom:14px}
+  #storage-studio .storage-summary{grid-template-columns:minmax(0,1fr) 16px minmax(0,1fr);gap:0 10px;margin-bottom:16px}
   #storage-studio .storage-summary strong{font-size:18px}
   #storage-studio .storage-summary .storage-summary-arrow{font-size:18px}
   #storage-studio .storage-summary span{font-size:10px}
+  #storage-studio .storage-summary>.storage-saving{grid-column:1/-1;justify-self:start;margin-top:10px}
   #storage-studio .storage-summary .storage-saving strong{font-size:10px}
   .storage-capacity-modes{flex-basis:100%}
   .storage-capacity-modes>div{width:max-content;max-width:100%}
   .storage-capacity-modes span{padding:8px 11px}
   #storage-capacity-field{max-width:none;min-width:0;flex-basis:100%}
   .storage-fit-action{min-width:0;max-width:100%}
-  #storage-studio .storage-filesystems-heading{padding:14px 15px 7px;flex-wrap:wrap;gap:4px}
-  #storage-studio .filesystem-row{grid-template-columns:minmax(0,1fr) auto;padding:12px 15px;gap:9px}
-  #storage-studio.resizing .filesystem-size-choice{grid-column:1/-1;justify-content:space-between}
-  #storage-studio .filesystem-row:has(.filesystem-auto-target:not([hidden])) .filesystem-size-choice{grid-column:1/-1;justify-content:flex-start;gap:18px}
-  #storage-studio .filesystem-auto-target{text-align:left}
-  #storage-studio.resizing .filesystem-visual{grid-column:1/-1}
-  #storage-studio .filesystem-resize{grid-column:1/-1;grid-row:auto}
-  #storage-studio .filesystem-target .size-field{width:139px}
-  #storage-studio .filesystem-original strong{font-size:11px}
+  #storage-studio .storage-filesystems-heading{padding:15px 15px 4px;flex-wrap:wrap;gap:4px}
+  #storage-studio .filesystem-row{grid-template-columns:minmax(0,1fr) 142px;padding:16px 15px;gap:12px 16px}
+  #storage-studio .filesystem-heading{grid-column:1/-1;grid-row:1}
+  #storage-studio .filesystem-original{grid-column:1;grid-row:2}
+  #storage-studio .filesystem-target,#storage-studio .filesystem-auto-target,#storage-studio .filesystem-locked{grid-column:2;grid-row:2}
+  #storage-studio .filesystem-meter{gap:7px 8px}
+  #storage-studio .filesystem-usage{gap:3px 10px;font-size:10px}
+  #storage-studio .filesystem-minimum{font-size:10px}
   #storage-studio .filesystem-total-change{padding:0 15px 10px}
   #storage-studio #storage-plan-controls{padding:14px 15px}
   #storage-studio .storage-evidence-notice{margin:13px 15px 0}
   #storage-studio .plan-action-row{align-items:center;flex-wrap:nowrap}
+  #storage-studio .plan-facts{grid-template-columns:1fr;gap:10px}
+  #storage-studio .plan-facts>span{display:flex;justify-content:space-between;gap:12px}
+  #storage-studio .plan-facts strong{margin:0;text-align:right}
 }
 @media(max-width:360px){
-  #storage-studio .filesystem-heading,#storage-studio .filesystem-size-choice{grid-column:1/-1}
-  #storage-studio .filesystem-size-choice{justify-content:flex-start}
-  #storage-studio.resizing .filesystem-size-choice:has(.filesystem-target){display:grid;grid-template-columns:minmax(0,1fr);gap:8px}
-  #storage-studio.resizing .filesystem-size-choice:has(.filesystem-target) .filesystem-original{display:flex;align-items:baseline;gap:8px}
-  #storage-studio.resizing .filesystem-arrow{display:none}
-  #storage-studio .filesystem-target,#storage-studio .filesystem-target .size-field{width:100%}
+  #storage-studio .filesystem-row{grid-template-columns:minmax(0,1fr);gap:12px}
+  #storage-studio .filesystem-original{grid-column:1;grid-row:2;display:flex;align-items:baseline;gap:8px}
+  #storage-studio .filesystem-target,#storage-studio .filesystem-auto-target,#storage-studio .filesystem-locked{grid-column:1;grid-row:3}
+  #storage-studio .filesystem-auto-target{display:flex;align-items:baseline;gap:8px}
+  #storage-studio .filesystem-locked{display:flex;align-items:center;gap:8px}
+  #storage-studio .filesystem-locked>span{min-height:0}
+  #storage-studio .filesystem-target .size-field{grid-template-columns:minmax(0,1fr) 54px}
+  #storage-studio .filesystem-original strong,#storage-studio .filesystem-auto-target strong{font-size:12px}
+  #storage-studio .filesystem-meter{grid-template-columns:minmax(0,1fr)}
+  #storage-studio .filesystem-minimum{grid-column:1;grid-row:4;justify-content:flex-start}
+  #storage-studio .filesystem-usage{font-size:11px}
 }
 @media(pointer:coarse){
   #storage-studio #storage-plan-button,#storage-studio #storage-fit-button,#storage-studio .size-field input,#storage-studio .size-field select{min-height:44px}

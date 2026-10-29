@@ -3,7 +3,7 @@ from copy import deepcopy
 from pathlib import Path
 import math
 
-from .storage import MIB, GIB, FILESYSTEMS, LVM_GUID, LVM_PIN_ERROR, StorageError, _ceil, _lvm_errors
+from .storage import MIB, GIB, FILESYSTEMS, LVM_GUID, LVM_PIN_ERROR, StorageError, _ceil, _lvm_errors, _lvm_partition_view
 
 
 def _integer(value):
@@ -76,15 +76,7 @@ def plan_growth(inspection, options, disk_size_gib=None):
     pvs, vgs, lvs = (lvm.get(key, []) for key in ("pvs","vgs","lvs"))
     pvpart = None
     if pvs or vgs or lvs:
-        # Normalize only the structural-checker view. Ubuntu installers can
-        # leave a proved LVM PV under the ordinary Linux-data GPT type. Actual
-        # metadata, rather than the type hint, establishes that mapping.
-        pvnames = {pv.get("pv_name") for pv in pvs}
-        checked = [{**part, "type": LVM_GUID if (
-            part.get("type") == 0x8e or (
-                part.get("type") == "0fc63daf-8483-4772-8e79-3d69d8477de4"
-                and part.get("filesystem") == "LVM2_member" and part["device"] in pvnames
-            )) else part.get("type")} for part in parts]
+        checked = _lvm_partition_view(lvm, parts)
         errors.extend(_lvm_errors(lvm, checked, filesystems))
         if len(pvs) == len(vgs) == 1:
             pvpart = next((part for part in parts if part["device"] == pvs[0].get("pv_name")), None)

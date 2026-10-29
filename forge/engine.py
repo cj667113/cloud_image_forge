@@ -678,6 +678,11 @@ class ImageEngine:
         _run(["qemu-img", "convert", "-f", fmt, "-O", "qcow2", str(source), str(work)], log)
         initial_mount_receipt = reconcile_mounts(work, inspection, mount_policy, log)
         resize_inspection = self.inspect(work) if storage_plan["requested"] and initial_mount_receipt["changed"] else inspection
+        from .storage import normalize_rebuild_boot_references
+        storage_boot_receipt = normalize_rebuild_boot_references(
+            work, resize_inspection, storage_plan.get("projected_boot_updates", []), log)
+        if storage_boot_receipt["changed"]:
+            resize_inspection = self.inspect(work)
         work = self._resize(work, destination_dir, resize_inspection, recipe, log)
         edit_mount_receipt = self._customize(work, resize_inspection, recipe, log)
         mount_receipt = initial_mount_receipt
@@ -785,6 +790,7 @@ class ImageEngine:
             if not storage_result["ready"]:
                 raise EngineError("Final storage rebuild verification failed: " + " ".join(storage_result["blockers"]))
             storage_result["plan"] = storage_plan
+            storage_result["boot_reference_updates"] = storage_boot_receipt
         platform_result = None
         if platform_plan["requested"]:
             platform_result = verify_platform(result_inspection, platform_options, oci_config=recipe.get("oci"),

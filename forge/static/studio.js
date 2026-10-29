@@ -83,16 +83,22 @@ function getStorageResizeConfig() {
 function storagePlanBody(config=undefined,disk=undefined,mountPolicy=undefined) {
   return {storage_resize:config===undefined?(getStorageResizeConfig()||{enabled:false,sizes:[]}):config,disk_size_gib:disk===undefined?getDiskSizeGiB():disk,mount_policy:mountPolicy??getMountPolicy()};
 }
+function storageDisplayUnit(mib) { return mib>=1024&&mib%256===0?'gib':'mib'; }
+function storageCapacityText(value) {
+  const mib=Number(value)/MiB;
+  if(!Number.isFinite(mib)||mib<=0)return bytes(value);
+  return Number.isInteger(mib)&&storageDisplayUnit(mib)==='mib'?`${mib.toLocaleString()} MiB`:bytes(value);
+}
 function storageRows() {
   return [...storageFilesystems()].sort((a,b)=>(a.mountpoint==='/'?-1:b.mountpoint==='/'?1:0)).map((fs,index)=>{
     const current=Math.ceil(Number(fs.size||0)/MiB),known=Number.isFinite(fs.used),minimum=Number(fs.minimum_size_mib)||32;
-    const unit=current>=1024&&current%256===0?'gib':'mib',name=fs.mountpoint||fs.device;
+    const unit=storageDisplayUnit(current),name=fs.mountpoint||fs.device;
     const description=fs.mountpoint==='/'?'System':fs.kind==='efi'?'EFI boot':fs.mountpoint==='/boot'?'Boot':fs.kind==='lv'?'Logical volume':'Partition';
     return `<article class="filesystem-row" data-fs-device="${esc(fs.device)}">
       <div class="filesystem-heading"><div><span class="filesystem-dot color-${index%5}"></span><strong>${esc(name)}</strong>${helpHint(`${description} · ${fs.filesystem||'Unknown'} · ${fs.device}${fs.editable?'. Sizes round up to whole MiB, or 4 MiB for LVM.':''}`,`About ${name}`)}</div><span class="filesystem-kind">${esc(description)} · ${esc(fs.filesystem||'Unknown')}</span></div>
-      <div class="filesystem-size-choice"><span class="filesystem-original"><small>Current</small><strong>${bytes(fs.size)}</strong></span><span class="filesystem-auto-target" hidden><small>Planned</small><strong data-fs-auto-size></strong></span>${fs.editable?`<span class="filesystem-arrow" data-rebuild-controls hidden aria-hidden="true">→</span><label class="filesystem-target" data-rebuild-controls hidden><span>New size</span><span class="size-field"><input type="number" id="fs-size-${encodeURIComponent(fs.device)}" data-fs-size-input="${esc(fs.device)}" value="${unit==='gib'?current/1024:current}" min="${unit==='gib'?32/1024:32}" step="${unit==='gib'?'any':'1'}" required aria-label="New capacity of ${esc(name)}"><select id="fs-unit-${encodeURIComponent(fs.device)}" data-fs-size-unit="${esc(fs.device)}" aria-label="Capacity unit for ${esc(name)}"><option value="gib"${unit==='gib'?' selected':''}>GiB</option><option value="mib"${unit==='mib'?' selected':''}>MiB</option></select></span></label><input type="hidden" value="${current}" data-rebuild-device="${esc(fs.device)}">`:`<span class="filesystem-locked">Fixed${helpHint(fs.kind==='efi'?'The EFI partition keeps its original size and boot files.':'This filesystem is not supported for resizing. Refresh inspection if storage evidence is missing.',`Why ${name} is fixed`)}</span>`}</div>
-      <div class="filesystem-visual"><div class="fs-track" role="img"><span class="fs-original-capacity"></span><span class="fs-capacity"><i class="fs-used"></i></span><span class="fs-size-marker"></span></div><div class="filesystem-usage"><span>${known?`${bytes(fs.used)} used`:'Usage unavailable'}</span><span data-fs-difference></span><span class="sr-only" data-fs-planned>${bytes(fs.size)}</span></div></div>
-      ${fs.editable?`<div class="filesystem-resize" data-rebuild-controls hidden><label class="slider-field"><span class="sr-only">Resize ${esc(name)} in MiB</span><input type="range" min="${minimum}" max="${Math.max(current*2,minimum+1024)}" step="1" value="${current}" data-rebuild-slider="${esc(fs.device)}"></label><span class="filesystem-minimum">Min. ${bytes(minimum*MiB)} ${helpHint(`Estimated minimum: ${minimum.toLocaleString()} MiB, including data and headroom. The server checks the layout before building; the estimate is not a guarantee.`,'Minimum size estimate')}</span></div>`:''}
+      <div class="filesystem-size-choice"><span class="filesystem-original"><small>Current</small><strong>${storageCapacityText(fs.size)}</strong></span><span class="filesystem-auto-target" hidden><small>Planned</small><strong data-fs-auto-size></strong></span>${fs.editable?`<label class="filesystem-target" data-rebuild-controls hidden><span>New size</span><span class="size-field"><input type="number" id="fs-size-${encodeURIComponent(fs.device)}" data-fs-size-input="${esc(fs.device)}" value="${unit==='gib'?current/1024:current}" min="${unit==='gib'?32/1024:32}" step="${unit==='gib'?'any':'1'}" required aria-label="New capacity of ${esc(name)}"><select id="fs-unit-${encodeURIComponent(fs.device)}" data-fs-size-unit="${esc(fs.device)}" aria-label="Capacity unit for ${esc(name)}"><option value="gib"${unit==='gib'?' selected':''}>GiB</option><option value="mib"${unit==='mib'?' selected':''}>MiB</option></select></span></label><input type="hidden" value="${current}" data-rebuild-device="${esc(fs.device)}">`:`<span class="filesystem-locked"><small>New size</small><span>Fixed${helpHint(fs.kind==='efi'?'The EFI partition keeps its original size and boot files.':'This filesystem is not supported for resizing. Refresh inspection if storage evidence is missing.',`Why ${name} is fixed`)}</span></span>`}</div>
+      <div class="filesystem-meter"><div class="filesystem-visual"><div class="fs-track" role="img"><span class="fs-original-capacity"></span><span class="fs-capacity"><i class="fs-used"></i></span><span class="fs-size-marker"></span></div><div class="filesystem-usage"><span>${known?`${bytes(fs.used)} used`:'Usage unavailable'}</span><span data-fs-difference></span><span class="sr-only" data-fs-planned>${bytes(fs.size)}</span></div></div>
+      ${fs.editable?`<div class="filesystem-resize" data-rebuild-controls hidden><label class="slider-field"><span class="sr-only">Resize ${esc(name)} in MiB</span><input type="range" min="${minimum}" max="${Math.max(current*2,minimum+1024)}" step="1" value="${current}" data-rebuild-slider="${esc(fs.device)}"></label><span class="filesystem-minimum">Min. ${storageCapacityText(minimum*MiB)} ${helpHint(`Estimated minimum: ${minimum.toLocaleString()} MiB, including data and headroom. The server checks the layout before building; the estimate is not a guarantee.`,'Minimum size estimate')}</span></div>`:''}</div>
       <div class="filesystem-alert" data-fs-alert role="status" hidden></div></article>`;
   }).join('') || '<p class="muted">No filesystem layout is available. Refresh inspection to collect storage evidence.</p>';
 }
@@ -169,7 +175,7 @@ function updateStorageStudio() {
     const field=storageSizeInputs().find(node=>node.dataset.rebuildDevice===fs.device),selected=plan?.filesystems?.find(item=>item.device===fs.device)?.selected_size_mib,next=Number.isFinite(selected)?selected*MiB:enabled&&field?Number(field.value)*MiB:Number(fs.size),current=Number(fs.size)||0,used=Number.isFinite(fs.used)?fs.used:null;
     fsBefore+=current;fsAfter+=Number.isFinite(next)?next:current;
     $('[data-fs-planned]',row).textContent=next>0?bytes(next):'Invalid';
-    const automatic=$('.filesystem-auto-target',row);automatic.hidden=enabled||!Number.isFinite(selected)||next===current;$('[data-fs-auto-size]',row).textContent=next>0?bytes(next):'Invalid';
+    const automatic=$('.filesystem-auto-target',row);automatic.hidden=enabled||!Number.isFinite(selected)||next===current;$('[data-fs-auto-size]',row).textContent=next>0?storageCapacityText(next):'Invalid';
     const max=Math.max(current,next||0,1);
     const track=$('.fs-track',row),bar=$('.fs-capacity',track);
     bar.style.width=`${Math.max(0,Math.min(100,(next||0)/max*100))}%`;
@@ -192,7 +198,8 @@ function renderStoragePlan(plan) {
   if(container.dataset.renderedPlan===signature&&$('.plan-status',container))return;
   container.dataset.renderedPlan=signature;
   const lines=items=>(items||[]).map(item=>`<li>${esc(item)}</li>`).join('');
-  $('#storage-plan').innerHTML=`<div role="status" class="plan-status ${plan.ready?'ready':'blocked'}">${icon(plan.ready?'check':'info')}<strong>${plan.ready?'Storage plan ready':'Resolve storage blockers'}</strong></div>${plan.blockers?.length?`<ul class="plan-blockers" role="alert">${lines(plan.blockers)}</ul>`:''}<div class="plan-facts"><span>Method <strong>${plan.mode==='growth'?'Grow in place on a copy':plan.mode==='unchanged'?'Keep current sizes':'Rebuild filesystems'}</strong></span><span>Minimum disk <strong>${bytes(plan.layout?.minimum_disk_size)}</strong></span><span>Working space <strong>${bytes(plan.estimated_temporary_bytes)}</strong></span></div>${plan.changes?.length?`<details><summary>Planned changes</summary><ul>${lines(plan.changes)}</ul></details>`:''}${plan.warnings?.length?`<details><summary>Checks & limitations (${plan.warnings.length})</summary><ul>${lines(plan.warnings)}</ul></details>`:''}`;
+  const estimate=value=>Number.isFinite(value)&&value>0?bytes(value):'Not determined';
+  $('#storage-plan').innerHTML=`<div role="status" class="plan-status ${plan.ready?'ready':'blocked'}">${icon(plan.ready?'check':'info')}<strong>${plan.ready?'Storage plan ready':'Resolve storage blockers'}</strong></div>${plan.blockers?.length?`<ul class="plan-blockers" role="alert">${lines(plan.blockers)}</ul>`:''}<div class="plan-facts"><span>Method <strong>${plan.mode==='growth'?'Grow in place on a copy':plan.mode==='unchanged'?'Keep current sizes':plan.mode==='rebuild'?'Rebuild filesystems':'Not determined'}</strong></span><span>Minimum disk <strong>${estimate(plan.layout?.minimum_disk_size)}</strong></span><span>Working space <strong>${plan.ready&&plan.estimated_temporary_bytes===0?'Not needed':estimate(plan.estimated_temporary_bytes)}</strong></span></div>${plan.changes?.length?`<details><summary>Planned changes</summary><ul>${lines(plan.changes)}</ul></details>`:''}${plan.warnings?.length?`<details><summary>Checks & limitations (${plan.warnings.length})</summary><ul>${lines(plan.warnings)}</ul></details>`:''}`;
 }
 function beginStudioPlan(button) {
   const requestId=String(++studioState.requestId);
@@ -251,10 +258,11 @@ function setStorageCapacityMode(mode) {
   field.dispatchEvent(new Event('input',{bubbles:true}));
   if(mode==='custom')field.focus({preventScroll:true});
 }
-function syncFilesystemInput(device,fromDisplay=false) {
+function syncFilesystemInput(device,fromDisplay=false,fromSlider=false) {
   const row=$$('[data-fs-device]').find(node=>node.dataset.fsDevice===device);if(!row)return;
   const field=$('[data-rebuild-device]',row),display=$('[data-fs-size-input]',row),unit=$('[data-fs-size-unit]',row);
   if(!field||!display)return;
+  if(fromSlider&&unit.value==='gib'&&storageDisplayUnit(Number(field.value))==='mib')unit.value='mib';
   const scale=unit.value==='gib'?1024:1;
   display.min=String(32/scale);
   display.step=unit.value==='gib'?'any':'1';
@@ -399,7 +407,7 @@ document.addEventListener('focusout',event=>{const anchor=event.target.closest('
 document.addEventListener('keydown',event=>{if(event.key==='Escape'){const anchor=$('.help-anchor.open');if(anchor)studioState.dismissedHelp.add(anchor);closeHelp();}});
 document.addEventListener('input',event=>{
   const input=event.target;
-  if(input.dataset.rebuildSlider){const field=storageSizeInputs().find(node=>node.dataset.rebuildDevice===input.dataset.rebuildSlider);if(field)field.value=input.value;syncFilesystemInput(input.dataset.rebuildSlider);}
+  if(input.dataset.rebuildSlider){const field=storageSizeInputs().find(node=>node.dataset.rebuildDevice===input.dataset.rebuildSlider);if(field)field.value=input.value;syncFilesystemInput(input.dataset.rebuildSlider,false,true);}
   if(input.dataset.fsSizeInput)syncFilesystemInput(input.dataset.fsSizeInput,true);
   if(input.dataset.rebuildDevice)syncFilesystemInput(input.dataset.rebuildDevice);
   if(input.closest('#panel-storage')&&input.name!=='storage-capacity-mode')invalidateStudioPlans('storage');

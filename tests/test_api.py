@@ -707,3 +707,21 @@ def test_automatic_storage_capacity_is_counted_before_uefi_growth_admission(clie
         'storage_resize':selected,'boot_migration':{'enabled':True}})
     assert response.status_code==422 and 'FORGE_MAX_VIRTUAL_GIB' in response.text
     assert len(client.get('/api/jobs').json())==1
+
+
+def test_shrink_preview_recognizes_proved_linux_data_pv_and_paired_grub_repair(client):
+    from test_storage_references import grub_pinned
+    from test_storage import OPTIONS
+    from forge.storage import LINUX_GUID
+    image=grub_pinned();image['storage']['layout']['partitions'][-1]['type']=LINUX_GUID
+    image_id=imported(client);client.app.state.store.update('image',image_id,inspection=image)
+    recipe={'storage_resize':OPTIONS,'disk_size_gib':10,'mount_policy':'auto'}
+    preview=client.post(f'/api/images/{image_id}/storage/plan',json=recipe)
+    assert preview.status_code==200 and preview.json()['ready'],preview.text
+    assert preview.json()['layout']['pv_device']=='/dev/sda3'
+    assert preview.json()['projected_boot_updates'][0]['source_sha256']
+    assert len(client.get('/api/jobs').json())==1
+    recipe['mount_policy']='preserve'
+    response=client.post(f'/api/images/{image_id}/build',json=recipe)
+    assert response.status_code==422 and 'pins internal' in response.text
+    assert len(client.get('/api/jobs').json())==1
