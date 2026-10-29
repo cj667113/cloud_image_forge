@@ -51,8 +51,15 @@ def _fstab_unescape(value):
 def _label_reference(label):
     # Existing labels only. Quotes/backslashes/control characters have differing
     # parser behavior across fstab consumers; prefer the already verified UUID.
-    if (not isinstance(label, str) or not label or len(label.encode("utf-8")) > 256
+    if not isinstance(label, str) or not label:
+        return None
+    try:
+        encoded = label.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    if (len(encoded) > 256
             or any(character in label for character in "\\\"'")
+            or any(character.isspace() and character not in " \t" for character in label)
             or any(not character.isprintable() and character != "\t" for character in label)):
         return None
     return "LABEL=" + label.replace(" ", r"\040").replace("\t", r"\011")

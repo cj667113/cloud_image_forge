@@ -50,7 +50,10 @@ def test_labels_policy_uses_existing_unique_labels_and_preserves_surrounding_tex
 
 
 @pytest.mark.parametrize("label,reason", [("", "no label"), ("BOOT", "not unique"), ('root"name', "safely"),
-                                         (r"root\name", "safely"), ("root\nname", "safely"), ("root\u2028name", "safely")])
+                                         (r"root\name", "safely"), ("root\nname", "safely"), ("root\u2028name", "safely"),
+                                         ("data\u00a0disk", "safely"), ("data\u2007disk", "safely"),
+                                         ("data\u202fdisk", "safely"), ("data\ud800disk", "safely"),
+                                         ("data\udcffdisk", "safely")])
 def test_label_fallback_is_explicit_even_when_existing_uuid_needs_no_edit(label, reason):
     inventory = filesystems()
     inventory[0]["label"] = label
@@ -59,6 +62,20 @@ def test_label_fallback_is_explicit_even_when_existing_uuid_needs_no_edit(label,
     entry = result["entries"][0]
     assert entry["reference_kind"] == "uuid" and reason in entry["fallback_reason"]
     assert any(reason in warning for warning in result["warnings"])
+
+
+@pytest.mark.parametrize("label", ["Données磁盘", "Données 磁盘"])
+def test_unicode_labels_remain_usable_and_round_trip_without_identity_changes(label):
+    inventory = filesystems()
+    inventory[0]["label"] = label
+    original = deepcopy(inventory)
+    result = plan(ROOT, filesystems=inventory, policy="labels")
+    assert result["ready"] and result["entries"][0]["reference_kind"] == "label"
+    assert result["entries"][0]["fallback_reason"] is None
+    assert result["content"] == ROOT.replace("UUID=root-current", "LABEL=" + label.replace(" ", r"\040"))
+    verified = plan(result["content"], filesystems=inventory, policy="labels")
+    assert verified["ready"] and not verified["changes"]
+    assert inventory == original
 
 
 def test_tab_label_is_octal_escaped_and_case_sensitive_uniqueness_is_retained():
