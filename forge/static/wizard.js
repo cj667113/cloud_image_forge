@@ -280,7 +280,8 @@ function wizardRenderReview() {
   add('Source','source',[wizardImage()?.name || 'Selected source',`Architecture: ${architectureName(wizardImage()?.inspection?.os?.arch)}`,`Detected boot: ${bootModeLabel(wizardImage()?.inspection?.boot)}`]);
   add('Storage','storage',[
     plannedCapacity ? `Disk: ${bytes(plannedCapacity)}` : recipe.storage_resize ? 'Size the disk automatically' : 'Keep current disk capacity',
-    ...(recipe.storage_resize?.sizes.length ? recipe.storage_resize.sizes.map(item=>`${storageFilesystems().find(fs=>fs.device===item.device)?.mountpoint || item.device}: ${bytes(item.size_mib*MiB)}`) : sizing?.ready && sizing.root_fill ? sizing.filesystems.filter(fs=>fs.selected_size!==fs.size).map(fs=>`${fs.mountpoint || fs.device}: ${bytes(fs.selected_size)} · automatic`) : sizing?.ready ? ['Keep filesystem capacities'] : recipe.storage_resize ? ['Automatic filesystem sizing'] : [])
+    ...(recipe.storage_resize?.sizes.length ? recipe.storage_resize.sizes.map(item=>`${storageFilesystems().find(fs=>fs.device===item.device)?.mountpoint || item.device}: ${bytes(item.size_mib*MiB)}`) : sizing?.ready && sizing.root_fill ? sizing.filesystems.filter(fs=>fs.selected_size!==fs.size).map(fs=>`${fs.mountpoint || fs.device}: ${bytes(fs.selected_size)} · automatic`) : sizing?.ready ? ['Keep filesystem capacities'] : recipe.storage_resize ? ['Automatic filesystem sizing'] : []),
+    ...(sizing?.ready && sizing.projected_boot_updates?.length ? ['Use filesystem UUIDs for GRUB searches'] : [])
   ],Boolean(recipe.disk_size_gib || recipe.storage_resize));
   const startup = recipe.services.map(item => `${item.action} ${item.name}`);
   startup.push(...recipe.files.filter(file => /\/cron|\/systemd\//.test(file.path)).map(file => `Edit ${file.path}`));
