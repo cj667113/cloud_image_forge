@@ -563,6 +563,8 @@ def plan_guest(inspection: dict, config: dict, allow_network=False, planned_firm
             blockers.append(network_unverified)
     elif not network_ready:
         blockers.append(network_unverified)
+    if not prepare and not network_ready:
+        blockers.extend(portability.get("network_blockers", []))
     if not prepare and bootstrap_ready and not evidence.get("network_ready") and network_ready:
         warnings.append("Retaining the verified Oracle first-boot DHCP path instead of rewriting prior NIC profiles. OCI metadata and a distinct destination instance identity are required; IPv6-only readiness is not inferred from this path.")
     if guest.get("configure_serial_console", True):

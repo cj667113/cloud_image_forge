@@ -1,5 +1,6 @@
 """Preservation accepts proven existing arrangements without normalizing them."""
 from copy import deepcopy
+import fnmatch
 import hashlib
 import json
 from pathlib import Path
@@ -420,6 +421,128 @@ def test_direct_network_requires_automatic_profile_start(path, content):
     with patch("forge.cloud_bootstrap.inspect_bootstrap", return_value={"ready": False, "files": []}):
         result = inspect_portability(Guest(), [], {}, {"network_backend": "NetworkManager", "network_ready": True, "network_files": [path]})
     assert not result["network_direct_ready"]
+
+
+class NetworkPolicyGuest:
+    def __init__(self, files, links=None):
+        self.files, self.links = files, links or {}
+    def lvs(self): return []
+    def is_symlink(self, path): return path in self.links
+    def readlink(self, path): return self.links[path]
+    def is_file(self, path): return path in self.files
+    def is_dir(self, path): return False
+    def glob_expand(self, pattern):
+        return [path for path in self.files.keys() | self.links.keys() if fnmatch.fnmatchcase(path, pattern)]
+    def checksum(self, kind, path): return hashlib.sha256(self.files[path].encode()).hexdigest()
+    def filesize(self, path): return len(self.files[path].encode())
+    def read_file(self, path): return self.files[path]
+    def inspect_get_major_version(self, root): return 26
+    def inspect_get_minor_version(self, root): return 4
+
+
+# Exact defaults from Ubuntu network-manager_1.54.3-2ubuntu3.1_arm64.deb.
+UBUNTU_NM_POLICIES = {
+    "/etc/NetworkManager/NetworkManager.conf": "[main]\nplugins=ifupdown,keyfile\n\n[ifupdown]\nmanaged=false\n\n[device]\nwifi.scan-rand-mac-address=no\n",
+    "/usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf": "[keyfile]\nunmanaged-devices=*,except:type:wifi,except:type:gsm,except:type:cdma\n",
+}
+
+
+def managed_network_facts(backend, *, iscsi=True, mutate=None, links=None):
+    from forge.oci_guest import _network_files, inspect_guest
+    files = {**_network_files(backend, iscsi=iscsi), **UBUNTU_NM_POLICIES,
+             "/usr/sbin/NetworkManager": "binary", "/usr/bin/networkctl": "binary",
+             "/etc/systemd/system/multi-user.target.wants/systemd-networkd.service": "enabled"}
+    if backend == "netplan":
+        files["/usr/sbin/netplan"] = "binary"
+    elif backend == "NetworkManager":
+        files["/etc/systemd/system/multi-user.target.wants/NetworkManager.service"] = "enabled"
+    if mutate:
+        mutate(files)
+    guest = NetworkPolicyGuest(files, links)
+    base = inspect_guest(guest, "/dev/root", [], [])
+    with patch("forge.cloud_bootstrap.inspect_bootstrap", return_value={"version": 1, "ready": False, "files": []}):
+        facts = inspect_portability(guest, [], {}, base)
+    return guest, base, facts
+
+
+@pytest.mark.parametrize("backend", ["netplan", "networkd"])
+@pytest.mark.parametrize("iscsi", [False, True])
+def test_managed_networkd_profiles_ignore_only_inactive_root_nm_policy(backend, iscsi):
+    guest, base, facts = managed_network_facts(backend, iscsi=iscsi)
+    assert base["network_ready"] and facts["network_direct_ready"]
+    assert not facts["network_blockers"]
+    for path in UBUNTU_NM_POLICIES:
+        assert facts["hashes"][path] == "sha256:" + hashlib.sha256(guest.files[path].encode()).hexdigest()
+    assert base["iscsi_network_handover"] is iscsi
+
+
+@pytest.mark.parametrize("backend", ["netplan", "networkd"])
+def test_fresh_managed_network_evidence_passes_oci_validation_without_projection(backend):
+    from test_oci_guest import arm_inspected, config
+    from forge.oci_guest import plan_guest
+    _, base, facts = managed_network_facts(backend)
+    source = arm_inspected()
+    source["os"]["distro"] = "ubuntu"
+    for key in ("network_backend", "network_ready", "network_files", "iscsi_network_handover"):
+        source["oci_evidence"][key] = base[key]
+    source["platform"] = {"portability": facts}
+    assert not plan_guest(source, config(prepare=False))["blockers"]
+    facts["network_blockers"] = ["The network renderer service is masked: /etc/systemd/system/systemd-networkd.service"]
+    blocked = plan_guest(source, config(prepare=False))
+    assert any("Existing network initialization" in error for error in blocked["blockers"])
+    assert facts["network_blockers"][0] in blocked["blockers"]
+
+
+@pytest.mark.parametrize("backend", ["netplan", "networkd"])
+def test_networkd_near_matches_and_competing_renderer_remain_unverified(backend):
+    from forge.oci_guest import _network_files
+    path = next(iter(_network_files(backend)))
+    def altered(files):
+        files[path] = files[path].replace('name: "e*"', 'name: "eth9"').replace('Name=en* eth*', 'Name=eth9')
+    _, _, facts = managed_network_facts(backend, mutate=altered)
+    assert not facts["network_direct_ready"]
+    assert facts["network_blockers"]
+    def competing(files):
+        files["/etc/systemd/system/multi-user.target.wants/NetworkManager.service"] = "enabled"
+        for policy in UBUNTU_NM_POLICIES:
+            files[policy] = "# no unmanaged-device settings\n"
+    _, _, facts = managed_network_facts(backend, mutate=competing)
+    assert not facts["network_direct_ready"]
+    assert any("Competing NetworkManager" in error for error in facts["network_blockers"])
+
+
+@pytest.mark.parametrize("backend", ["netplan", "networkd"])
+def test_inactive_root_nm_exception_requires_enabled_networkd(backend):
+    def disabled(files):
+        files.pop("/etc/systemd/system/multi-user.target.wants/systemd-networkd.service")
+    _, _, facts = managed_network_facts(backend, mutate=disabled)
+    assert not facts["network_direct_ready"] and facts["network_blockers"]
+
+
+def test_netplan_nm_renderer_multiple_profiles_and_active_nm_keep_policy_checks():
+    path = "/etc/netplan/90-cloud-image-forge-oci.yaml"
+    def nm_renderer(files): files[path] = files[path].replace("renderer: networkd", "renderer: NetworkManager")
+    def extra_profile(files): files["/etc/netplan/99-other.yaml"] = "network: {}\n"
+    for mutate in (nm_renderer, extra_profile):
+        _, _, facts = managed_network_facts("netplan", mutate=mutate)
+        assert not facts["network_direct_ready"] and facts["network_blockers"]
+    _, base, facts = managed_network_facts("NetworkManager")
+    assert base["network_backend"] == "NetworkManager"
+    assert not facts["network_direct_ready"]
+    assert any("unmanaged-device policy" in error for error in facts["network_blockers"])
+
+
+@pytest.mark.parametrize("backend,service", [("netplan", "systemd-networkd.service"),
+                                           ("networkd", "systemd-networkd.service"),
+                                           ("NetworkManager", "NetworkManager.service")])
+@pytest.mark.parametrize("override", [False, True])
+def test_renderer_masks_and_dropins_still_block_with_installed_initrd_nm(backend, service, override):
+    path = "/etc/systemd/system/" + service
+    def mutate(files):
+        if override: files[path + ".d/override.conf"] = "[Service]\nExecStart=/bin/false\n"
+    _, _, facts = managed_network_facts(backend, mutate=mutate, links={} if override else {path: "/dev/null"})
+    assert not facts["network_direct_ready"]
+    assert any("drop-ins" in error if override else "masked" in error for error in facts["network_blockers"])
 
 
 class ArchiveGuest:

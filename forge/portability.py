@@ -235,9 +235,10 @@ def _transport(words, devices, root_uuid):
 
 def inspect_portability(g, partitions, evidence, base):
     from .cloud_bootstrap import inspect_bootstrap
-    from .oci_guest import _glob, _network_files, _read
+    from .oci_guest import _enabled, _glob, _network_files, _read
     network_files = base.get("network_files", [])
     direct = bool(base.get("network_ready") and not evidence.get("persistent_network_files"))
+    known_networkd_profile = False
     if base.get("network_backend") == "NetworkManager":
         for path in network_files:
             text = _read(g, path)
@@ -253,8 +254,10 @@ def inspect_portability(g, partitions, evidence, base):
     elif base.get("network_backend") in {"netplan", "networkd"}:
         # These renderers can bind to names even when DHCP is enabled. Recognize
         # the known wildcard profile by content, not a Forge marker/path alone.
-        known = set(_network_files(base["network_backend"]).values())
-        direct = direct and len(network_files) == 1 and _read(g, network_files[0]) in known
+        known = {content for iscsi in (False, True)
+                 for content in _network_files(base["network_backend"], iscsi=iscsi).values()}
+        known_networkd_profile = len(network_files) == 1 and _read(g, network_files[0]) in known
+        direct = direct and known_networkd_profile
     bootstrap = inspect_bootstrap(g, base)
     network_blockers = []
     service = {"NetworkManager": "NetworkManager.service", "netplan": "systemd-networkd.service", "networkd": "systemd-networkd.service"}.get(base.get("network_backend"))
@@ -271,9 +274,18 @@ def inspect_portability(g, partitions, evidence, base):
         if service_dropins:
             network_blockers.append("Network renderer service drop-ins require review: " + ", ".join(sorted(service_dropins)))
     manager_files = ["/etc/NetworkManager/NetworkManager.conf"] + _glob(g, "/etc/NetworkManager/conf.d/*.conf") + _glob(g, "/usr/lib/NetworkManager/conf.d/*.conf")
+    manager_enabled = _enabled(g, "NetworkManager.service")
+    if known_networkd_profile and manager_enabled:
+        network_blockers.append("Competing NetworkManager service is enabled alongside the networkd renderer.")
+    # Installing NM for firmware discovery must not make its unused root
+    # policies govern networkd. Only the exact managed networkd profile, an
+    # enabled networkd service and a disabled NM service establish this case.
+    # Unknown/netplan-NM profiles retain the conservative policy checks.
+    initrd_only_manager = (known_networkd_profile and _enabled(g, "systemd-networkd.service")
+                          and not manager_enabled)
     for path in manager_files:
         active = "\n".join(line for line in _read(g, path).splitlines() if not line.lstrip().startswith(("#", ";")))
-        if re.search(r"^\s*(?:unmanaged-devices\s*=\s*\S|managed\s*=\s*(?:false|no|0)\s*$)", active, re.M | re.I):
+        if not initrd_only_manager and re.search(r"^\s*(?:unmanaged-devices\s*=\s*\S|managed\s*=\s*(?:false|no|0)\s*$)", active, re.M | re.I):
             network_blockers.append("NetworkManager unmanaged-device policy requires review: " + path)
     paths = {"/etc/fstab", "/etc/default/grub", "/etc/kernel/cmdline", "/etc/cloud/cloud-init.disabled"}
     for key in ("boot_files", "generated_grub"):
