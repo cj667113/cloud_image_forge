@@ -147,6 +147,8 @@ def test_archive_companion_import_uses_native_oci_type_and_filename():
     handoff = json.loads(files["image-import.json"])
     assert handoff["sourceImageType"] == "OCI"
     assert handoff["name"] == "image.oci"
+    assert "Upload the OCI image archive (.oci)" in files["README.txt"]
+    assert "The QCOW2 must be uploaded" not in files["README.txt"]
 
 
 def test_import_and_schema_handoff_contains_every_setting_in_right_api_location():

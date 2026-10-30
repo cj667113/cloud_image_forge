@@ -462,7 +462,7 @@ def bundle_files(config: OciConfig, artifact: dict) -> dict[str, str]:
     rendered["README.txt"] = (
         "OCI configuration for a Cloud Image Forge artifact\n\n"
         "This ZIP contains configuration only. It is NOT an OCI .oci image archive.\n"
-        "The QCOW2 must be uploaded separately to OCI Object Storage. Generic S3 upload does not register an OCI image.\n"
+        f"Upload the {'OCI image archive (.oci)' if artifact.get('format') == 'oci' else 'standalone QCOW2 disk'} to OCI Object Storage. This configuration ZIP is separate; generic S3 upload does not register an OCI image.\n"
         "No cloud command has been run. Review every file and replace all REPLACE_* values before using it.\n"
         "Presigned object URIs, if supplied, are included in image-import.json and the profile; keep this ZIP private.\n\n"
         "1. Obtain the target region/tenancy schema (do not guess its version):\n"
