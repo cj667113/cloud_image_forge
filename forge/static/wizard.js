@@ -122,7 +122,7 @@ function wizardUpdate() {
   build.hidden = session.step !== 'review';
   build.disabled = busy || wizardInspectionPending() || wizardBuildPending();
   const target = $('input[name="target"]:checked')?.value || 'oci';
-  $('#build-summary').textContent = `${profiles[target].label} · ${($('input[name="target"]:checked')?.value === 'generic' ? $('#output-format').value : profiles[target].format).toUpperCase()}`;
+  $('#build-summary').textContent = `${profiles[target].label} · ${selectedOutputFormat().toUpperCase()}`;
   $('#wizard-footer-help').textContent = wizardBuildPending() ? 'Build in progress' : '';
   const selector = $('#image-select'); if (selector) selector.disabled = busy;
   if (session.step === 'review') wizardRenderReview();
@@ -297,7 +297,7 @@ function wizardRenderReview() {
   if (recipe.regenerate_grub) boot.push('Regenerate GRUB configuration');
   boot.push(...recipe.files.filter(file => /\/modules-load\.d\/|\/modprobe\.d\//.test(file.path)).map(file => `Edit ${file.path}`));
   add('Boot and kernel','boot',boot,Boolean(recipe.boot_migration || recipe.kernel_default || recipe.kernel_args || recipe.packages_install.length || recipe.packages_remove.length || recipe.rebuild_initramfs || recipe.regenerate_grub || recipe.allow_network || recipe.files.some(file => /\/modules-load\.d\/|\/modprobe\.d\//.test(file.path))));
-  add('Destination','export',[profiles[recipe.target].label,`Output: ${recipe.output_format.toUpperCase()}`,recipe.sparsify ? 'Reclaim unused space' : 'Keep unused blocks',...(recipe.output_format === 'qcow2' ? [recipe.compress ? 'Compress QCOW2 output' : 'Uncompressed QCOW2 output'] : [])]);
+  add('Destination','export',[profiles[recipe.target].label,`Output: ${recipe.output_format.toUpperCase()}`,recipe.sparsify ? 'Reclaim unused space' : 'Keep unused blocks',...(['qcow2','oci'].includes(recipe.output_format) ? [recipe.compress ? 'Compress QCOW2 output' : 'Uncompressed QCOW2 output'] : [])]);
   if(recipe.platform_migration) { const platform=recipe.platform_migration;add('Hardware compatibility','export',[platform.strategy==='preserve'?'Preserve & validate · hardware settings unchanged':'Reconfigure hardware settings',platform.source==='unknown'?`Destination: ${platform.target==='vm'?'Virtual machine':'Bare metal'}; previous platform unspecified`:`${platform.source==='vm'?'Virtual machine':'Bare metal'} → ${platform.target==='vm'?'Virtual machine':'Bare metal'}`,`Boot: ${platform.boot_attachment}; network: ${platform.network_attachment==='accelerated'?'Accelerated PV':platform.network_attachment}`,...(platform.nic_driver?[platform.nic_driver==='auto'?'NIC drivers: automatic available bundle':`NIC driver: ${platform.nic_driver}`]:[]),...(platform.target==='bare_metal'?['Experimental · OCI bare-metal BYOI is unsupported']:[])]); }
   if (recipe.target === 'oci') {
     const firmware = recipe.oci?.capabilities?.['Compute.Firmware'];

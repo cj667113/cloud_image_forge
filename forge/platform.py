@@ -52,7 +52,7 @@ def _iscsi_backend(content):
     return None
 
 
-def _iscsi_archive_ready(g, path, members):
+def _iscsi_userspace_ready(g, path, members):
     """Evidence from the archive itself, not just the installed package files."""
     names = {name.lstrip("./") for name in members}
     root = next((name for name in ("usr/sbin/iscsiroot", "sbin/iscsiroot") if name in names), None)
@@ -83,7 +83,12 @@ def _iscsi_archive_ready(g, path, members):
     return True
 
 
-def iscsi_initramfs_checks(path, listing_variable="listing"):
+def _iscsi_archive_ready(g, path, members):
+    from .iscsi_network import inspect_archive_network
+    return _iscsi_userspace_ready(g, path, members) and inspect_archive_network(g, path, members)["ready"]
+
+
+def iscsi_initramfs_checks(path, listing_variable="listing", *, firmware_network=False):
     """Native archive proof shared by platform and OCI dracut preparation.
 
 Modern dracut's firmware handler uses iscsiadm/iscsid, while older handlers
@@ -93,7 +98,7 @@ complete toolchain; merely finding an unused helper is insufficient.
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", listing_variable):
         raise ValueError("Unsafe initramfs listing variable")
     quoted = shlex.quote(str(path))
-    return [
+    checks = [
         "forge_iscsi_has() { printf '%s\\n' \"${" + listing_variable + "}\" | grep -Eq \"$1\"; }",
         "forge_iscsi_fail() { echo \"iSCSI initramfs verification failed: $1\" >&2; exit 1; }",
         f"forge_iscsi_modules=$(lsinitrd -m {quoted})",
@@ -113,6 +118,17 @@ complete toolchain; merely finding an unused helper is insufficient.
         "  forge_iscsi_has '(^|[[:space:]])(usr/)?s?bin/iscsistart([[:space:]]|$)' || forge_iscsi_fail 'legacy firmware helper iscsistart missing'",
         "else forge_iscsi_fail 'unrecognized firmware discovery implementation'; fi",
     ]
+
+    if firmware_network:
+        checks += [
+            "printf '%s\\n' \"$forge_iscsi_modules\" | grep -Eq '^[[:space:]]*network-manager[[:space:]]*$' || forge_iscsi_fail 'firmware-aware NetworkManager module missing'",
+            "if printf '%s\\n' \"$forge_iscsi_modules\" | grep -Eq '^[[:space:]]*(systemd-networkd|network-legacy)[[:space:]]*$'; then forge_iscsi_fail 'competing initrd network backend'; fi",
+            "forge_iscsi_has '(^|[[:space:]])usr/(libexec|lib)/nm-initrd-generator([[:space:]]|$)' || forge_iscsi_fail 'iBFT network generator missing'",
+            "forge_iscsi_has '(^|[[:space:]])(usr/)?sbin/NetworkManager([[:space:]]|$)' || forge_iscsi_fail 'initrd NetworkManager daemon missing'",
+            "forge_iscsi_has '(^|[[:space:]])(usr/|var/)?lib/dracut/hooks/cmdline/[0-9]+-nm-config\\.sh([[:space:]]|$)' || forge_iscsi_fail 'initrd network configuration hook missing'",
+            "forge_iscsi_has '(^|[[:space:]])(usr/|var/)?lib/dracut/hooks/initqueue/settled/[0-9]+-nm-run\\.sh([[:space:]]|$)' || forge_iscsi_fail 'initrd network online hook missing'",
+        ]
+    return checks
 
 
 def _module_inventory(g, version, text, installed=False):
@@ -245,6 +261,7 @@ def _generated_grub_evidence(g, partitions):
 def _inspect_platform(g, root, partitions, kernels, oci_evidence=None):
     """Read evidence only; old imports need refreshing before migration."""
     from .oci_guest import inspect_guest
+    from .iscsi_network import installed_generator
     from .portability import inspect_archive, inspect_portability
     base = deepcopy(oci_evidence) if oci_evidence is not None else inspect_guest(g, root, partitions, kernels)
     inventory = {}
@@ -265,7 +282,7 @@ def _inspect_platform(g, root, partitions, kernels, oci_evidence=None):
                 members = g.initrd_list(initrd)
                 listed = sorted({match.group(1).replace("-", "_") for name in members
                                  if (match := re.search(r"/([A-Za-z0-9_-]+)\.ko(?:\.(?:xz|gz|zst))?$", "/" + name))})
-                iscsi_userspace = _iscsi_archive_ready(g, initrd, members)
+                iscsi_userspace = _iscsi_userspace_ready(g, initrd, members)
             except RuntimeError:
                 pass
             try:
@@ -280,7 +297,7 @@ def _inspect_platform(g, root, partitions, kernels, oci_evidence=None):
                 members = parsed.initrd_list(initrd)
                 listed = sorted({match.group(1).replace("-", "_") for name in members
                                  if (match := re.search(r"/([A-Za-z0-9_-]+)\.ko(?:\.(?:xz|gz|zst))?$", "/" + name))})
-                iscsi_userspace = _iscsi_archive_ready(parsed, initrd, members)
+                iscsi_userspace = _iscsi_userspace_ready(parsed, initrd, members)
                 archive = inspect_archive(parsed, initrd, members)
                 archive["decoder"] = "bounded_newc"
                 archive["formats"] = list(getattr(parsed, "formats", []))
@@ -319,6 +336,8 @@ def _inspect_platform(g, root, partitions, kernels, oci_evidence=None):
             "boot_environment_paths": environment_paths,
             "dracut_modules": sorted({re.sub(r"^\d+", "", PurePosixPath(p).name)
                                       for p in _glob(g, "/usr/lib/dracut/modules.d/*")}),
+            "nm_initrd_generator": installed_generator(g),
+            "iscsi_network_handover": base.get("iscsi_network_handover", False),
             "iscsi_userspace_backend": _iscsi_backend(_read(g, iscsi_directory + "/iscsiroot.sh")) if iscsi_directory else None,
             "network_backend": base.get("network_backend"), "network_ready": base.get("network_ready", False),
             "network_files": base.get("network_files", []), "serial_console_ready": base.get("serial_console_ready", False),
@@ -626,15 +645,12 @@ def plan_platform(inspection, options, allow_network=False, oci_config=None, tar
             blockers.append("Installed dracut firmware iSCSI discovery handler is not recognized; inspect or update the guest dracut package before migration.")
         plan["iscsi_userspace_backend"] = iscsi_backend
         modules = set(evidence.get("dracut_modules", []))
-        network_module = ("network-manager" if "network-manager" in modules and tools.get("NetworkManager") else
-                          "network" if "network" in modules else
-                          "network-legacy" if "network-legacy" in modules else None)
-        plan["dracut_network_module"] = network_module
-        if "iscsi" not in modules or not network_module:
-            if (rpm or deb) and options.get("install_packages") and allow_network:
-                packages.add("dracut-network")
-            else:
-                blockers.append("The dracut iSCSI and network modules must be installed (dracut-network on Enterprise Linux, Debian and Ubuntu).")
+        from .iscsi_network import plan_network
+        firmware_network = plan_network(evidence, install=options.get("install_packages"), allow_network=allow_network, rpm=rpm)
+        plan["dracut_network_module"] = firmware_network["module"]
+        packages.update(firmware_network["packages"])
+        blockers.extend(firmware_network["blockers"])
+        actions.append("Use NetworkManager's firmware-aware iBFT generator inside the initramfs; retain the post-root network renderer and verify its network-root handover policy.")
         actions.append("Prepare firmware-discovered iSCSI boot with netroot=iscsi, rd.iscsi.firmware=1 and rd.neednet=1; rebuild and verify the iSCSI userspace in every initramfs.")
         warnings.append("The target firmware must supply valid iBFT/iSCSI boot parameters. This image does not invent an OCI address, IQN, credentials or initiator identity, and cannot verify firmware discovery offline.")
     else:
@@ -675,12 +691,15 @@ def plan_platform(inspection, options, allow_network=False, oci_config=None, tar
         if item.get("optional") and item.get("preserve"):
             warnings.append(f"Optional mount {item['mountpoint']} is not present in this disk and will be retained; validate it on the target.")
     plan["network_backend"] = evidence.get("network_backend")
+    plan["iscsi_network_handover"] = bool(evidence.get("iscsi_network_handover"))
     if options.get("configure_network", True):
         if plan["network_backend"] not in {"NetworkManager", "netplan", "networkd"}:
             blockers.append("No supported DHCP renderer is installed (NetworkManager, netplan or systemd-networkd).")
         actions.append("Back up existing network profiles and persistent NIC rules, then configure DHCP without a source-machine MAC/interface binding.")
     elif not evidence.get("network_ready") or evidence.get("persistent_network_files"):
         blockers.append("Network changes are disabled and portable DHCP/persistent-name readiness is not verified.")
+    if boot == "iscsi" and not options.get("configure_network", True) and not evidence.get("iscsi_network_handover"):
+        blockers.append("Network changes are disabled and retention of firmware-root connectivity across switch-root is unverified; enable managed network preparation or configure it explicitly.")
     if options.get("configure_serial_console", True):
         actions.append(f"Enable {plan['serial_device']} at 115200 baud and serial-getty while preserving unrelated console and boot settings.")
     try:
@@ -801,7 +820,7 @@ def _initramfs_script(inspection, plan, options):
         if plan["initramfs_backend"] == "dracut":
             command = "dracut --force --no-hostonly --no-hostonly-cmdline --add-drivers " + shlex.quote(" ".join(modular))
             if options["boot_attachment"] == "iscsi":
-                command += " --add " + shlex.quote("iscsi " + plan["dracut_network_module"])
+                command += " --add " + shlex.quote("iscsi " + plan["dracut_network_module"]) + " --omit 'systemd-networkd network-legacy'"
             commands += [command + " " + shlex.quote(path) + " " + shlex.quote(version), "listing=$(lsinitrd " + shlex.quote(path) + ")"]
         else:
             commands += ["update-initramfs " + ("-u" if kernel.get("initrd") else "-c") + " -k " + shlex.quote(version),
@@ -810,7 +829,7 @@ def _initramfs_script(inspection, plan, options):
             expression = "/" + module.replace("_", "[-_]") + r"\.ko([. /]|$)"
             commands.append("printf '%s\\n' \"$listing\" | grep -Eq " + shlex.quote(expression) + " || { echo " + shlex.quote("Required platform driver absent from initramfs " + version + ": " + module) + " >&2; exit 1; }")
         if options["boot_attachment"] == "iscsi":
-            commands += iscsi_initramfs_checks(path)
+            commands += iscsi_initramfs_checks(path, firmware_network=True)
     return "\n".join(commands)
 
 
@@ -930,9 +949,10 @@ def verify_platform(inspection, options, *, oci_config=None, target_provider="oc
             missing -= set(record.get("modules", []))
         if missing:
             blockers.append(f"Kernel {version}: resulting initramfs inclusion is unverified for {', '.join(sorted(missing))}.")
-        if options.get("boot_attachment") == "iscsi" and not (kernel.get("initrd_iscsi_userspace")
-                                                                or matching_receipt and record.get("iscsi_boot") is True):
+        if options.get("boot_attachment") == "iscsi" and not (kernel.get("initrd_iscsi_userspace") and kernel.get("portability", {}).get("firmware_network", {}).get("ready")):
             blockers.append(f"Kernel {version}: resulting initramfs iSCSI boot userspace is unverified.")
+    if options.get("boot_attachment") == "iscsi" and not evidence.get("iscsi_network_handover"):
+        blockers.append("Resulting firmware-root networking does not prove connection retention across switch-root.")
     if not evidence.get("network_ready") or evidence.get("persistent_network_files"):
         blockers.append("Resulting portable DHCP configuration or persistent NIC naming is not verified.")
     if options.get("configure_serial_console", True) and (not evidence.get("serial_console_ready")
@@ -991,15 +1011,20 @@ def prepare_platform(work: Path, inspection, options, allow_network, log, *, oci
         return final
     for action in plan["actions"]:
         log("Platform: " + action)
+    original_network_backend = plan.get("network_backend")
     if plan["packages"]:
         _run(["virt-customize", "--format", "qcow2", "-a", str(work), "--network", "--install", ",".join(plan["packages"])], log)
         inspection = ImageEngine().inspect(work)
+        # Installing an initrd helper must not select a different root renderer.
+        inspection["platform"]["network_backend"] = original_network_backend
         plan = plan_platform(inspection, options, False, oci_config, target_provider, mount_policy=mount_policy)
         if not plan["ready"]:
             raise EngineError("Platform prerequisites remain missing after package installation: " + " ".join(plan["blockers"]))
     evidence = inspection["platform"]
     backup = BACKUPS + "/" + uuid4().hex
     commands = ["set -eu"]
+    if options["boot_attachment"] == "iscsi" and plan["network_backend"] != "NetworkManager":
+        commands += ["systemctl --root=/ disable NetworkManager.service NetworkManager-wait-online.service"]
     try:
         with _guest(work, "qcow2", readonly=False) as g:
             _mount(g, _roots(g), False)
@@ -1021,11 +1046,11 @@ def prepare_platform(work: Path, inspection, options, allow_network, log, *, oci
             else:
                 dracut = 'hostonly="no"\nhostonly_cmdline="no"\nadd_drivers+=" ' + " ".join(plan["required_modules"]) + ' "\n'
                 if options["boot_attachment"] == "iscsi":
-                    dracut += 'add_dracutmodules+=" iscsi ' + plan["dracut_network_module"] + ' "\n'
+                    dracut += 'add_dracutmodules+=" iscsi ' + plan["dracut_network_module"] + ' "\nomit_dracutmodules+=" systemd-networkd network-legacy "\n'
                 _write(g, "/etc/dracut.conf.d/90-cloud-image-forge-platform.conf",
                        dracut, backup)
             if options.get("configure_network", True):
-                generated = _network_files(plan["network_backend"])
+                generated = _network_files(plan["network_backend"], iscsi=options["boot_attachment"] == "iscsi")
                 for path in set(evidence.get("network_files", []) + evidence.get("persistent_network_files", [])) - set(generated):
                     _backup(g, path, backup)
                     if g.is_file(path):
@@ -1059,7 +1084,9 @@ def prepare_platform(work: Path, inspection, options, allow_network, log, *, oci
                 raise EngineError(f"Kernel {version}: inspected initramfs is not the file whose driver contents were verified.")
         receipt = {"verified_initrds": {version: {"path": kernel.get("initrd"), "sha256": kernel.get("initrd_sha256"),
                                                 "modules": sorted(set(plan["required_modules"]) - set(kernel.get("builtin", []))),
-                                                "iscsi_boot": options["boot_attachment"] == "iscsi"}
+                                                "iscsi_boot": options["boot_attachment"] == "iscsi",
+                                                "firmware_network": deepcopy(kernel.get("portability", {}).get("firmware_network")),
+                                                "projected": False}
                                         for version, kernel in after_kernels.items()}}
         final = verify_platform(after, options, oci_config=oci_config, target_provider=target_provider, receipt=receipt, mount_policy=mount_policy)
         if not final["ready"]:

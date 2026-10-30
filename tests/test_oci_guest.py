@@ -114,6 +114,9 @@ class PlanTests(unittest.TestCase):
         kernel = next(iter(image["oci_evidence"]["kernels"].values()))
         kernel["config"].update(CONFIG_ACPI="y", CONFIG_PCI="y")
         image["oci_evidence"]["iscsi_boot_configured"] = True
+        image["oci_evidence"]["iscsi_network_handover"] = True
+        image["platform"] = {"kernels": {version: {"initrd_iscsi_userspace": True, "portability": {"firmware_network": {"ready": True}}}
+                                         for version in image["oci_evidence"]["kernels"]}}
         result = plan_guest(image, profile, platform_nic_driver="mlx5_core")
         self.assertEqual(result["blockers"], [])
         kernel["modules"].remove("mlx5_core")

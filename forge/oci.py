@@ -13,7 +13,8 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 import zipfile
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, field_validator, model_validator
+from uuid import UUID
 
 from .architecture import normalize_arch
 
@@ -209,6 +210,16 @@ class OciConfig(StrictModel):
     import_options: ImportOptions = Field(default_factory=ImportOptions)
     global_schema_version: str | None = Field(default=None, max_length=256)
     global_schema: dict | None = None
+    image_caps_format_version: str | None = Field(default=None, max_length=36)
+
+    @field_validator("image_caps_format_version")
+    @classmethod
+    def metadata_format_uuid(cls, value):
+        if value is None:
+            return None
+        if not isinstance(value, str) or str(UUID(value)) != value.lower():
+            raise ValueError("OCI metadata format must be a canonical UUID from an image_metadata.json reference")
+        return value.lower()
 
     @model_validator(mode="after")
     def validate_capabilities(self):
@@ -270,6 +281,17 @@ def compatibility_plan(inspection: dict, config: OciConfig, allow_network=False,
             planned_guest = evidence.setdefault("oci_evidence", {})
             if project_platform and platform_migration.get("boot_attachment") == "iscsi":
                 planned_guest["iscsi_boot_configured"] = True
+                if platform_plan.get("dracut_network_module") == "network-manager":
+                    planned_platform = evidence.setdefault("platform", {})
+                    planned_platform.setdefault("tools", {})["NetworkManager"] = True
+                    planned_platform["nm_initrd_generator"] = True  # Planned installation; final inspection supplies its actual path.
+                    for kernel in planned_platform.get("kernels", {}).values():
+                        kernel["initrd_iscsi_userspace"] = True
+                        kernel.setdefault("portability", {})["firmware_network"] = {
+                            "version": 1, "ready": True, "backend": "network-manager", "projected": True, "errors": []}
+                    if platform_migration.get("configure_network", True):
+                        planned_guest["iscsi_network_handover"] = True
+                        planned_platform["iscsi_network_handover"] = True
             if project_platform and platform_migration.get("configure_network", True):
                 planned_guest["network_ready"] = True
             if project_platform and platform_migration.get("configure_serial_console", True):
@@ -281,6 +303,10 @@ def compatibility_plan(inspection: dict, config: OciConfig, allow_network=False,
                 for key in ("modules", "builtin"):
                     kernel[key] = sorted(set(kernel.get(key, [])) | set(physical.get(key, [])))
                 kernel["initrd_modules"] = sorted(set(kernel.get("initrd_modules") or []) | set(platform_plan.get("required_modules", [])))
+                if (platform_migration.get("boot_attachment") == "iscsi"
+                        and platform_plan.get("dracut_network_module") == "network-manager"):
+                    kernel.setdefault("portability", {})["firmware_network"] = {
+                        "version": 1, "ready": True, "backend": "network-manager", "projected": True, "errors": []}
     # A known hardware target must not pass based on an unrelated installed VF
     # driver. The reviewed E5 host exposes ConnectX-6 Dx physical functions.
     if bm_e5_selected:
@@ -392,7 +418,7 @@ def bundle_files(config: OciConfig, artifact: dict) -> dict[str, str]:
     comp = options.compartment_id or "REPLACE_COMPARTMENT_OCID"
     version = config.global_schema_version or "REPLACE_GLOBAL_SCHEMA_VERSION"
     image_id = "REPLACE_IMPORTED_IMAGE_OCID"
-    imports = {"compartmentId": comp, "sourceImageType": "QCOW2", "launchMode": options.launch_mode,
+    imports = {"compartmentId": comp, "sourceImageType": "OCI" if artifact.get("format") == "oci" else "QCOW2", "launchMode": options.launch_mode,
                "displayName": options.display_name or "Cloud Image Forge image",
                "freeformTags": options.freeform_tags, "definedTags": options.defined_tags}
     if options.operating_system:
@@ -404,7 +430,7 @@ def bundle_files(config: OciConfig, artifact: dict) -> dict[str, str]:
         imports["uri"] = options.object_uri
     else:
         imports.update(namespace=options.namespace or "REPLACE_NAMESPACE", bucketName=options.bucket or "REPLACE_BUCKET",
-                       name=options.object_name or artifact.get("name", "image.qcow2"))
+                       name=options.object_name or artifact.get("name", "image.oci" if artifact.get("format") == "oci" else "image.qcow2"))
     schema = {"compartmentId": comp, "imageId": image_id, "globalImageCapabilitySchemaVersionName": version,
               "schemaData": capability_schema(config), "displayName": ((options.display_name or "Cloud Image Forge") + " capabilities")[:255],
               "definedTags": options.defined_tags, "freeformTags": options.freeform_tags}

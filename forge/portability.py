@@ -84,6 +84,8 @@ def inspect_archive(g, path, members=None):
         target = any(name in names for name in ("usr/lib/systemd/system/initrd-root-device.target", "lib/systemd/system/initrd-root-device.target"))
         result["iscsi_local_root_completion"] = bool(systemd and target and hooks and all(
             _local_root_completion(_archive_text(g, path, name)) for name in hooks))
+        from .iscsi_network import inspect_archive_network
+        result["firmware_network"] = inspect_archive_network(g, path, members) if "iscsi" in result["dracut_modules"] else None
         result["readable"] = True
     except (RuntimeError, ValueError, UnicodeError, AttributeError, TypeError) as exc:
         result["errors"].append(str(exc))
@@ -464,7 +466,7 @@ def assess_portability(inspection, options, target_provider="oci"):
             status = "unknown" if status == "ready" else status
             problems.append(f"Kernel {version}: initramfs fingerprint cannot be read.")
         if boot == "iscsi" or version in optional_versions:
-            if not kernel.get("initrd_iscsi_userspace"):
+            if not kernel.get("initrd_iscsi_userspace") or boot == "iscsi" and not (archive.get("firmware_network") or {}).get("ready"):
                 status = "unknown" if status == "ready" else status
                 problems.append(f"Kernel {version}: archived firmware iSCSI userspace is unverified.")
         if root.get("is_lv") and not archive.get("lvm_userspace"):
@@ -485,13 +487,17 @@ def assess_portability(inspection, options, target_provider="oci"):
     bootstrap = facts.get("network_bootstrap", {})
     bootstrap_ready = target_provider == "oci" and bootstrap.get("ready") is True
     network_ready = (facts.get("network_direct_ready") or bootstrap_ready) and not facts.get("network_blockers")
+    if boot == "iscsi" and not evidence.get("iscsi_network_handover"):
+        network_ready = False
+        result["blockers"].append("Existing firmware-root network handover is unverified; retain the initrd connection with an explicit supported policy before preserving this hardware profile.")
     check("network", "Existing network initialization", "ready" if network_ready else "unknown",
           ["Existing unbound DHCP configuration is retained."] if network_ready and facts.get("network_direct_ready") else bootstrap.get("evidence", []) if network_ready else ["Neither portable DHCP nor an enabled, verified destination network initialization path could be established."] + facts.get("network_blockers", []) + bootstrap.get("blockers", []) + (["Oracle datasource bootstrapping requires OCI metadata; it does not establish generic-target networking."] if bootstrap.get("ready") and target_provider != "oci" else []))
     if arch == "x86_64" and nic in NIC_DRIVERS and result["kernels"]:
         dual_required = PV_DRIVERS | {"virtio_net", nic, "iscsi_tcp", "iscsi_ibft"}
         dual = all(dual_required <= (set(kernel.get("modules", [])) | set(kernel.get("builtin", [])))
                    and dual_required <= (set(kernel.get("initrd_modules") or []) | set(kernel.get("builtin", [])))
-                   and kernel.get("initrd_iscsi_userspace") and kernel.get("portability", {}).get("iscsi_local_root_completion")
+                   and kernel.get("initrd_iscsi_userspace") and (kernel.get("portability", {}).get("firmware_network") or {}).get("ready")
+                   and kernel.get("portability", {}).get("iscsi_local_root_completion")
                    for kernel in evidence.get("kernels", {}).values())
         result["dual_environment"] = {"status": "ready" if dual and not result["blockers"] and result["root_transport"] == "optional_firmware_iscsi" else "unknown",
                                        "nic_driver": nic, "scope": "offline_prerequisites", "boot_tested": False}

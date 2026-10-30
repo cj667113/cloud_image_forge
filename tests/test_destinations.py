@@ -145,7 +145,7 @@ def test_required_download_preview_does_not_grant_network_or_package_consent():
                               "firmware": {"UEFI_64": True}, "network_backend": "netplan"}
     before = deepcopy(source)
     bare = resolve_destination(source, {"profile_id": "oci:BM.Standard.A1.160"})
-    assert bare["required_packages"] == ["dracut-network"]
+    assert bare["required_packages"] == ["dracut-network", "network-manager"]
     assert bare["platform_migration"]["install_packages"] is False
     assert "allow_network" not in bare and source == before
     vm = resolve_destination(source, {"profile_id": "oci:aarch64:vm"})

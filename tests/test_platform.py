@@ -17,7 +17,7 @@ from forge.engine import EngineError
 from forge.platform import (MODULE_CONFIG, _adapt_args, _boot_args, _fstab_evidence,
                             _fstab_text, _initramfs_script, _inspect_boot_environment, _safe_path,
                             _generated_grub_evidence,
-                            _iscsi_archive_ready, _iscsi_backend, iscsi_initramfs_checks,
+                            _iscsi_userspace_ready, _iscsi_backend, iscsi_initramfs_checks,
                             inspect_platform, plan_platform, prepare_platform, verify_platform)
 
 
@@ -42,7 +42,7 @@ def image():
             "platform": {"version": 1,
                          "kernels": {KERNEL: {"modules": drivers, "builtin": [],
                                               "initrd": f"/boot/initramfs-{KERNEL}.img", "initrd_modules": drivers,
-                                              "initrd_sha256": "a" * 64, "initrd_iscsi_userspace": True}},
+                                              "initrd_sha256": "a" * 64, "initrd_iscsi_userspace": True, "portability": {"firmware_network": {"ready": True}}}},
                          "tools": {name: True for name in ("dracut", "lsinitrd", "systemctl", "grub2-mkconfig", "grubby", "iscsiadm", "iscsistart", "iscsid", "iscsi-iname", "dnf", "NetworkManager")},
                          "fstab": {"entries": [{"line": 1, "mountpoint": "/", "source": "UUID=" + ROOT_UUID,
                                                  "replacement": "UUID=" + ROOT_UUID}], "errors": [], "root_uuid": ROOT_UUID,
@@ -50,6 +50,7 @@ def image():
                          "boot_files": {"/etc/default/grub": f'GRUB_CMDLINE_LINUX="quiet root=UUID={ROOT_UUID}"\n'},
                          "generated_grub": {"/boot/grub2/grub.cfg": f"linux /vmlinuz-{KERNEL} root=UUID={ROOT_UUID} quiet\n"},
                          "dracut_modules": ["iscsi", "network-manager"],
+                         "nm_initrd_generator": "/usr/libexec/nm-initrd-generator", "iscsi_network_handover": True,
                          "iscsi_userspace_backend": "iscsiadm",
                          "network_backend": "NetworkManager", "network_ready": True, "network_files": [],
                          "persistent_network_files": [], "serial_console_ready": True, "blacklisted_modules": [], "os_version": {"major": 9, "minor": 8}}}
@@ -262,14 +263,15 @@ class InspectionTests(unittest.TestCase):
 
 
 class PlanTests(unittest.TestCase):
-    def test_network_dispatcher_does_not_force_uninstalled_networkmanager(self):
+    def test_network_dispatcher_cannot_substitute_dhcp_for_firmware_networking(self):
         source = image()
         source["platform"]["tools"]["NetworkManager"] = False
         source["platform"]["dracut_modules"] = ["iscsi", "network-manager", "network", "systemd-networkd"]
         profile = options(source="vm", target="bare_metal", boot_attachment="iscsi", network_attachment="vfio", nic_driver="mlx5_core")
         plan = plan_platform(source, profile)
-        self.assertTrue(plan["ready"], plan["blockers"])
-        self.assertEqual(plan["dracut_network_module"], "network")
+        self.assertFalse(plan["ready"])
+        self.assertEqual(plan["dracut_network_module"], "network-manager")
+        self.assertTrue(any("nm-initrd-generator" in item for item in plan["blockers"]))
         source["platform"]["dracut_modules"] = ["iscsi", "network-manager"]
         self.assertFalse(plan_platform(source, profile)["ready"])
 
@@ -699,8 +701,8 @@ class IscsiInitramfsTests(unittest.TestCase):
         g = Guest()
         with patch.object(g, "initrd_cat", create=True, side_effect=lambda path, name:
                           "iscsiadm -m fw -l\n" if name.endswith("iscsiroot") else "iscsi\nnetwork\nsystemd\n"):
-            self.assertTrue(_iscsi_archive_ready(g, "/boot/test.img", members + ["usr/lib/dracut/modules.txt"]))
-            self.assertFalse(_iscsi_archive_ready(g, "/boot/test.img", unknown + ["usr/lib/dracut/modules.txt"]))
+            self.assertTrue(_iscsi_userspace_ready(g, "/boot/test.img", members + ["usr/lib/dracut/modules.txt"]))
+            self.assertFalse(_iscsi_userspace_ready(g, "/boot/test.img", unknown + ["usr/lib/dracut/modules.txt"]))
 
     def test_each_modern_component_is_required_even_with_unused_legacy_helper(self):
         for missing in self.modern:
@@ -727,8 +729,8 @@ class IscsiInitramfsTests(unittest.TestCase):
         members = self.modern + ["usr/lib/dracut/modules.txt"]
         with patch.object(g, "initrd_cat", create=True, side_effect=lambda path, name:
                           "iscsiadm -m fw -l\n" if name.endswith("iscsiroot") else "iscsi\nnetwork\nsystemd\n"):
-            self.assertTrue(_iscsi_archive_ready(g, "/boot/test.img", members))
-            self.assertFalse(_iscsi_archive_ready(g, "/boot/test.img", [name for name in members if not name.endswith("iscsi-iname")]))
+            self.assertTrue(_iscsi_userspace_ready(g, "/boot/test.img", members))
+            self.assertFalse(_iscsi_userspace_ready(g, "/boot/test.img", [name for name in members if not name.endswith("iscsi-iname")]))
         self.assertEqual(_iscsi_backend("# iscsistart -b\niscsiadm -m fw -l\n"), "iscsiadm")
         self.assertIsNone(_iscsi_backend("# iscsistart -b\n"))
 

@@ -456,7 +456,7 @@ class BuildTests(unittest.TestCase):
                 self.assertEqual(source.read_bytes(), original)
 
     def run_build(self, *, output_format="qcow2", compare_failure=False, virtual_size=10 * GIB,
-                  guest_arch="x86_64", architecture_change=False, mount_policy="auto"):
+                  guest_arch="x86_64", architecture_change=False, mount_policy="auto", extra_recipe=None):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         directory = Path(temp.name)
@@ -469,6 +469,8 @@ class BuildTests(unittest.TestCase):
         info["os"]["arch"] = guest_arch
         final_info = {**info, "os": {"arch": "aarch64" if guest_arch == "x86_64" else "x86_64"}} if architecture_change else info
         engine = ImageEngine()
+        recipe = {"output_format": output_format, "sparsify": False, "mount_policy": mount_policy,
+                  **(extra_recipe or {})}
 
         def run(command, log=None):
             commands.append(command)
@@ -487,11 +489,11 @@ class BuildTests(unittest.TestCase):
             if compare_failure or architecture_change:
                 with self.assertRaisesRegex(EngineError, "guest CPU architecture" if architecture_change else "bytes differ"):
                     engine.build(source, directory / "build", info,
-                                 {"output_format": output_format, "sparsify": False, "mount_policy": mount_policy}, lambda _: None)
+                                 recipe, lambda _: None)
                 result = None
             else:
                 result = engine.build(source, directory / "build", info,
-                                      {"output_format": output_format, "sparsify": False, "mount_policy": mount_policy}, lambda _: None)
+                                      recipe, lambda _: None)
         self.assertEqual(source.read_bytes(), baseline)
         return result, commands
 
@@ -563,6 +565,38 @@ class BuildTests(unittest.TestCase):
         result, _ = self.run_build(output_format="gcp")
         with tarfile.open(result["artifact_path"], "r:gz") as archive:
             self.assertEqual(archive.getnames(), ["disk.raw"])
+
+    def test_oci_archive_wraps_the_checked_qcow2_and_publishes_verified_metadata(self):
+        import tarfile
+        recipe = {"target": "oci", "oci": {"guest": {"prepare": False}, "import_options": {
+            "operating_system": "Ubuntu", "operating_system_version": "26.04.1"}}}
+        def prepared(work, inspected, *args, **kwargs):
+            return {"_inspection": inspected, "warnings": []}
+        with patch("forge.oci.compatibility_plan", return_value={"blockers": []}), \
+                patch("forge.oci_guest.prepare_guest", side_effect=prepared):
+            result, commands = self.run_build(output_format="oci", extra_recipe=recipe)
+        self.assertEqual(result["filename"], "image.oci")
+        self.assertEqual(result["format"], "oci")
+        self.assertTrue(result["oci_archive"]["verified"])
+        self.assertTrue(any(command[:2] == ["qemu-img", "check"] and command[-1].endswith("archive-disk.qcow2") for command in commands))
+        self.assertTrue(any(command[:2] == ["qemu-img", "compare"] and command[-1].endswith("archive-disk.qcow2") for command in commands))
+        with tarfile.open(result["artifact_path"]) as archive:
+            self.assertEqual(set(archive.getnames()), {"image_metadata.json", "output.QCOW2"})
+            self.assertEqual(archive.extractfile("output.QCOW2").read(), qcow_header())
+            metadata = json.load(archive.extractfile("image_metadata.json"))
+            self.assertEqual(metadata["operatingSystem"], "Ubuntu")
+        self.assertFalse((Path(result["artifact_path"]).parent / "archive-disk.qcow2").exists())
+
+    def test_failed_qcow_comparison_never_packages_an_oci_archive(self):
+        recipe = {"target": "oci", "oci": {"guest": {"prepare": False}, "import_options": {
+            "operating_system": "Ubuntu", "operating_system_version": "26.04.1"}}}
+        def prepared(work, inspected, *args, **kwargs):
+            return {"_inspection": inspected, "warnings": []}
+        with patch("forge.oci.compatibility_plan", return_value={"blockers": []}), \
+                patch("forge.oci_guest.prepare_guest", side_effect=prepared), \
+                patch("forge.oci_archive.write_archive") as package:
+            self.run_build(output_format="oci", compare_failure=True, extra_recipe=recipe)
+        package.assert_not_called()
 
     def test_ext4_is_shrunk_before_partition_copy(self):
         temp = tempfile.TemporaryDirectory()

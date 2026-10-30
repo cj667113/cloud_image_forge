@@ -40,14 +40,14 @@ def image(words="root=/dev/mapper/ocivolume-root ro netroot=iscsi rd.iscsi.firmw
               "is_lv": True, "uuid": ROOT_UUID, "mountpoint": "/", "filesystem": "xfs"}
     archive = {"version": 1, "readable": True, "hostonly": False, "dracut_modules": ["systemd", "dracut-systemd", "iscsi", "lvm"],
                "embedded_cmdline": {"etc/cmdline.d/00-btrfs.conf": "rd.driver.pre=btrfs"},
-               "iscsi_local_root_completion": True, "lvm_userspace": True, "errors": []}
+               "iscsi_local_root_completion": True, "lvm_userspace": True, "firmware_network": {"ready": True}, "errors": []}
     return {"os": {"distro": "oraclelinux", "arch": "x86_64"},
             "boot": {"supported_firmware": ["UEFI_64"], "recommended_firmware": "UEFI_64"},
             "platform": {"version": 1,
                          "kernels": {KERNEL: {"modules": list(MODULE_CONFIG), "builtin": [],
                                                "initrd": f"/boot/initramfs-{KERNEL}.img", "initrd_modules": list(MODULE_CONFIG),
                                                "initrd_sha256": "a" * 64, "initrd_iscsi_userspace": True, "portability": archive}},
-                         "tools": {"grub2-mkconfig": True},
+                         "tools": {"grub2-mkconfig": True}, "iscsi_network_handover": True,
                          "fstab": {"root_uuid": ROOT_UUID, "errors": [], "entries": [
                              {"line": 1, "source": "/dev/mapper/ocivolume-root", "mountpoint": "/", "uuid": ROOT_UUID,
                               "replacement": "UUID=" + ROOT_UUID}]},

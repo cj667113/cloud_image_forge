@@ -150,7 +150,7 @@ function captureEditorDraft() {
   captureSystemdExplorerState(form.dataset.imageId);
   const fields = [];
   for (const node of $$('input,select,textarea',form)) {
-    if (node.closest('.ssh-user-row')) continue;
+    if (node.type === 'file' || node.closest('.ssh-user-row')) continue;
     let key;
     if (node.dataset.ociDefault) key = ['oci-default',node.dataset.ociDefault];
     else if (node.dataset.ociAllowed) key = ['oci-allowed',node.dataset.ociAllowed,node.value];
@@ -176,7 +176,7 @@ function restoreEditorDraft(draft) {
   for (const item of draft.fields) {
     const [kind,key,value] = item.key;
     const node = fields.find(element => kind === 'id' ? element.id === key : kind === 'file' ? element.dataset.file === key : kind === 'partition' ? element.dataset.partition === key : kind === 'rebuild' ? element.dataset.rebuildDevice === key : kind === 'oci-default' ? element.dataset.ociDefault === key : element.dataset.ociAllowed === key && element.value === value);
-    if (!node) continue;
+    if (!node || node.type === 'file') continue;
     if (node.type === 'checkbox' || node.type === 'radio') node.checked = item.checked;
     else if (node.tagName !== 'SELECT' || [...node.options].some(option => option.value === item.value)) node.value = item.value;
   }
@@ -237,7 +237,7 @@ function renderImages(force = false) {
   <section class="editor-panel" role="tabpanel" aria-labelledby="tab-mounts" id="panel-mounts" hidden>${renderMountPolicy()}<details class="editor-disclosure" data-disclosure="mount-fstab"><summary>Edit fstab <span class="disclosure-meta">Advanced</span></summary><div class="details-content">${fileEditor('/etc/fstab','Filesystem table','Manual edits are applied before the mount policy. Preserve root, boot and EFI mounts; invalid entries can prevent boot.',13)}</div></details><details class="editor-disclosure" data-disclosure="mount-identifiers"><summary>Filesystem identifiers <span class="disclosure-meta">Labels &amp; UUIDs</span></summary><div class="details-content">${renderMountIdentifiers(partitions)}</div></details></section>
   <section class="editor-panel" role="tabpanel" aria-labelledby="tab-boot" id="panel-boot" hidden>${bootSummary(inspection,'boot')}${renderBootMigration()}<div class="form-grid"><label class="field">Default kernel<select id="kernel-default"><option value="">Keep current default</option>${(inspection.kernels || []).map(kernel => `<option value="${esc(kernel)}">${esc(kernel)}</option>`).join('')}</select><span class="field-help">Selecting a default requires grubby in the guest.</span></label><label class="field">Kernel arguments<input id="kernel-args" placeholder="Unchanged"><span class="field-help">Sets GRUB_CMDLINE_LINUX and updates installed kernels with grubby. Existing unrelated entry arguments are retained; leave blank for no change.</span></label></div><details class="editor-disclosure" data-disclosure="boot-grub"><summary>GRUB configuration <span class="disclosure-meta">Bootloader defaults</span></summary><div class="details-content">${fileEditor('/etc/default/grub','GRUB defaults','Enable regeneration below to apply changes.',8)}<label class="check-field"><input type="checkbox" id="regenerate-grub"><span>Regenerate GRUB configuration<small>Apply /etc/default/grub changes using the guest’s supported GRUB tooling.</small></span></label></div></details><details class="editor-disclosure" data-disclosure="boot-packages"><summary>Packages <span class="disclosure-meta">Optional</span></summary><div class="details-content"><div class="form-grid"><label class="field">Install packages<input id="packages-install" placeholder="kernel cloud-init"><span class="field-help">Space- or comma-separated guest package names.</span></label><label class="field">Remove packages<input id="packages-remove" placeholder="unused-kernel-package"><span class="field-help">Keep a bootable kernel and the storage drivers required by your cloud.</span></label></div></div></details><details class="editor-disclosure" data-disclosure="boot-modules"><summary>Kernel modules & initramfs <span class="disclosure-meta">Drivers and options</span></summary><div class="details-content"><div class="form-grid">${fileEditor('/etc/modules-load.d/cloud-image-forge.conf','Modules to load','One module name per line.',6)}${fileEditor('/etc/modprobe.d/cloud-image-forge.conf','Module options and blacklists','Use modprobe.d options or blacklist directives.',6)}</div><label class="check-field"><input type="checkbox" id="rebuild-initramfs"><span>Rebuild initramfs<small>Refresh the guest’s initial RAM filesystem after kernel or driver changes.</small></span></label></div></details></section>
 ${renderOciPanel()}
-  <section class="editor-panel" role="tabpanel" aria-labelledby="tab-export" id="panel-export" hidden><div class="export-options">${Object.entries(profiles).map(([key,p],i) => `<div class="export-option"><input type="radio" name="target" id="target-${key}" value="${key}"${i ? '' : ' checked'}><label for="target-${key}">${esc(p.label)}<small>${{oci:'QCOW2 · zlib',aws:'RAW disk',azure:'Fixed VHD',gcp:'tar.gz',generic:'Choose format'}[key]}</small></label></div>`).join('')}</div><div class="export-summary" id="export-summary"></div><label class="field" id="generic-format-wrap" hidden>Output format<select id="output-format"><option value="qcow2">QCOW2</option><option value="raw">RAW</option><option value="vhd">Fixed VHD</option></select></label><details class="editor-disclosure" data-disclosure="export-options"><summary>Output options <span class="disclosure-meta">Space and compression</span></summary><div class="details-content"><label class="check-field"><input type="checkbox" id="sparsify" checked><span>Reclaim unused filesystem space<small>Run offline sparsification on the working image before export.</small></span></label><label class="check-field"><input type="checkbox" id="compress" checked><span>Compress QCOW2 output with zlib<small>Reduces the file footprint without shrinking the virtual disk.</small></span></label></div></details></section>
+  <section class="editor-panel" role="tabpanel" aria-labelledby="tab-export" id="panel-export" hidden><div class="export-options">${Object.entries(profiles).map(([key,p],i) => `<div class="export-option"><input type="radio" name="target" id="target-${key}" value="${key}"${i ? '' : ' checked'}><label for="target-${key}">${esc(p.label)}<small>${{oci:'QCOW2 or OCI archive',aws:'RAW disk',azure:'Fixed VHD',gcp:'tar.gz',generic:'Choose format'}[key]}</small></label></div>`).join('')}</div><div class="export-summary" id="export-summary"></div><label class="field" id="oci-format-wrap">Output format<select id="oci-output-format"><option value="qcow2">QCOW2 (.qcow2)</option><option value="oci">OCI archive (.oci)</option></select></label><label class="field" id="generic-format-wrap" hidden>Output format<select id="output-format"><option value="qcow2">QCOW2</option><option value="raw">RAW</option><option value="vhd">Fixed VHD</option></select></label><details class="editor-disclosure" data-disclosure="export-options"><summary>Output options <span class="disclosure-meta">Space and compression</span></summary><div class="details-content"><label class="check-field"><input type="checkbox" id="sparsify" checked><span>Reclaim unused filesystem space<small>Run offline sparsification on the working image before export.</small></span></label><label class="check-field"><input type="checkbox" id="compress" checked><span>Compress QCOW2 output with zlib<small>Reduces the file footprint without shrinking the virtual disk.</small></span></label></div></details></section>
   </div><div class="build-bar"><div><strong id="build-summary">OCI export · Original source preserved</strong><p>Only your chosen changes are applied. Follow progress in Activity.</p></div><button type="submit" id="build-button" class="button primary">${icon('stack')}Build image${icon('arrow')}</button></div><div id="build-error" class="notice error compact-notice" role="alert" hidden></div></form>`;
   $('#recipe-form').addEventListener('submit', buildImage);
   renderOciCapabilities();
@@ -255,7 +255,29 @@ ${renderOciPanel()}
   mountSystemdExplorer();
 }
 function setTab(tab) { wizardShowStep(tab,{focus:false}); }
-function updateExport() { const target = $('input[name="target"]:checked')?.value || 'oci', profile = profiles[target]; $('#export-summary').innerHTML = `<strong>${esc(profile.title)}</strong>${helpHint(profile.description,'Output format details')}`; $('#generic-format-wrap').hidden = target !== 'generic'; const format = target === 'generic' ? $('#output-format').value : profile.format; $('#compress').disabled = format !== 'qcow2'; $('#build-summary').textContent = `${profile.label} · ${format.toUpperCase()}`; if ($('#oci-target-notice')) $('#oci-target-notice').hidden = target === 'oci'; if ($('.wizard-stepper')) wizardUpdate(); }
+function selectedOutputFormat() {
+  const target = $('input[name="target"]:checked')?.value || 'oci';
+  return target === 'oci' ? $('#oci-output-format')?.value || 'qcow2' : target === 'generic' ? $('#output-format').value : profiles[target].format;
+}
+function updateExport() {
+  const target = $('input[name="target"]:checked')?.value || 'oci', profile = profiles[target], format = selectedOutputFormat(), archive = format === 'oci';
+  const title = archive ? 'OCI archive (.oci)' : profile.title;
+  const description = archive ? 'Plain TAR containing output.QCOW2 and image_metadata.json at the archive root. OCI settings supply the import metadata. Compression applies to the QCOW2 disk.' : profile.description;
+  $('#export-summary').innerHTML = `<strong>${esc(title)}</strong>${helpHint(description,'Output format details')}`;
+  $('#oci-format-wrap').hidden = target !== 'oci';
+  $('#generic-format-wrap').hidden = target !== 'generic';
+  $('#compress').disabled = !['qcow2','oci'].includes(format);
+  const ociEnabled = $('#oci-enabled');
+  if (ociEnabled) {
+    if (archive && !ociEnabled.checked) { ociEnabled.checked = true; markOciChanged(); }
+    ociEnabled.disabled = archive;
+    ociEnabled.closest('label').title = archive ? 'OCI settings are required for OCI archive output.' : '';
+    updateOciVisibility();
+  }
+  $('#build-summary').textContent = `${profile.label} · ${format.toUpperCase()}`;
+  if ($('#oci-target-notice')) $('#oci-target-notice').hidden = target === 'oci';
+  if ($('.wizard-stepper')) wizardUpdate();
+}
 function addService() { const row = document.createElement('div'); row.className = 'rule-row'; row.innerHTML = `<input class="service-name" list="known-services" placeholder="sshd.service" aria-label="Systemd service name"><select class="service-action" aria-label="Service action"><option value="enable">Enable</option><option value="disable">Disable</option><option value="mask">Mask</option><option value="unmask">Unmask</option></select><button type="button" class="icon-button" data-action="remove-service" aria-label="Remove service action">${icon('close')}</button>`; $('#service-rules').append(row); $('#service-changes').open=true; updateDisclosureSummaries(); revealEditorField($('.service-name',row)); }
 function getRecipe() {
   const source = state.images.find(image => image.id === state.selected);
@@ -265,13 +287,14 @@ function getRecipe() {
   const customPath = $('#custom-file-path').value.trim(), customContent = $('#custom-file-content').value;
   if (customPath || customContent) { if (!customPath || !customContent) throw new Error('Enter both a guest file path and content for the custom startup file.'); const existing = files.findIndex(file => file.path === customPath); if (existing >= 0) throw new Error('This path is already edited above. Use a different path for the new startup file.'); if (customContent !== (originalFiles[customPath] || '')) files.push({path:customPath,content:customContent}); }
   const services = $$('.rule-row').map(row => ({name:$('.service-name',row).value.trim(),action:$('.service-action',row).value})).filter(service => service.name);
-  const target = $('input[name="target"]:checked').value;
+  const target = $('input[name="target"]:checked').value, output_format = selectedOutputFormat();
+  if (output_format === 'oci' && !$('#oci-enabled')?.checked) throw editorError('OCI archive output requires OCI settings.','#oci-enabled');
   const splitPackages = selector => $(selector).value.trim().split(/[\s,]+/).filter(Boolean);
   const packages_install = splitPackages('#packages-install');
   if (files.some(file => file.path === '/etc/default/grub') && !$('#regenerate-grub').checked) throw new Error('Enable GRUB regeneration in Boot & kernel to apply your GRUB defaults changes.');
   const boot_migration = getBootMigrationConfig();
   const ssh_access = getSshAccessConfig();
-  return {mount_policy:getMountPolicy(),...(ssh_access ? {ssh_access} : {}),...(storage_resize ? {storage_resize} : {}),...(platform_migration ? {platform_migration} : {}),...(boot_migration ? {boot_migration} : {}),...(target === 'oci' && $('#oci-enabled')?.checked ? {oci:getOciConfig()} : {}),target,output_format:target === 'generic' ? $('#output-format').value : profiles[target].format,disk_size_gib:getDiskSizeGiB(),partition_changes:[],expand_partition:null,expand_lv:null,files,services,packages_install,packages_remove:splitPackages('#packages-remove'),kernel_default:$('#kernel-default').value || null,kernel_args:$('#kernel-args').value.trim() || null,rebuild_initramfs:$('#rebuild-initramfs').checked,regenerate_grub:$('#regenerate-grub').checked,sparsify:$('#sparsify').checked,compress:!$('#compress').disabled && $('#compress').checked,allow_network:requiredDownloadsEnabled()};
+  return {mount_policy:getMountPolicy(),...(ssh_access ? {ssh_access} : {}),...(storage_resize ? {storage_resize} : {}),...(platform_migration ? {platform_migration} : {}),...(boot_migration ? {boot_migration} : {}),...(target === 'oci' && $('#oci-enabled')?.checked ? {oci:getOciConfig()} : {}),target,output_format,disk_size_gib:getDiskSizeGiB(),partition_changes:[],expand_partition:null,expand_lv:null,files,services,packages_install,packages_remove:splitPackages('#packages-remove'),kernel_default:$('#kernel-default').value || null,kernel_args:$('#kernel-args').value.trim() || null,rebuild_initramfs:$('#rebuild-initramfs').checked,regenerate_grub:$('#regenerate-grub').checked,sparsify:$('#sparsify').checked,compress:!$('#compress').disabled && $('#compress').checked,allow_network:requiredDownloadsEnabled()};
 }
 async function buildImage(event) {
   event.preventDefault();
@@ -364,7 +387,7 @@ document.addEventListener('click',event => {
   if(button.dataset.importMode) setImportMode(button.dataset.importMode);
   if(button.dataset.tab) wizardGo(button.dataset.tab);
   if (['add-service','remove-service','oci-add-shape','oci-remove-shape','oci-use-target'].includes(button.dataset.action)) state.editorRevision++;
-  if(button.dataset.s3) { state.s3WizardImage = button.closest('#panel-result') ? state.selected : null; state.s3Artifact = button.dataset.s3; const artifact = state.artifacts.find(item => item.id === state.s3Artifact); $('#s3-artifact-name').textContent = artifact?.name || artifact?.filename || 'Image export'; notice('#s3-error',''); compactStudioHelp($('#s3-dialog')); $('#s3-dialog').showModal(); }
+  if(button.dataset.s3) { state.s3WizardImage = button.closest('#panel-result') ? state.selected : null; state.s3Artifact = button.dataset.s3; const artifact = state.artifacts.find(item => item.id === state.s3Artifact); $('#s3-artifact-name').textContent = artifact?.name || artifact?.filename || 'Image export'; $('#s3-url').placeholder = `s3://my-bucket/images/${artifact?.name || artifact?.filename || 'custom-image.qcow2'}`; notice('#s3-error',''); compactStudioHelp($('#s3-dialog')); $('#s3-dialog').showModal(); }
   if(button.dataset.action === 'open-import') showImport();
   if(button.dataset.action === 'refresh') refresh();
   if(button.dataset.action === 'refresh-inspection') refreshInspection();
@@ -375,10 +398,12 @@ document.addEventListener('click',event => {
   if(button.dataset.action === 'oci-add-shape') addOciShape();
   if(button.dataset.action === 'oci-remove-shape') { button.closest('.oci-shape-row').remove(); markOciChanged(); }
   if(button.dataset.action === 'oci-load-schema') changeOciSchema();
+  if(button.dataset.action === 'oci-load-metadata') $('#oci-metadata-file').click();
+  if(button.dataset.action === 'oci-clear-metadata') { state.editorRevision++; $('#oci-image-caps-version').value = ''; notice('#oci-metadata-error',''); markOciChanged(); }
   if(button.dataset.action === 'oci-reset-schema' || button.dataset.action === 'oci-refresh-catalog') changeOciSchema(true);
   if(button.dataset.action === 'oci-use-target') { $('#target-oci').checked = true; updateExport(); }
 });
-document.addEventListener('change',event => { if(event.target.id === 'image-select') { state.selected = event.target.value; state.editorRevision++; renderImages(true); } if(event.target.name === 'target' || event.target.id === 'output-format') updateExport(); });
+document.addEventListener('change',event => { if(event.target.id === 'image-select') { state.selected = event.target.value; state.editorRevision++; renderImages(true); } if(event.target.name === 'target' || ['output-format','oci-output-format'].includes(event.target.id)) updateExport(); });
 document.addEventListener('input', event => {
   if (event.target.closest('#recipe-form')) state.editorRevision++;
   if (event.target.closest('#migration-controls')) invalidateMigrationPlan();
@@ -388,6 +413,7 @@ document.addEventListener('change', event => {
   if (event.target.closest('#recipe-form')) state.editorRevision++;
   const input = event.target;
   if (input.id === 'oci-enabled') updateOciVisibility();
+  if (input.id === 'oci-metadata-file') loadOciMetadataReference(input);
   if (input.id === 'boot-migration-enabled') toggleBootMigration();
 
   if (input.dataset.ociDefault === 'Compute.Firmware' || input.dataset.ociAllowed === 'Compute.Firmware' || input.id === 'oci-firmware-confirm') { state.migrationAutoFirmware = null; state.ociFirmwareEdited = input.id === 'oci-firmware-confirm' ? input.checked : true; if ($('#oci-firmware-confirm')) $('#oci-firmware-confirm').checked = state.ociFirmwareEdited; }
@@ -488,7 +514,7 @@ async function previewBootMigration(config = null, beforeBuild = false, allowNet
 function renderOciPanel() {
   return `<section class="editor-panel" role="tabpanel" aria-labelledby="tab-oci" id="panel-oci" hidden>
     <div class="oci-panel-heading"><h3>Image capabilities</h3><span class="badge" id="oci-catalog-count">${state.ociCatalog?.capabilities?.length || 0} capabilities</span></div>
-    <label class="check-field oci-enable"><input type="checkbox" id="oci-enabled"><span>Apply OCI settings<small>Changing an OCI setting enables this option. Settings apply when the export target is Oracle Cloud.</small></span></label>
+    <label class="check-field oci-enable"><input type="checkbox" id="oci-enabled"><span>Apply OCI settings<small>Required for OCI archive output. Changing an OCI setting also enables this option. Settings apply when the export target is Oracle Cloud.</small></span></label>
     <div id="oci-target-notice" class="notice info" hidden>OCI settings are saved in this form, but the current export target is not Oracle Cloud. <button type="button" class="button ghost small" data-action="oci-use-target">Use OCI export${icon('arrow')}</button></div>
     <div id="oci-catalog-error" class="notice error" role="alert"${state.ociCatalog ? ' hidden' : ''}>${esc(state.ociCatalogError || 'The OCI capability catalog is not available yet. Refresh the catalog to configure this image.')} <button type="button" class="button ghost small" data-action="oci-refresh-catalog">Refresh catalog</button></div>
     <div id="oci-settings" hidden><div id="oci-firmware-alert">${['dual','unknown'].includes(studioImage()?.inspection?.boot?.mode) ? `<div class="notice warning">${studioImage().inspection.boot.mode === 'dual' ? 'Both firmware modes are present. Confirm your firmware choice under Compute.' : 'Firmware support is unknown. Refresh inspection before choosing OCI firmware.'}</div>` : !studioImage()?.inspection?.boot ? '<div class="notice warning">Refresh inspection to detect firmware support.</div>' : ''}</div>
@@ -523,8 +549,12 @@ function renderOciPanel() {
       <h3 class="subheading">Compatible shapes <span class="disclosure-meta" id="oci-source-architecture"></span></h3><p class="field-help">Use exact OCI shape names for this architecture; CPU and memory limits are optional.</p>
       <div id="oci-shapes"></div><button type="button" class="button secondary small" data-action="oci-add-shape">${icon('plus')}Add compatible shape</button>
     </div></details>
-    <details class="editor-disclosure oci-details" data-disclosure="oci-schema"><summary>Custom capability schema <span class="disclosure-meta">Advanced</span></summary><div class="details-content">
+    <details class="editor-disclosure oci-details" data-disclosure="oci-schema"><summary>Metadata & custom schema <span class="disclosure-meta">Advanced</span></summary><div class="details-content">
       <p class="panel-intro">Paste and load a regional OCI global image capability schema. Additional capabilities may require manual guest preparation.</p>
+      <label class="field">Metadata reference <span class="optional">Optional · OCI archive</span>${helpHint('Load an OCI image_metadata.json file (version 2, up to 1 MiB). Only its imageCapsFormatVersion UUID is used to embed the selected capabilities in the archive; operating system, capabilities, and shapes are not imported. This is separate from the global schema version. Without a reference, the archive uses null capability metadata; additional settings remain in the configuration download.','Metadata reference')}<input id="oci-image-caps-version" readonly placeholder="No reference loaded" aria-label="Image capability format version"></label>
+      <input type="file" id="oci-metadata-file" accept=".json,application/json" hidden>
+      <div class="oci-inline-actions oci-metadata-actions"><button type="button" class="button secondary small" data-action="oci-load-metadata">${icon('upload')}Load metadata JSON</button><button type="button" class="button ghost small" data-action="oci-clear-metadata">Clear reference</button></div>
+      <div id="oci-metadata-error" class="notice error" role="alert" hidden></div>
       <label class="field">Global schema version<input id="oci-schema-version" placeholder="Schema version from OCI"></label>
       <label class="field">Global capability schema <span class="optional">JSON object</span><textarea id="oci-schema-json" class="code-editor" rows="8" spellcheck="false" placeholder="Paste OCI global image capability schema JSON"></textarea></label>
       <div class="oci-inline-actions"><button type="button" class="button secondary small" data-action="oci-load-schema">${icon('code')}Load schema</button><button type="button" class="button ghost small" data-action="oci-reset-schema">Use bundled catalog</button><span class="field-help" id="oci-schema-status">Bundled catalog</span></div>
@@ -604,7 +634,26 @@ function getOciConfig() {
   }
   if (import_options.object_uri && ['namespace','bucket','object_name'].some(key => import_options[key])) throw editorError('Choose either an Object Storage URI or namespace, bucket, and object name for OCI import.','#oci-object-uri');
   const guest = {prepare:$('#oci-prepare').checked,install_packages:$('#oci-install-packages').checked,configure_network:$('#oci-configure-network').checked,configure_cloud_init:$('#oci-configure-cloud-init').checked,configure_serial_console:$('#oci-configure-serial').checked,acknowledge_ipv6_validation:$('#oci-ipv6-ack').checked};
-  return {capabilities:readOciCapabilities(),guest,import_options,global_schema_version:$('#oci-schema-version').value.trim() || null,global_schema};
+  const image_caps_format_version = $('#oci-image-caps-version').value.trim() || null;
+  if (image_caps_format_version && !ociMetadataUuid(image_caps_format_version)) throw editorError('Load a metadata reference with a valid imageCapsFormatVersion UUID.','#oci-image-caps-version');
+  return {capabilities:readOciCapabilities(),guest,import_options,image_caps_format_version,global_schema_version:$('#oci-schema-version').value.trim() || null,global_schema};
+}
+function ociMetadataUuid(value) { return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value); }
+async function loadOciMetadataReference(input) {
+  const file = input.files?.[0]; if (!file) return;
+  const imageId = state.selected, revision = state.editorRevision, output = $('#oci-image-caps-version');
+  const current = () => input.isConnected && output?.isConnected && state.selected === imageId && state.editorRevision === revision;
+  notice('#oci-metadata-error','');
+  try {
+    if (file.size > 1024 * 1024) throw new Error('Metadata references must be 1 MiB or smaller.');
+    const text = await file.text(); if (!current()) return;
+    let metadata; try { metadata = JSON.parse(text); } catch { throw new Error('The metadata reference must be valid JSON.'); }
+    if (!metadata || Array.isArray(metadata) || metadata.version !== 2) throw new Error('Use an OCI image_metadata.json reference with version 2.');
+    if (!ociMetadataUuid(metadata.imageCapsFormatVersion)) throw new Error('The reference must contain a valid imageCapsFormatVersion UUID.');
+    output.value = metadata.imageCapsFormatVersion.toLowerCase(); state.editorRevision++; markOciChanged();
+    toast('Metadata format reference loaded. Your image settings are unchanged.');
+  } catch (error) { if (current()) notice('#oci-metadata-error',errorText(error)); }
+  finally { if (input.isConnected) input.value = ''; }
 }
 function setOciPlanMessage(message, status = 'stale') {
   const panel = $('#oci-plan');

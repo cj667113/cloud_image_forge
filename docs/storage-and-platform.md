@@ -154,3 +154,27 @@ When OCI capability preparation is also selected, its settings must agree with t
 On 2026-10-29 UTC, an isolated native ARM test passed 15 checks using a disposable Debian fixture with a labeled ext4 data filesystem. Preparation wrote and independently resolved its actual `LABEL=` reference while retaining verified UUID fallbacks for the unlabeled root and EFI filesystems. Filesystem UUIDs/labels and `fstab` ownership/mode stayed unchanged; QCOW2 integrity, export byte comparison, fresh final mount verification and original-source SHA-256 checks passed. The label was created only during fixture setup; product code never assigned it. This was a mount-policy/export test, not a guest boot or provider launch.
 
 The associated UI pass combined disk and filesystem sizing, simplified Access cards and added the mount reference chooser. Focused browser checks covered exact units, Fit and planner blockers, drafts, key uploads and validation, label fallbacks, stale responses, early resize/scroll events, and 1440/390/320-pixel layouts. The automated suite passed 740 tests and 152 subtests, including Unicode label fallbacks and supported Unicode label round trips.
+
+Firmware iSCSI boot also needs a network configuration stage before storage
+login. Forge now selects dracut's `network-manager` backend and checks the
+archived `nm-initrd-generator`, configuration/online hooks, daemon, service
+activation, and iSCSI discovery chain in every kernel. A `network` module tag
+or systemd-networkd DHCP fallback alone does not establish iBFT networking.
+Missing NetworkManager packages follow the existing installation/download
+permission rules. The target must still supply a valid firmware table, a
+supported NIC, and a reachable iSCSI target; offline readiness is not a hardware
+boot test. [NetworkManager's generator](https://networkmanager.dev/docs/api/latest/nm-initrd-generator.html)
+recognizes `rd.iscsi.ibft`; [dracut's NetworkManager module](https://github.com/dracut-ng/dracut/blob/110/modules.d/35network-manager/module-setup.sh)
+connects it to early boot.
+
+The root filesystem's network renderer is retained when installing initrd
+NetworkManager. Managed netplan/networkd profiles use `critical: true` or
+`KeepConfiguration=yes` for firmware-root handover, and root NetworkManager
+retains the inherited connection with a low-priority DHCP fallback. An
+unverified manual handover is blocked when network changes are disabled.
+Per-kernel path, SHA256, firmware-network evidence, and handover readiness are
+retained in verification receipts. These changes do not rename filesystems or
+change UUIDs. [Netplan's critical setting](https://netplan.readthedocs.io/en/stable/netplan-yaml/)
+and [systemd's connection retention](https://www.freedesktop.org/software/systemd/man/259/systemd.network.html#KeepConfiguration=)
+protect network-root connectivity; they cannot repair a missing boot-device
+connection before the root filesystem appears.

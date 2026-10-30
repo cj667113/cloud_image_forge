@@ -11,7 +11,7 @@ from unittest.mock import patch
 import pytest
 
 from forge.initramfs import ArchiveError, _zstd_library, parse_file, read_archive
-from forge.platform import _iscsi_archive_ready, inspect_platform
+from forge.platform import _iscsi_userspace_ready, inspect_platform
 from forge.portability import inspect_archive
 
 
@@ -85,7 +85,7 @@ def test_zstd_reader_retains_exact_dracut_var_hook_without_admitting_other_direc
     assert parsed.initrd_cat(parsed.path, hook) == body
     assert other in parsed.initrd_list(parsed.path)
     assert inspect_archive(parsed, parsed.path)["iscsi_local_root_completion"]
-    assert _iscsi_archive_ready(parsed, parsed.path, parsed.initrd_list(parsed.path))
+    assert _iscsi_userspace_ready(parsed, parsed.path, parsed.initrd_list(parsed.path))
     with pytest.raises(RuntimeError, match="Required archive text is missing"):
         parsed.initrd_cat(parsed.path, other)
 
@@ -156,7 +156,7 @@ def test_early_microcode_and_gzip_main_are_merged_and_support_existing_proof():
     evidence = inspect_archive(archive, archive.path, names)
     assert evidence["readable"] and evidence["iscsi_local_root_completion"]
     assert evidence["lvm_userspace"]
-    assert _iscsi_archive_ready(archive, archive.path, names)
+    assert _iscsi_userspace_ready(archive, archive.path, names)
 
 
 @pytest.mark.parametrize("compressed", [False, True])

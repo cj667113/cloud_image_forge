@@ -222,6 +222,8 @@ def _network_evidence(g, tools):
     backend = "netplan" if tools.get("netplan") else "NetworkManager" if tools.get("NetworkManager") else "networkd" if tools.get("networkctl") else None
     all_paths = {path for patterns in NETWORK_PATTERNS.values() for pattern in patterns for path in _glob(g, pattern)
                  if not path.endswith("ifcfg-lo")}
+    if backend == "NetworkManager" and tools.get("networkctl") and any(path.endswith('.network') for path in all_paths) and not any('/NetworkManager/' in path or 'ifcfg-' in path for path in all_paths):
+        backend = "networkd"
     selected_paths = {path for pattern in NETWORK_PATTERNS.get(backend, ()) for path in _glob(g, pattern)}
     texts = {path: _read(g, path) for path in sorted(selected_paths)
              if not path.endswith("ifcfg-lo")}
@@ -324,6 +326,7 @@ def inspect_guest(g, root: str, partitions: list, kernels: list, boot: dict | No
     cloud_ready = (tools.get("cloud-init") and datasource and _oracle_datasource_selected(g) and cloud_units_ready
                    and not (g.is_file("/etc/cloud/cloud-init.disabled") or g.is_symlink("/etc/cloud/cloud-init.disabled"))
                    and "cloud-init=disabled" not in boot_text)
+    from .iscsi_network import inspect_handover
     backend, network_ready, network_files = _network_evidence(g, tools)
     ipv6_files = [path for path in ["/etc/sysctl.conf"] + _glob(g, "/etc/sysctl.d/*.conf") if SYSCTL_DISABLE.search(_read(g, path))]
     return {"version": 1, "architecture": architecture, "firmware": firmware, "kernels": support, "tools": tools,
@@ -331,6 +334,7 @@ def inspect_guest(g, root: str, partitions: list, kernels: list, boot: dict | No
             "oracle_datasource": bool(datasource), "cloud_init_ready": bool(cloud_ready),
             "cloud_init_units": cloud_units, "cloud_init_units_ready": cloud_units_ready,
             "consistent_naming_rules": sorted(set(naming)), "blacklisted_modules": sorted(blacklisted),
+            "iscsi_network_handover": inspect_handover(g, backend, network_files),
             "iscsi_boot_configured": any(arg in boot_text for arg in ("rd.iscsi.firmware=1", "rd.iscsi.ibft=1", "ip=ibft")) and bool(_iscsi_module_directory(g)),
             "os_version": {"major": g.inspect_get_major_version(root), "minor": g.inspect_get_minor_version(root)},
             "ipv6_disable_files": ipv6_files, "boot_arguments": boot_text[:65536],
@@ -512,6 +516,20 @@ def plan_guest(inspection: dict, config: dict, allow_network=False, planned_firm
     if prepare and initramfs:
         need_tool("lsinitrd" if initramfs == "dracut" else "lsinitramfs",
                   "dracut" if initramfs == "dracut" and rpm else "dracut-core" if initramfs == "dracut" and deb else "initramfs-tools-core" if deb else None)
+    firmware_network = None
+    if iscsi_boot:
+        from .iscsi_network import plan_network
+        if prepare:
+            firmware_network = plan_network(inspection.get("platform", {}), install=guest.get("install_packages"), allow_network=allow_network, rpm=rpm)
+            packages.update(firmware_network["packages"])
+            blockers.extend(firmware_network["blockers"])
+        else:
+            for version in kernels:
+                actual = inspection.get("platform", {}).get("kernels", {}).get(version, {})
+                if not actual.get("initrd_iscsi_userspace") or not (actual.get("portability", {}).get("firmware_network") or {}).get("ready"):
+                    blockers.append(f"Kernel {version}: archived firmware iSCSI networking and discovery chain are unverified; refresh inspection or choose Reconfigure.")
+        if not (prepare and guest.get("configure_network", True)) and not evidence.get("iscsi_network_handover"):
+            blockers.append("Existing firmware-root network retention across switch-root is unverified; enable managed network preparation or configure retention explicitly.")
     if iscsi:
         need_tool("iscsiadm", "iscsi-initiator-utils" if rpm else "open-iscsi" if deb else None)
     if multipath:
@@ -561,6 +579,8 @@ def plan_guest(inspection: dict, config: dict, allow_network=False, planned_firm
         warnings.append("Guest preparation is disabled. Read-only evidence checks apply; no image files will be adapted for OCI.")
     return {"changes": changes, "blockers": list(dict.fromkeys(blockers)), "warnings": list(dict.fromkeys(warnings)),
             "required_modules": sorted(required), "packages": sorted(packages), "network_backend": backend,
+            "iscsi_network_handover": bool(evidence.get("iscsi_network_handover")),
+            "dracut_network_module": firmware_network["module"] if firmware_network else None,
             "initramfs_backend": initramfs, "iscsi_boot": iscsi_boot, "multipath": multipath,
             "architecture": arch, "serial_device": serial}
 
@@ -584,15 +604,21 @@ def _write(g, path, content, mode=0o644):
     g.chown(0, 0, path)
 
 
-def _network_files(backend):
+def _network_files(backend, *, iscsi=False):
     if backend == "NetworkManager":
-        return {"/etc/NetworkManager/system-connections/cloud-image-forge-oci.nmconnection":
+        from .iscsi_network import NM_KEEP, NM_KEEP_TEXT
+        result = {"/etc/NetworkManager/system-connections/cloud-image-forge-oci.nmconnection":
                 "[connection]\nid=Cloud Image Forge OCI\ntype=ethernet\nautoconnect=true\nautoconnect-priority=999\n[ethernet]\n[ipv4]\nmethod=auto\nmay-fail=true\n[ipv6]\nmethod=auto\nmay-fail=true\n"}
+        if iscsi:
+            result[NM_KEEP] = NM_KEEP_TEXT
+            key = "/etc/NetworkManager/system-connections/cloud-image-forge-oci.nmconnection"
+            result[key] = result[key].replace("autoconnect-priority=999", "autoconnect-priority=-999")
+        return result
     if backend == "netplan":
         return {"/etc/netplan/90-cloud-image-forge-oci.yaml":
-                'network:\n  version: 2\n  renderer: networkd\n  ethernets:\n    oci:\n      match:\n        name: "e*"\n      dhcp4: true\n      dhcp6: true\n      accept-ra: true\n      optional: true\n'}
+                'network:\n  version: 2\n  renderer: networkd\n  ethernets:\n    oci:\n      match:\n        name: "e*"\n      dhcp4: true\n      dhcp6: true\n      accept-ra: true\n      optional: true\n' + ('      critical: true\n' if iscsi else '')}
     return {"/etc/systemd/network/10-cloud-image-forge-oci.network":
-            "[Match]\nName=en* eth*\n[Network]\nDHCP=yes\nIPv6AcceptRA=yes\n[Link]\nRequiredForOnline=no\n"}
+            "[Match]\nName=en* eth*\n[Network]\nDHCP=yes\nIPv6AcceptRA=yes\n" + ("KeepConfiguration=yes\n" if iscsi else "") + "[Link]\nRequiredForOnline=no\n"}
 
 
 def _initramfs_script(inspection, plan):
@@ -608,7 +634,7 @@ def _initramfs_script(inspection, plan):
             modules = sorted(set(plan["required_modules"]) & set(kernel.get("modules", [])))
             command = f"dracut --force --no-hostonly --add-drivers {shlex.quote(' '.join(modules))} {shlex.quote(path)} {version_q}"
             if plan["iscsi_boot"]:
-                command += " --add iscsi"
+                command += " --add 'iscsi network-manager' --omit 'systemd-networkd network-legacy'"
             commands += [command, f"listing=$(lsinitrd {shlex.quote(path)})"]
         else:
             action = "-u" if kernel.get("initrd") else "-c"
@@ -620,7 +646,7 @@ def _initramfs_script(inspection, plan):
             commands.append("printf '%s\\n' \"$listing\" | grep -Eq " + shlex.quote(expression) + " || { echo " + shlex.quote(f"Required driver {module} absent from initramfs {version}") + " >&2; exit 1; }")
         if plan["iscsi_boot"]:
             from .platform import iscsi_initramfs_checks
-            commands += iscsi_initramfs_checks(path)
+            commands += iscsi_initramfs_checks(path, firmware_network=True)
     return "\n".join(commands)
 
 
@@ -638,9 +664,11 @@ def prepare_guest(work: Path, inspection: dict, config: dict, allow_network: boo
         return plan
     for change in plan["changes"]:
         log("OCI: " + change)
+    original_network_backend = plan.get("network_backend")
     if plan["packages"]:
         _run(["virt-customize", "--format", "qcow2", "-a", str(work), "--network", "--install", ",".join(plan["packages"])], log)
         inspection = ImageEngine().inspect(work)
+        inspection["oci_evidence"]["network_backend"] = original_network_backend
         plan = compatibility_plan(inspection, model, allow_network=False, platform_migration=platform_migration, mount_policy=mount_policy)
         if plan["blockers"]:
             raise EngineError("OCI prerequisites still missing after package installation: " + " ".join(plan["blockers"]))
@@ -660,6 +688,8 @@ def prepare_guest(work: Path, inspection: dict, config: dict, allow_network: boo
     guest = config.get("guest", {})
     evidence = inspection["oci_evidence"]
     commands = []
+    if plan["iscsi_boot"] and plan["network_backend"] != "NetworkManager":
+        commands += ["systemctl --root=/ disable NetworkManager.service NetworkManager-wait-online.service"]
     with _guest(work, "qcow2", readonly=False) as g:
         _mount(g, _roots(g), False)
         if plan["initramfs_backend"] == "initramfs-tools":
@@ -668,7 +698,7 @@ def prepare_guest(work: Path, inspection: dict, config: dict, allow_network: boo
             additions = [module for module in plan["required_modules"] if not re.search(rf"^\s*{re.escape(module)}(?:\s|$)", existing, re.M)]
             _write(g, path, existing.rstrip() + "\n# OCI drivers added by Cloud Image Forge\n" + "\n".join(additions) + "\n")
         if guest.get("configure_network", True):
-            generated = _network_files(plan["network_backend"])
+            generated = _network_files(plan["network_backend"], iscsi=plan["iscsi_boot"])
             for path in evidence.get("network_files", []):
                 if path not in generated and g.is_file(path):
                     _backup(g, path)
@@ -744,7 +774,7 @@ def prepare_guest(work: Path, inspection: dict, config: dict, allow_network: boo
                                project_platform=False, mount_policy=mount_policy)
     if final["blockers"]:
         raise EngineError("OCI guest verification failed after preparation: " + " ".join(final["blockers"]))
-    if extra_required_modules:
+    if extra_required_modules or plan["iscsi_boot"]:
         hardware = after.get("platform", {}).get("kernels", {})
         if set(hardware) != set(evidence["kernels"]):
             raise EngineError("Hardware kernel inventory changed during OCI preparation.")
@@ -756,9 +786,11 @@ def prepare_guest(work: Path, inspection: dict, config: dict, allow_network: boo
         plan["verified_initrds"] = {
             version: {"path": kernel.get("initrd"), "sha256": kernel.get("initrd_sha256"),
                       "modules": sorted(set(plan["required_modules"]) - set(kernel.get("builtin", []))),
-                      "iscsi_boot": bool(plan["iscsi_boot"])}
+                      "iscsi_boot": bool(plan["iscsi_boot"]),
+                      "firmware_network": kernel.get("portability", {}).get("firmware_network"), "projected": False}
             for version, kernel in after.get("platform", {}).get("kernels", {}).items()
         }
+    plan["iscsi_network_handover"] = bool(after.get("oci_evidence", {}).get("iscsi_network_handover"))
     log("OCI guest preparation completed; actual configuration and rebuilt initramfs driver inclusion verified")
     plan["_inspection"] = after
     return plan

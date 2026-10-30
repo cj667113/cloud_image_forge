@@ -392,9 +392,13 @@ def _validate_recipe(recipe: dict, inspection: dict) -> None:
             raise EngineError("Preserve and validate requires OCI guest preparation disabled.")
     target = recipe.get("target", "generic")
     fmt = recipe.get("output_format", "qcow2")
-    target_formats = {"oci": "qcow2", "aws": "raw", "azure": "vhd", "gcp": "gcp"}
-    if target not in {*target_formats, "generic"} or fmt not in {"qcow2", "raw", "vhd", "gcp"}:
+    target_formats = {"aws": "raw", "azure": "vhd", "gcp": "gcp"}
+    if target not in {*target_formats, "oci", "generic"} or fmt not in {"qcow2", "raw", "vhd", "gcp", "oci"}:
         raise EngineError("Unknown export target or format.")
+    if target == "oci" and fmt not in {"qcow2", "oci"}:
+        raise EngineError("oci requires qcow2 or oci output.")
+    if fmt == "oci" and (target != "oci" or recipe.get("oci") is None):
+        raise EngineError("An OCI image archive requires the Oracle Cloud target and OCI settings.")
     if target in target_formats and fmt != target_formats[target]:
         raise EngineError(f"{target} requires {target_formats[target]} output.")
     if recipe.get("oci") is not None and target != "oci":
@@ -480,7 +484,7 @@ class ImageEngine:
                 "worker_arch": worker, "guest_architectures": list(SUPPORTED_ARCHES),
                 "guest_execution_architectures": [worker] if worker in SUPPORTED_ARCHES else [],
                 "input_formats": ["qcow2", "raw", "vhd", "vmdk"],
-                "output_formats": ["qcow2", "raw", "vhd", "gcp"],
+                "output_formats": ["qcow2", "raw", "vhd", "gcp", "oci"],
                 "kvm": os.access("/dev/kvm", os.R_OK | os.W_OK),
                 "resize": "Partition and LVM growth, offline ext2/3/4 shrink, and a validated filesystem rebuild for supported GPT/UEFI XFS and LVM layouts."}
 
@@ -708,6 +712,9 @@ class ImageEngine:
                                            platform_migration=platform_options, mount_policy=mount_policy)
             if preflight["blockers"]:
                 raise EngineError("OCI preparation blocked: " + " ".join(preflight["blockers"]))
+            if recipe.get("output_format") == "oci":
+                from .oci_archive import image_metadata
+                image_metadata(oci_config, inspection)
         if not self.capabilities()["available"]:
             raise EngineError("Image tools are unavailable. Run the supplied Linux Docker container.")
         destination_dir.mkdir(parents=True, exist_ok=True)
@@ -862,28 +869,36 @@ class ImageEngine:
             raise EngineError("Final boot mount verification failed: " + " ".join(boot_mount_result["blockers"]))
         mount_result.update(policy=mount_policy, changes=mount_receipt.get("changes", []),
                             uuid_map=mount_receipt.get("uuid_map", []), boot_references=boot_mount_result)
-        filenames = {"qcow2": "image.qcow2", "raw": "image.raw", "vhd": "image.vhd", "gcp": "image.tar.gz"}
+        filenames = {"qcow2": "image.qcow2", "raw": "image.raw", "vhd": "image.vhd", "gcp": "image.tar.gz", "oci": "image.oci"}
         output = destination_dir / filenames[final_format]
-        conversion = destination_dir / "disk.raw" if final_format == "gcp" else output
-        qemu_format = {"qcow2": "qcow2", "raw": "raw", "vhd": "vpc", "gcp": "raw"}[final_format]
+        conversion = (destination_dir / "disk.raw" if final_format == "gcp" else
+                      destination_dir / "archive-disk.qcow2" if final_format == "oci" else output)
+        qemu_format = {"qcow2": "qcow2", "raw": "raw", "vhd": "vpc", "gcp": "raw", "oci": "qcow2"}[final_format]
         command = ["qemu-img", "convert", "-f", "qcow2", "-O", qemu_format]
-        if final_format == "qcow2":
+        if final_format in {"qcow2", "oci"}:
             command += ["-o", "compat=1.1,compression_type=zlib,cluster_size=131072"]
             if recipe.get("compress", True):
                 command += ["-c"]
         elif final_format == "vhd":
             command += ["-o", "subformat=fixed,force_size"]
         command += [str(work), str(conversion)]
-        log(f"Converting to {final_format}")
+        log("Converting to " + ("QCOW2 for the OCI archive" if final_format == "oci" else final_format))
         _run(command, log)
-        if final_format == "qcow2":
+        if final_format in {"qcow2", "oci"}:
             _run(["qemu-img", "check", "-f", "qcow2", str(conversion)], log)
         log("Comparing every guest-visible byte after format conversion")
         _run(["qemu-img", "compare", "-f", "qcow2", "-F", qemu_format, str(work), str(conversion)], log)
         output_info = _image_info(conversion, qemu_format)
         if output_info["virtual-size"] != virtual_size:
             raise EngineError("Export virtual capacity differs from the prepared disk.")
-        if final_format == "gcp":
+        archive_receipt = None
+        if final_format == "oci":
+            from .oci_archive import write_archive
+            log("Packaging output.QCOW2 and image_metadata.json as an OCI image archive")
+            archive_receipt = write_archive(output, conversion, oci_config, result_inspection, log)
+            warnings.extend(archive_receipt.get("warnings", []))
+            conversion.unlink()
+        elif final_format == "gcp":
             log("Packaging a root-level disk.raw for Google Cloud")
             with tarfile.open(output, "w:gz", format=tarfile.GNU_FORMAT) as archive:
                 archive.add(conversion, arcname="disk.raw", recursive=False)
@@ -901,4 +916,5 @@ class ImageEngine:
                 "storage_rebuild": storage_result if not (recipe.get("storage_resize") or {}).get("enabled") else None,
                 "storage_resize": storage_result if (recipe.get("storage_resize") or {}).get("enabled") else None,
                 "platform_migration": platform_result, "ssh_access": ssh_result,
-                "mount_reconciliation": mount_result}
+                "mount_reconciliation": mount_result,
+                **({"oci_archive": archive_receipt} if archive_receipt is not None else {})}

@@ -107,7 +107,8 @@ class _ZstdDecoder:
 
 
 def _wanted(name):
-    return (name in {"usr/lib/dracut/modules.txt", "lib/dracut/modules.txt", "usr/sbin/iscsiroot", "sbin/iscsiroot", "etc/cmdline", "etc/fstab", "etc/lvm/lvm.conf", "etc/lvm/lvmlocal.conf"}
+    from .iscsi_network import retained
+    return (retained(name) or name in {"usr/lib/dracut/modules.txt", "lib/dracut/modules.txt", "usr/sbin/iscsiroot", "sbin/iscsiroot", "etc/cmdline", "etc/fstab", "etc/lvm/lvm.conf", "etc/lvm/lvmlocal.conf"}
             or bool(re.fullmatch(r"etc/cmdline\.d/[^/]+\.conf", name))
             or bool(re.fullmatch(r"etc/lvm/devices/[^/]+", name))
             or bool(re.fullmatch(r"(?:(?:usr|var)/)?lib/dracut/hooks/cmdline/[0-9]+-parse-iscsiroot\.sh", name)))

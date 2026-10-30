@@ -122,6 +122,33 @@ def test_non_oci_recipes_cannot_silently_drop_oci_configuration():
         Recipe(target="aws", output_format="raw", oci={})
 
 
+def test_oci_image_archive_requires_oci_target_and_metadata_settings():
+    assert Recipe(target="oci", output_format="oci", oci={}).output_format == "oci"
+    assert Recipe(target="oci", output_format="qcow2").output_format == "qcow2"
+    for recipe in ({"target": "generic", "output_format": "oci"},
+                   {"target": "oci", "output_format": "oci"}):
+        with pytest.raises(ValidationError, match="requires the Oracle Cloud"):
+            Recipe(**recipe)
+
+
+def test_metadata_format_is_a_separate_explicit_reference_uuid():
+    reference = "34dd2cea-aff2-4f45-b8f6-1cb5290bfab2"
+    config = OciConfig(global_schema_version="a-regional-schema-version", image_caps_format_version=reference.upper())
+    assert config.image_caps_format_version == reference
+    assert config.global_schema_version == "a-regional-schema-version"
+    assert OciConfig(global_schema_version=reference).image_caps_format_version is None
+    for invalid in ("not-a-format", "{" + reference + "}", reference.replace("-", "")):
+        with pytest.raises(ValidationError):
+            OciConfig(image_caps_format_version=invalid)
+
+
+def test_archive_companion_import_uses_native_oci_type_and_filename():
+    files = bundle_files(OciConfig(), {"name": "image.oci", "format": "oci"})
+    handoff = json.loads(files["image-import.json"])
+    assert handoff["sourceImageType"] == "OCI"
+    assert handoff["name"] == "image.oci"
+
+
 def test_import_and_schema_handoff_contains_every_setting_in_right_api_location():
     config = OciConfig(import_options={"compartment_id": "ocid1.compartment.test", "namespace": "ns", "bucket": "images",
                                      "object_name": "oracle.qcow2", "display_name": "Test image", "operating_system": "Oracle Linux",

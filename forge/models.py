@@ -151,7 +151,7 @@ class SSHAccess(StrictModel):
 
 class Recipe(StrictModel):
     target: Literal["oci", "aws", "azure", "gcp", "generic"] = "oci"
-    output_format: Literal["qcow2", "raw", "vhd", "gcp"] = "qcow2"
+    output_format: Literal["qcow2", "raw", "vhd", "gcp", "oci"] = "qcow2"
     disk_size_gib: float | None = Field(default=None, gt=0, le=2048)
     partition_changes: list[PartitionChange] = Field(default_factory=list, max_length=128)
     expand_partition: str | None = Field(default=None, pattern=r"^/dev/sda[1-9][0-9]*$")
@@ -196,7 +196,11 @@ class Recipe(StrictModel):
             raise ValueError("Preserve and validate requires OCI guest preparation disabled; select Validate only or Reconfigure")
         if self.oci is not None and self.target != "oci":
             raise ValueError("OCI capabilities can be applied only to an OCI export")
-        expected = {"oci": "qcow2", "aws": "raw", "azure": "vhd", "gcp": "gcp"}
+        if self.output_format == "oci" and (self.target != "oci" or self.oci is None):
+            raise ValueError("An OCI image archive requires the Oracle Cloud target and OCI settings")
+        expected = {"aws": "raw", "azure": "vhd", "gcp": "gcp"}
+        if self.target == "oci" and self.output_format not in {"qcow2", "oci"}:
+            raise ValueError("oci requires the qcow2 or oci export preset")
         if self.target in expected and self.output_format != expected[self.target]:
             raise ValueError(f"{self.target} requires the {expected[self.target]} export preset")
         if self.packages_install and not self.allow_network:

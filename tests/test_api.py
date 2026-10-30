@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from threading import Event
 import time
+import tarfile
 import zipfile
 
 from fastapi.testclient import TestClient
@@ -522,6 +523,44 @@ def test_oci_build_publishes_complete_downloadable_configuration(client, monkeyp
         assert len(schema["schemaData"]) == 13
         assert schema["globalImageCapabilitySchemaVersionName"] == "tenancy-version"
         assert "isPvEncryptionInTransitEnabled" in json.loads(archive.read("instance-launch-fragment.json"))
+
+
+def test_oci_archive_uses_existing_download_and_s3_flows(client, monkeypatch):
+    image_id = imported(client)
+    monkeypatch.setattr("forge.oci_guest.plan_guest", lambda *a, **k: {"changes": [], "blockers": [], "warnings": []})
+    def archive_build(source, directory, inspection, recipe, log):
+        assert recipe["output_format"] == "oci" and source.read_bytes() == b"test-source"
+        path = directory / "image.oci"
+        with tarfile.open(path, "w") as archive:
+            for name, content in (("image_metadata.json", b'{"version":2}'), ("output.QCOW2", b"test-output")):
+                member = tarfile.TarInfo(name)
+                member.size = len(content)
+                archive.addfile(member, io.BytesIO(content))
+        return {"artifact_path": str(path), "filename": path.name, "format": "oci", "virtual_size": 1024**3,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "warnings": ["Test output only"]}
+    monkeypatch.setattr(client.app.state.engine, "build", archive_build)
+    response = client.post(f"/api/images/{image_id}/build", json={"target": "oci", "output_format": "oci", "oci": {}})
+    assert response.status_code == 202, response.text
+    job = finished(client, response.json()["job_id"])
+    assert job["status"] == "succeeded", job
+    artifact_id = job["result"]["artifact_id"]
+    item = client.get(f"/api/artifacts/{artifact_id}").json()
+    download = client.get(f"/api/artifacts/{artifact_id}/download")
+    assert item["format"] == "oci" and item["name"] == "image.oci"
+    assert "image.oci" in download.headers["content-disposition"]
+    assert hashlib.sha256(download.content).hexdigest() == item["sha256"]
+    with tarfile.open(fileobj=io.BytesIO(download.content)) as archive:
+        assert set(archive.getnames()) == {"image_metadata.json", "output.QCOW2"}
+    config = client.get(f"/api/artifacts/{artifact_id}/oci-bundle")
+    with zipfile.ZipFile(io.BytesIO(config.content)) as archive:
+        assert json.loads(archive.read("image-import.json"))["sourceImageType"] == "OCI"
+    def upload(location, path, settings, log):
+        assert path.name == "image.oci" and path.read_bytes() == download.content
+        return {"url": "s3://example/image.oci", "size": path.stat().st_size}
+    monkeypatch.setattr("forge.transfers.upload", upload)
+    upload_job = client.post(f"/api/artifacts/{artifact_id}/upload", json={"url": "s3://example/image.oci"})
+    assert upload_job.status_code == 202, upload_job.text
+    assert finished(client, upload_job.json()["job_id"])["status"] == "succeeded"
 
 
 def test_uefi_plan_for_old_import_requires_refresh_and_never_mutates(client, tmp_path):
