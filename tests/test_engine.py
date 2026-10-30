@@ -578,6 +578,7 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(result["filename"], "image.oci")
         self.assertEqual(result["format"], "oci")
         self.assertTrue(result["oci_archive"]["verified"])
+        self.assertFalse(any("metadata is not bundled" in warning for warning in result["warnings"]))
         self.assertTrue(any(command[:2] == ["qemu-img", "check"] and command[-1].endswith("archive-disk.qcow2") for command in commands))
         self.assertTrue(any(command[:2] == ["qemu-img", "compare"] and command[-1].endswith("archive-disk.qcow2") for command in commands))
         with tarfile.open(result["artifact_path"]) as archive:

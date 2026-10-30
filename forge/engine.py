@@ -731,7 +731,7 @@ class ImageEngine:
         warnings = ["Output format validated; cloud import and boot testing have not been performed."]
         if storage_plan["requested"]:
             warnings.extend(storage_plan["warnings"])
-        if target == "oci":
+        if target == "oci" and final_format != "oci":
             warnings.append("Import as QCOW2 and verify firmware, launch mode, agents, and destination boot-volume sizing. OCI metadata is not bundled.")
         if recipe.get("kernel_args") is not None:
             warnings.append("On grubby/BLS guests, requested kernel arguments update matching names and retain other existing arguments.")
