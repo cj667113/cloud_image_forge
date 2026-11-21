@@ -1,4 +1,6 @@
 """Small persistent registry; every operation uses its own SQLite connection."""
+from __future__ import annotations
+
 from datetime import datetime, timezone
 import json
 import logging
