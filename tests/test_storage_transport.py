@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from forge.storage import (MIB, StorageError, _archive_manifest, _compare_manifests,
-                           _export_archive, _import_archive, _raw_gpt_names, _set_gpt_name, plan_rebuild)
+                           _export_archive, _import_archive, _raw_gpt_names, _set_gpt_name, _stage_archive, plan_rebuild)
 from test_storage import make_archive, inspected, OPTIONS, write_fileout
 
 
@@ -90,6 +90,21 @@ def test_host_gzip_roundtrip_preserves_exact_tar_and_manifest_metadata(tmp_path)
     assert not list(tmp_path.glob('raw-*.tar'))
 
 
+@pytest.mark.parametrize("allowance,plain,suffix", [(2*MIB, True, ".tar"), (1, True, ".gz"), (2*MIB, False, ".gz")])
+def test_staging_uses_space_budget_and_preserves_contents(tmp_path, allowance, plain, suffix):
+    guest, fixture, raw, calls = tar_guest(tmp_path)
+    path, size = _stage_archive(guest, tmp_path / "root", allowance, plain, lambda _: None)
+    assert path.suffix == suffix and size == len(raw)
+    _compare_manifests(_archive_manifest(fixture), _archive_manifest(path), "/dev/test")
+    _import_archive(guest, path, size)
+    if suffix == ".tar":
+        assert calls[-1] == ("in", str(path))
+        with pytest.raises(StorageError, match="size changed"):
+            _import_archive(guest, path, size + 1)
+    else:
+        assert not (tmp_path / "root.tar").exists()
+
+
 def test_export_does_not_overwrite_preexisting_archive(tmp_path):
     guest,fixture,raw,calls=tar_guest(tmp_path);archive=tmp_path/'archive.gz';archive.write_bytes(b'untouched')
     with pytest.raises(FileExistsError):_export_archive(guest,archive,len(raw))
@@ -105,7 +120,7 @@ def test_failed_transport_cleans_only_owned_raw_and_partial_gzip(tmp_path,stage)
         with pytest.raises(RuntimeError):_export_archive(guest,archive,len(raw))
         assert not archive.exists()
     elif stage=='compress':
-        with patch('forge.storage._GZIP_EXPORT','raise SystemExit(1)'),pytest.raises(StorageError):_export_archive(guest,archive,len(raw))
+        with patch('forge.storage._ARCHIVE_WRITER','raise SystemExit(1)'),pytest.raises(StorageError):_export_archive(guest,archive,len(raw))
         assert not archive.exists()
     elif stage=='space':
         with patch('forge.storage.shutil.disk_usage',return_value=Mock(free=0)),pytest.raises(StorageError,match='workspace'):_export_archive(guest,archive,len(raw))

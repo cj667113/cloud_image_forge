@@ -221,9 +221,9 @@ def verify_growth(inspection, plan, *, expected_disk_size=None):
     return result
 
 
-def grow(source_work: Path, destination: Path, inspection, options, disk_size_gib, log):
+def grow(source_work: Path, destination: Path, inspection, options, disk_size_gib, log, *, inspected_work=False):
     from .engine import ImageEngine, _guest, _run
-    fresh = ImageEngine().inspect(source_work, include_editor=False)
+    fresh = inspection if inspected_work else ImageEngine().inspect(source_work, include_editor=False)
     plan = plan_growth(fresh, options, disk_size_gib)
     if not plan["ready"]:
         raise StorageError("Automatic growth blocked: " + " ".join(plan["blockers"]))

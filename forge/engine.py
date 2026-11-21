@@ -6,6 +6,8 @@ image is never writable; every build starts with a standalone working copy.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import errno
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -18,6 +20,7 @@ import shutil
 import signal
 import struct
 import subprocess
+import sys
 import tarfile
 import tempfile
 from typing import Callable
@@ -211,6 +214,31 @@ def _image_info(path: Path, fmt: str | None = None) -> dict:
     if not 0 < size <= max_size:
         raise EngineError(f"Virtual disk size must be at most {max_size // GIB} GiB.")
     return info
+
+
+def _create_working_copy(source: Path, fmt: str, info: dict, work: Path, log):
+    """Clone an ordinary QCOW2 inode when supported, otherwise flatten with QEMU."""
+    data = info.get("format-specific", {}).get("data", {})
+    can_clone = (sys.platform == "linux" and fmt == "qcow2"
+                 and info.get("dirty-flag") is False and data.get("compat") == "1.1"
+                 and data.get("corrupt") is False and not info.get("snapshots") and not data.get("bitmaps"))
+    if can_clone:
+        # FICLONE is _IOW(0x94, 9, int) on both supported Linux architectures.
+        # Python exposes its name starting with 3.12. The Docker worker uses 3.11.
+        with source.open("rb") as original, work.open("xb") as cloned:
+            try:
+                fcntl.ioctl(cloned.fileno(), getattr(fcntl, "FICLONE", 0x40049409), original.fileno())
+            except OSError as exc:
+                work.unlink()
+                if exc.errno not in {errno.EXDEV, errno.EOPNOTSUPP, errno.ENOTTY, errno.EINVAL,
+                                     errno.ENOSYS, errno.EPERM}:
+                    raise
+            else:
+                log("Created an independent copy-on-write QCOW2 working image")
+                _run(["qemu-img", "check", "-f", "qcow2", str(work)], log)
+                return
+    log("Creating an independent QCOW2 working copy")
+    _run(["qemu-img", "convert", "-f", fmt, "-O", "qcow2", str(source), str(work)], log)
 
 
 @contextmanager
@@ -560,16 +588,18 @@ class ImageEngine:
             os_info = {"name": g.inspect_get_product_name(root), "distro": g.inspect_get_distro(root),
                        "arch": architecture, "root": root}
             kernels = sorted(g.glob_expand("/boot/vmlinuz-*"))
+            from .initramfs import ReadOnlyInitrdGuest
             from .oci_guest import inspect_guest
-            oci_evidence = inspect_guest(g, root, partitions, kernels, boot=boot)
+            archive_guest = ReadOnlyInitrdGuest(g)
+            oci_evidence = inspect_guest(archive_guest, root, partitions, kernels, boot=boot)
             try:
                 migration_guest = inspect_prerequisites(g, root, partitions, migration_layout)
             except RuntimeError as exc:
                 migration_guest = {"errors": [f"Cannot inspect optional UEFI migration prerequisites: {exc}"]}
             from .storage import inspect_storage
             from .platform import inspect_platform
-            storage = inspect_storage(g, root, partitions, migration_layout)
-            platform = inspect_platform(g, root, partitions, kernels, oci_evidence=oci_evidence)
+            storage = inspect_storage(archive_guest, root, partitions, migration_layout)
+            platform = inspect_platform(archive_guest, root, partitions, kernels, oci_evidence=oci_evidence)
             from .ssh_access import inspect_access
             ssh_access = inspect_access(g)
         return {"format": fmt, "virtual_size": info["virtual-size"],
@@ -581,7 +611,7 @@ class ImageEngine:
                 "mount_reconciliation": platform.get("fstab"),
                 "warnings": ["Bootability and cloud-agent compatibility require a test launch after export."]}
 
-    def _resize(self, work: Path, destination: Path, inspection: dict, recipe: dict, log) -> Path:
+    def _resize(self, work: Path, destination: Path, inspection: dict, recipe: dict, log, *, inspected_work=False) -> Path:
         if (recipe.get("storage_resize") or {}).get("enabled"):
             from .storage import plan_storage
             plan = plan_storage(inspection, recipe["storage_resize"], recipe.get("disk_size_gib"), mount_policy=recipe.get("mount_policy", "auto"))
@@ -590,16 +620,17 @@ class ImageEngine:
             if plan["mode"] == "rebuild":
                 return self._resize(work, destination, inspection,
                                     {**recipe, "storage_resize": None, "storage_rebuild": recipe["storage_resize"],
-                                     "disk_size_gib": plan["layout"]["disk_size_after"] / GIB}, log)
+                                     "disk_size_gib": plan["layout"]["disk_size_after"] / GIB}, log, inspected_work=inspected_work)
             from .growth import grow
             grown = grow(work, destination / f"grown-{uuid4().hex}.qcow2", inspection,
-                         recipe["storage_resize"], recipe.get("disk_size_gib"), log)
+                         recipe["storage_resize"], recipe.get("disk_size_gib"), log, inspected_work=inspected_work)
             if grown != work:
                 work.unlink()
             return grown
         if (recipe.get("storage_rebuild") or {}).get("enabled"):
             from .storage import rebuild
-            rebuilt = rebuild(work, destination / f"rebuilt-{uuid4().hex}.qcow2", inspection, recipe, log)
+            rebuilt = rebuild(work, destination / f"rebuilt-{uuid4().hex}.qcow2", inspection, recipe, log,
+                              inspected_work=inspected_work)
             if rebuilt != work:
                 work.unlink()
             return rebuilt
@@ -754,17 +785,17 @@ class ImageEngine:
             warnings.append("Import as QCOW2 and verify firmware, launch mode, agents, and destination boot-volume sizing. OCI metadata is not bundled.")
         if recipe.get("kernel_args") is not None:
             warnings.append("On grubby/BLS guests, requested kernel arguments update matching names and retain other existing arguments.")
-        log("Creating an independent QCOW2 working copy; source remains unchanged")
-        _run(["qemu-img", "convert", "-f", fmt, "-O", "qcow2", str(source), str(work)], log)
+        _create_working_copy(source, fmt, fresh, work, log)
         initial_mount_receipt = reconcile_mounts(work, inspection, mount_policy, log)
-        resize_inspection = self.inspect(work, include_editor=False) if storage_plan["requested"] and initial_mount_receipt["changed"] else inspection
         from .storage import normalize_rebuild_boot_references
+        # fstab reconciliation changes no device identities. The GRUB rewrite
+        # checks the live UUIDs and file hash against its projected mapping.
         storage_boot_receipt = normalize_rebuild_boot_references(
-            work, resize_inspection, storage_plan.get("projected_boot_updates", []), log)
-        if storage_boot_receipt["changed"]:
-            resize_inspection = self.inspect(work, include_editor=False)
+            work, inspection, storage_plan.get("projected_boot_updates", []), log)
+        inspected_work = storage_plan["requested"] and (initial_mount_receipt["changed"] or storage_boot_receipt["changed"])
+        resize_inspection = self.inspect(work, include_editor=False) if inspected_work else inspection
         before_resize = work
-        work = self._resize(work, destination_dir, resize_inspection, recipe, log)
+        work = self._resize(work, destination_dir, resize_inspection, recipe, log, inspected_work=inspected_work)
         edit_mount_receipt = self._customize(work, resize_inspection, recipe, log)
         mount_receipt = initial_mount_receipt
         if isinstance(edit_mount_receipt, dict):

@@ -32,17 +32,21 @@ FILESYSTEMS = {"xfs", "ext2", "ext3", "ext4"}
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,126}\Z")
 ARCHIVE_OPTIONS = {"compress": "gzip", "xattrs": True, "selinux": True, "acls": True}
 ARCHIVE_METADATA = {key: value for key, value in ARCHIVE_OPTIONS.items() if key != "compress"}
-_GZIP_EXPORT = '''import gzip, resource, signal, sys
-limit, seconds = map(int, sys.argv[1:])
+_ARCHIVE_WRITER = '''import contextlib, gzip, resource, signal, sys
+limit, seconds, plain_limit = map(int, sys.argv[1:])
 resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
 signal.alarm(seconds)
 count = 0
 try:
-    with gzip.GzipFile(filename="", mode="wb", fileobj=sys.stdout.buffer, compresslevel=6, mtime=0) as output:
+    sink = (contextlib.nullcontext(sys.stdout.buffer) if plain_limit else
+            gzip.GzipFile(filename="", mode="wb", fileobj=sys.stdout.buffer, compresslevel=6, mtime=0))
+    with sink as output:
         while chunk := sys.stdin.buffer.read(4 * 1024 * 1024):
             count += len(chunk)
             if count > limit:
                 raise ValueError("Raw archive exceeds workspace")
+            if plain_limit and count > plain_limit:
+                sys.exit(3)
             output.write(chunk)
     sys.stdout.buffer.flush()
     sys.stderr.write("OK " + str(count) + "\\n")
@@ -57,6 +61,10 @@ MOUNT_POLICIES = {"auto", "labels", "preserve"}
 
 
 class StorageError(RuntimeError):
+    pass
+
+
+class _PlainTarTooLarge(StorageError):
     pass
 
 
@@ -1363,7 +1371,8 @@ def _archive_manifest(path):
     from decimal import Decimal
 
     entries, hardlinks, logical_bytes = {}, {}, 0
-    with tarfile.open(path, "r|gz", encoding="utf-8", errors="surrogateescape") as archive:
+    mode = "r|" if Path(path).suffix == ".tar" else "r|gz"
+    with tarfile.open(path, mode, bufsize=256 * 1024, encoding="utf-8", errors="surrogateescape") as archive:
         for member in archive:
             name = _member_path(member.name)
             if name in entries or name in hardlinks or len(entries) + len(hardlinks) >= 500000:
@@ -1472,8 +1481,8 @@ def _archive_space(folder, size):
         raise StorageError("Not enough host workspace for one uncompressed filesystem archive and verification headroom")
 
 
-def _export_archive(g, archive, capacity):
-    """Stream raw tar into a size-limited gzip child on the native worker CPU."""
+def _export_archive(g, archive, capacity, *, plain_limit=0):
+    """Stream appliance tar to a bounded native writer, optionally compressing it."""
     archive = Path(archive)
     _archive_space(archive.parent, capacity)
     limit = shutil.disk_usage(archive.parent).free - 512 * MIB
@@ -1485,13 +1494,12 @@ def _export_archive(g, archive, capacity):
             created = True
             # The constant child sets only its own file limit. preexec_fn and
             # process-global limits are unsafe in the threaded API worker.
-            process = subprocess.Popen([sys.executable, "-I", "-c", _GZIP_EXPORT, str(limit), str(timeout)],
+            process = subprocess.Popen([sys.executable, "-I", "-c", _ARCHIVE_WRITER, str(limit), str(timeout), str(plain_limit)],
                                        stdin=subprocess.PIPE, stdout=output, stderr=subprocess.PIPE,
                                        bufsize=0, start_new_session=True)
             transfer_error = None
             try:
-                # libguestfs explicitly supports FileOut to /dev/fd/N. No
-                # uncompressed host file, FIFO or Python thread is involved.
+                # libguestfs streams FileOut to the native writer through this pipe.
                 g.tar_out("/", f"/dev/fd/{process.stdin.fileno()}", numericowner=True, **ARCHIVE_METADATA)
             except Exception as exc:
                 transfer_error = exc
@@ -1500,15 +1508,17 @@ def _export_archive(g, archive, capacity):
             try:
                 code = process.wait(timeout=30)
             except subprocess.TimeoutExpired as exc:
-                raise StorageError("Native archive compressor did not finish within its shutdown timeout") from exc
+                raise StorageError("Native archive writer did not finish within its shutdown timeout") from exc
             status = process.stderr.read(128)
+            if plain_limit and code == 3:
+                raise _PlainTarTooLarge("Plain tar exceeded the reserved staging space")
             if code != 0 or not re.fullmatch(rb"OK [0-9]{1,20}\n", status):
-                raise StorageError("Native archive compression failed or exceeded its workspace/time limit") from transfer_error
+                raise StorageError("Native archive writer failed or exceeded its workspace/time limit") from transfer_error
             if transfer_error is not None:
                 raise transfer_error
             size = int(status[3:])
             if not 0 < size <= limit:
-                raise StorageError("Native archive compressor returned an invalid input size")
+                raise StorageError("Native archive writer returned an invalid input size")
         return size
     except BaseException:
         if created:
@@ -1523,9 +1533,25 @@ def _export_archive(g, archive, capacity):
             process.stderr.close()
 
 
+def _stage_archive(g, basename, capacity, plain, log):
+    if plain:
+        path = basename.with_suffix(".tar")
+        try:
+            return path, _export_archive(g, path, capacity, plain_limit=capacity)
+        except _PlainTarTooLarge:
+            log("Expanded tar exceeds its staging allowance. Retrying with compression.")
+    path = basename.with_suffix(".tar.gz")
+    return path, _export_archive(g, path, capacity)
+
+
 def _import_archive(g, archive, raw_size):
     """Decompress one owned archive with an exact observed expansion bound."""
     archive = Path(archive)
+    if archive.suffix == ".tar":
+        if archive.stat().st_size != raw_size:
+            raise StorageError("Filesystem archive size changed before restore")
+        g.tar_in(str(archive), "/", **ARCHIVE_METADATA)
+        return
     _archive_space(archive.parent, raw_size)
     raw = None
     try:
@@ -1569,7 +1595,7 @@ def _verify_layout(g, plan):
             raise StorageError(f"Rebuilt LV has an unexpected size: {lv['device']}")
 
 
-def rebuild(source_work: Path, destination: Path, inspection: dict, recipe: dict, log) -> Path:
+def rebuild(source_work: Path, destination: Path, inspection: dict, recipe: dict, log, *, inspected_work=False) -> Path:
     """Return a verified new image, retaining source_work on success and failure.
 
     The caller may delete its disposable source after adopting the returned path.
@@ -1593,8 +1619,12 @@ def rebuild(source_work: Path, destination: Path, inspection: dict, recipe: dict
     destination = destination.parent.resolve() / destination.name
     if source_work == destination:
         raise StorageError("Rebuild source and destination must be different files")
-    log("Refreshing storage evidence in the source working image before filesystem rebuild")
-    fresh = ImageEngine().inspect(source_work, include_editor=False)
+    if inspected_work:
+        log("Using the storage evidence just collected from the normalized working image")
+        fresh = inspection
+    else:
+        log("Refreshing storage evidence in the source working image before filesystem rebuild")
+        fresh = ImageEngine().inspect(source_work, include_editor=False)
     # Projection is preview-only. The actual source must already have had its
     # fstab reconciled and freshly inspected before rebuilding LVM identities.
     plan = plan_rebuild(fresh, options, recipe.get("disk_size_gib"), mount_policy="preserve", project_references=False)
@@ -1607,8 +1637,12 @@ def rebuild(source_work: Path, destination: Path, inspection: dict, recipe: dict
     esp = next(item for item in file_systems if item["kind"] == "efi")
     regular = [item for item in file_systems if item["editable"]]
     needed = sum(item.get("used", 0) for item in regular) + esp["size"] + max((item["size"] for item in regular), default=0) + 512 * MIB
-    if shutil.disk_usage(destination.parent).free < needed:
+    free = shutil.disk_usage(destination.parent).free
+    if free < needed:
         raise StorageError("Not enough host workspace for the source archives and verification headroom")
+    # Keep room for the entire destination and the compressed fallback even if
+    # a sparse source expands beyond its raw staging allowance.
+    plain_archives = free >= needed + plan["layout"]["disk_size_after"] + sum(item["size"] for item in regular)
     created = False
     try:
         with tempfile.TemporaryDirectory(prefix="storage-rebuild-", dir=destination.parent) as folder:
@@ -1648,8 +1682,8 @@ def rebuild(source_work: Path, destination: Path, inspection: dict, recipe: dict
                     log(f"Archiving {device} separately with numeric ownership, ACLs, xattrs and SELinux contexts")
                     _identity(g, filesystem)
                     g.mount_ro(device, "/")
-                    archive = staging / f"filesystem-{index}.tar.gz"
-                    raw_sizes[device] = _export_archive(g, archive, filesystem["size"])
+                    archive, raw_sizes[device] = _stage_archive(
+                        g, staging / f"filesystem-{index}", filesystem["size"], plain_archives, log)
                     g.umount_all()
                     manifest = _archive_manifest(archive)
                     # guestfs tar-in expands sparse and reflink files; reject a
@@ -1663,11 +1697,14 @@ def rebuild(source_work: Path, destination: Path, inspection: dict, recipe: dict
             if efi_raw.stat().st_size != esp["size"]:
                 raise StorageError("EFI raw copy is truncated")
             efi_hash = _digest(efi_raw)
-            needed = sum(manifest["logical_bytes"] for manifest in manifests.values()) + max((path.stat().st_size for path in archives.values()), default=0) + max(raw_sizes.values(), default=0) + 512 * MIB
+            restore_temp = max((size for device, size in raw_sizes.items() if archives[device].suffix == ".gz"), default=0)
+            verify_temp = max((path.stat().st_size for path in archives.values()), default=0)
+            needed = sum(manifest["logical_bytes"] for manifest in manifests.values()) + verify_temp + restore_temp + 512 * MIB
             if shutil.disk_usage(destination.parent).free < needed:
                 raise StorageError("Not enough host workspace to restore files and verify the rebuilt disk")
             with _guest(destination, "qcow2", readonly=False) as g:
                 g.upload_offset(str(efi_raw), esp["device"], 0)
+                efi_raw.unlink()
                 for filesystem in regular:
                     device, fs = filesystem["device"], filesystem["filesystem"]
                     log(f"Creating and restoring {fs} filesystem on {device}")
@@ -1689,17 +1726,18 @@ def rebuild(source_work: Path, destination: Path, inspection: dict, recipe: dict
                     if stats["bavail"] * stats["frsize"] < 64 * MIB:
                         raise StorageError(f"Restored filesystem {device} has less than 64 MiB available; choose a larger size")
                     g.umount_all()
+                    archives[device].unlink()
             _run(["qemu-img", "check", "-f", "qcow2", str(destination)], log)
             with _guest(destination, "qcow2", readonly=True) as g:
                 _verify_layout(g, plan)
                 for filesystem in file_systems:
                     _identity(g, filesystem)
-                verification = staging / "verify.tar.gz"
                 for filesystem in regular:
                     device = filesystem["device"]
                     log(f"Verifying every archived file and preserved metadata on {device}")
                     g.mount_ro(device, "/")
-                    _export_archive(g, verification, filesystem["selected_size_mib"] * MIB)
+                    verification, _ = _stage_archive(
+                        g, staging / "verify", filesystem["selected_size_mib"] * MIB, plain_archives, log)
                     g.umount_all()
                     _compare_manifests(manifests[device], _archive_manifest(verification), device)
                     verification.unlink()

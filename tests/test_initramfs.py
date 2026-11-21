@@ -327,3 +327,53 @@ def test_platform_fallback_reuses_the_parsed_archive_for_all_evidence():
     assert kernel["portability"]["readable"] and kernel["initrd_iscsi_userspace"]
     assert "dm_mod" in kernel["initrd_modules"]
     assert len(guest.downloads) == 1
+
+
+def test_native_reads_are_shared_only_in_one_bounded_readonly_inspection():
+    from unittest.mock import Mock
+    from forge.initramfs import ReadOnlyInitrdGuest
+
+    guest = Mock()
+    guest.initrd_list.side_effect = lambda path: ["etc/fstab", "etc/cmdline"]
+    guest.initrd_cat.side_effect = [RuntimeError("read error"), b"first", b"second"]
+    path = "/boot/initrd"
+    inspection = ReadOnlyInitrdGuest(guest)
+    inspection.initrd_list(path).clear()
+    assert inspection.initrd_list(path) == ["etc/fstab", "etc/cmdline"]
+    guest.initrd_list.assert_called_once_with(path)
+    with pytest.raises(RuntimeError, match="read error"):
+        inspection.initrd_cat(path, "etc/fstab")
+    assert inspection.initrd_cat(path, "etc/fstab") == inspection.initrd_cat(path, "etc/fstab") == b"first"
+    assert ReadOnlyInitrdGuest(guest).initrd_cat(path, "etc/fstab") == b"second"
+    assert guest.initrd_cat.call_count == 3
+
+    guest.initrd_list.reset_mock()
+    with patch("forge.initramfs.MAX_RETAINED", 1):
+        inspection = ReadOnlyInitrdGuest(guest)
+        assert inspection.initrd_list(path) == inspection.initrd_list(path) == ["etc/fstab", "etc/cmdline"]
+    assert guest.initrd_list.call_count == 2
+
+
+def test_platform_uses_storage_decode_after_rechecking_guest_fingerprint():
+    from forge.storage import _inspect_initrd_lvm
+
+    guest = Guest(composed())
+    path = "/boot/initramfs-test.img"
+    base = {"kernels": {"test": {"initrd": path}}, "tools": {}}
+    parts = [{"device": "/dev/sda1", "mountpoint": "/", "filesystem": "xfs",
+              "uuid": "11111111-2222-3333-4444-555555555555"}]
+
+    # A storage scan must decode the archive before its evidence can be reused.
+    _inspect_initrd_lvm(guest, [], [], [])
+    with patch.object(guest, "initrd_list", wraps=guest.initrd_list) as native_listing:
+        platform = inspect_platform(guest, "/dev/sda1", parts, ["/boot/vmlinuz-test"], base)
+    native_listing.assert_not_called()
+    assert len(guest.downloads) == 1
+    kernel = platform["kernels"]["test"]
+    assert kernel["portability"]["decoder"] == "bounded_newc"
+    assert kernel["initrd_iscsi_userspace"] and "dm_mod" in kernel["initrd_modules"]
+
+    guest.files[path] = bytes(len(guest.files[path]))
+    platform = inspect_platform(guest, "/dev/sda1", parts, ["/boot/vmlinuz-test"], base)
+    assert not platform["kernels"]["test"]["portability"]["readable"]
+    assert platform["kernels"]["test"]["initrd_sha256"] != kernel["initrd_sha256"]

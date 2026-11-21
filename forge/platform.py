@@ -258,11 +258,27 @@ def _generated_grub_evidence(g, partitions):
     return files, errors
 
 
+def _kernel_initrd_evidence(reader, path):
+    from .portability import inspect_archive
+
+    members, listed, iscsi_userspace = None, None, False
+    if path:
+        try:
+            members = reader.initrd_list(path)
+            listed = sorted({match.group(1).replace("-", "_") for name in members
+                             if (match := re.search(r"/([A-Za-z0-9_-]+)\.ko(?:\.(?:xz|gz|zst))?$", "/" + name))})
+            iscsi_userspace = _iscsi_userspace_ready(reader, path, members)
+        except RuntimeError:
+            pass
+    return members, listed, iscsi_userspace, inspect_archive(reader, path, members)
+
+
 def _inspect_platform(g, root, partitions, kernels, oci_evidence=None):
     """Read evidence only; old imports need refreshing before migration."""
     from .oci_guest import inspect_guest
     from .iscsi_network import installed_generator
-    from .portability import inspect_archive, inspect_portability
+    from .initramfs import archive_fingerprint, read_archive
+    from .portability import inspect_portability
     base = deepcopy(oci_evidence) if oci_evidence is not None else inspect_guest(g, root, partitions, kernels)
     inventory = {}
     for path in kernels:
@@ -275,39 +291,24 @@ def _inspect_platform(g, root, partitions, kernels, oci_evidence=None):
         builtin = _module_inventory(g, version, _read(g, f"/lib/modules/{version}/modules.builtin"))
         builtin.update(name for name, option in MODULE_CONFIG.items() if config.get(option) == "y")
         initrd = old.get("initrd")
-        listed, iscsi_userspace, members = None, False, None
-        digest = None
-        if initrd:
+        digest, parsed = archive_fingerprint(g, initrd) if initrd else (None, None)
+        # The storage scan may already have decoded this exact initrd on the
+        # worker. Reuse it after checking its current guest fingerprint.
+        members, listed, iscsi_userspace, archive = _kernel_initrd_evidence(parsed or g, initrd)
+        if initrd and parsed is None and (members is None or not archive["readable"] or "early_cpio" in members):
             try:
-                members = g.initrd_list(initrd)
-                listed = sorted({match.group(1).replace("-", "_") for name in members
-                                 if (match := re.search(r"/([A-Za-z0-9_-]+)\.ko(?:\.(?:xz|gz|zst))?$", "/" + name))})
-                iscsi_userspace = _iscsi_userspace_ready(g, initrd, members)
-            except RuntimeError:
-                pass
-            try:
-                digest = g.checksum("sha256", initrd)
-            except RuntimeError:
-                pass
-        archive = inspect_archive(g, initrd, members)
-        if initrd and (members is None or not archive.get("readable") or "early_cpio" in members):
-            try:
-                from .initramfs import read_archive
                 parsed = read_archive(g, initrd, digest)
-                members = parsed.initrd_list(initrd)
-                listed = sorted({match.group(1).replace("-", "_") for name in members
-                                 if (match := re.search(r"/([A-Za-z0-9_-]+)\.ko(?:\.(?:xz|gz|zst))?$", "/" + name))})
-                iscsi_userspace = _iscsi_userspace_ready(parsed, initrd, members)
-                archive = inspect_archive(parsed, initrd, members)
-                archive["decoder"] = "bounded_newc"
-                archive["formats"] = list(getattr(parsed, "formats", []))
-                digest = parsed.sha256
+                members, listed, iscsi_userspace, archive = _kernel_initrd_evidence(parsed, initrd)
             except (RuntimeError, ValueError, OSError, AttributeError) as exc:
                 archive["readable"] = False
                 archive["errors"].append("Bounded initramfs reader: " + str(exc))
                 # An early CPIO listing is not the main archive's inventory.
                 if members is not None and "early_cpio" in members:
                     listed = None
+        if parsed is not None:
+            archive["decoder"] = "bounded_newc"
+            archive["formats"] = list(parsed.formats)
+            digest = parsed.sha256
         inventory[version] = {"modules": sorted(installed), "builtin": sorted(builtin),
                               "config": {key: value for key, value in config.items() if key in ARCH_CONFIG},
                               "architecture": _kernel_architecture(config),

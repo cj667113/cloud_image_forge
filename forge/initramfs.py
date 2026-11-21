@@ -16,6 +16,7 @@ import posixpath
 from pathlib import Path, PurePosixPath
 import re
 import stat
+import sys
 import tempfile
 import time
 import zlib
@@ -36,6 +37,43 @@ MAX_CACHE_ARCHIVES = 2
 
 class ArchiveError(ValueError):
     pass
+
+
+class ReadOnlyInitrdGuest:
+    """Share native archive reads only for one mounted read-only inspection."""
+
+    def __init__(self, guest):
+        self._guest = guest
+        self._reads = {}
+        self._retained = 0
+
+    def __getattr__(self, name):
+        return getattr(self._guest, name)
+
+    def _retain(self, key, value, size):
+        # Oversize results still go to the caller. Only the retained copy is bounded.
+        size += sys.getsizeof(key) + sum(map(sys.getsizeof, key))
+        if len(self._reads) < 256 and self._retained + size <= MAX_RETAINED:
+            self._reads[key] = value
+            self._retained += size
+
+    def initrd_list(self, path):
+        key = (path, None)
+        if key in self._reads:
+            return list(self._reads[key])
+        members = self._guest.initrd_list(path)
+        if len(members) <= MAX_ENTRIES:
+            listing = tuple(members)
+            self._retain(key, listing, sys.getsizeof(listing) + sum(map(sys.getsizeof, listing)))
+        return members
+
+    def initrd_cat(self, path, name):
+        key = (path, name)
+        if key in self._reads:
+            return self._reads[key]
+        content = self._guest.initrd_cat(path, name)
+        self._retain(key, content, sys.getsizeof(content))
+        return content
 
 
 class _ZstdBuffer(ctypes.Structure):
@@ -388,26 +426,37 @@ def _cache_archive(cache, key, archive):
         cache.popitem(last=False)
 
 
-def read_archive(g, path, expected_sha256=None):
-    size = g.filesize(path)
-    if not 0 < size <= MAX_INPUT:
-        raise ArchiveError("Initramfs file is empty or exceeds the 256 MiB inspection limit.")
-    # An actual checksum is re-read even when the caller supplied its earlier
-    # observation. This prevents same-size mutation or a stale expected hash
-    # from turning the per-handle cache into a proof bypass.
+def archive_fingerprint(g, path, *, size=None):
+    """Hash current guest bytes before returning any previously decoded archive."""
     try:
         observed = g.checksum("sha256", path)
     except (RuntimeError, AttributeError):
         observed = None
     if not isinstance(observed, str) or not re.fullmatch(r"[0-9a-f]{64}", observed):
         observed = None
+    cache = _archive_cache(g)
+    if observed and cache:
+        if size is None:
+            try:
+                size = g.filesize(path)
+            except (RuntimeError, AttributeError):
+                return observed, None
+        key = (path, size, observed)
+        if key in cache:
+            cache.move_to_end(key)
+            return observed, cache[key]
+    return observed, None
+
+
+def read_archive(g, path, expected_sha256=None):
+    size = g.filesize(path)
+    if not 0 < size <= MAX_INPUT:
+        raise ArchiveError("Initramfs file is empty or exceeds the 256 MiB inspection limit.")
+    observed, cached = archive_fingerprint(g, path, size=size)
     if observed and expected_sha256 and observed != expected_sha256:
         raise ArchiveError("Initramfs fingerprint changed during inspection.")
-    cache = _archive_cache(g)
-    key = (path, size, observed)
-    if observed and key in cache:
-        cache.move_to_end(key)
-        return cache[key]
+    if cached is not None:
+        return cached
     with tempfile.TemporaryDirectory(prefix="forge-initramfs-") as directory:
         target = Path(directory) / "initramfs"
         # Download through the already read-only libguestfs appliance. No guest
@@ -422,5 +471,5 @@ def read_archive(g, path, expected_sha256=None):
             file.seek(0)
             archive = parse_file(file, path)
         archive.sha256 = digest
-        _cache_archive(cache, (path, size, digest), archive)
+        _cache_archive(_archive_cache(g), (path, size, digest), archive)
         return archive

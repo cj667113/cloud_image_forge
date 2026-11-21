@@ -1,5 +1,6 @@
 """Safety invariants and conversion orchestration; no libguestfs installation needed."""
 from contextlib import contextmanager
+import errno
 import hashlib
 import json
 import os
@@ -10,8 +11,9 @@ import tempfile
 import time
 import unittest
 from unittest.mock import Mock, patch
+import pytest
 
-from forge.engine import (EngineError, GIB, MIB, ImageEngine, _grub_assignment,
+from forge.engine import (EngineError, GIB, MIB, ImageEngine, _create_working_copy, _grub_assignment,
                           _input_format, _roots, _run, _validate_fstab, _validate_recipe, _mount, _run_guest_script)
 
 
@@ -165,7 +167,10 @@ class InspectionTests(unittest.TestCase):
             self.assertEqual(result["services"], [])
             systemd_scan.assert_called_once_with(g)
             self.assertEqual(oci.call_count, 2)
-            oci.assert_called_with(g, "/dev/sda2", [], [], boot=boot)
+            first_reader, second_reader = (call.args[0] for call in oci.call_args_list)
+            self.assertIsNot(first_reader, second_reader)
+            self.assertIs(second_reader.inspect_get_arch, g.inspect_get_arch)
+            oci.assert_called_with(second_reader, "/dev/sda2", [], [], boot=boot)
             self.assertEqual(working, {key: value for key, value in result.items()
                                        if key not in {"files", "services", "systemd"}})
 
@@ -298,6 +303,20 @@ class RecipeTests(unittest.TestCase):
 
 
 class BuildTests(unittest.TestCase):
+    def test_resize_uses_current_inspection_only_after_mount_or_boot_repair(self):
+        for mounts_changed, boot_changed in ((False, False), (True, False), (False, True), (True, True)):
+            with self.subTest(mounts_changed=mounts_changed, boot_changed=boot_changed):
+                self.reconcile_mounts.return_value["changed"] = mounts_changed
+                def stop_at_resize(engine, *args, inspected_work):
+                    self.assertEqual(inspected_work, mounts_changed or boot_changed)
+                    self.assertEqual(engine.inspect.call_count, int(inspected_work))
+                    raise StopIteration
+                with patch("forge.storage.plan_recipe_storage", return_value={"requested": True, "warnings": []}), \
+                     patch("forge.storage.normalize_rebuild_boot_references", return_value={"changed": boot_changed}), \
+                     patch.object(ImageEngine, "_resize", autospec=True, side_effect=stop_at_resize):
+                    with self.assertRaises(StopIteration):
+                        self.run_build()
+
     def setUp(self):
         # Other orchestration tests isolate disk access; mount reconciliation
         # has separate real-inventory tests and explicit publication tests below.
@@ -724,12 +743,49 @@ def test_automatic_resize_engine_uses_growth_and_keeps_old_copy_until_success(tm
     from test_growth import image,options
     from forge.engine import ImageEngine
     work=tmp_path/'working.qcow2';work.write_bytes(b'old-copy')
-    def grow(source,dest,inspection,config,disk,log):
+    def grow(source,dest,inspection,config,disk,log,*,inspected_work):
+        assert not inspected_work
         assert source.read_bytes()==b'old-copy' and config==options()
         dest.write_bytes(b'grown');return dest
     with patch('forge.growth.grow',grow):
         result=ImageEngine()._resize(work,tmp_path,image(),{'storage_resize':options()},lambda _:None)
     assert not work.exists() and result.read_bytes()==b'grown'
+
+
+def test_qcow2_clone_is_exclusive_and_independently_checked(tmp_path, monkeypatch):
+    source, work = tmp_path / "input.qcow2", tmp_path / "working.qcow2"
+    source.write_bytes(qcow_header())
+    info = {"dirty-flag": False, "format-specific": {"data": {"compat": "1.1", "corrupt": False}}}
+    def clone(dest_fd, request, src_fd):
+        assert os.fstat(src_fd).st_ino != os.fstat(dest_fd).st_ino
+        os.write(dest_fd, os.read(src_fd, 512))
+    monkeypatch.setattr("forge.engine.sys.platform", "linux")
+    with patch("forge.engine.fcntl.ioctl", side_effect=clone), patch("forge.engine._run") as run:
+        _create_working_copy(source, "qcow2", info, work, lambda _: None)
+        assert run.call_args.args[0] == ["qemu-img", "check", "-f", "qcow2", str(work)]
+        assert source.read_bytes() == work.read_bytes()
+        work.write_bytes(b"modified build")
+        with pytest.raises(FileExistsError):
+            _create_working_copy(source, "qcow2", info, work, lambda _: None)
+        assert work.read_bytes() == b"modified build" and source.read_bytes() == qcow_header()
+
+
+@pytest.mark.parametrize("fmt,special,should_try", [
+    ("raw", {}, False), ("qcow2", {"dirty-flag": True}, False),
+    ("qcow2", {"snapshots": [{"id": "1"}]}, False),
+    ("qcow2", {"format-specific": {"data": {"compat": "1.1", "corrupt": False, "bitmaps": [{}]}}}, False),
+    ("qcow2", {}, True),
+])
+def test_working_copy_flattens_inputs_and_falls_back_on_incompatible_filesystems(tmp_path, monkeypatch, fmt, special, should_try):
+    source, work = tmp_path / "input", tmp_path / "working.qcow2"
+    source.write_bytes(qcow_header())
+    info = {"dirty-flag": False, "format-specific": {"data": {"compat": "1.1", "corrupt": False}}, **special}
+    monkeypatch.setattr("forge.engine.sys.platform", "linux")
+    with patch("forge.engine.fcntl.ioctl", side_effect=OSError(errno.EOPNOTSUPP, "unsupported")) as clone, patch("forge.engine._run") as run:
+        _create_working_copy(source, fmt, info, work, lambda _: None)
+        assert clone.called == should_try
+        assert not work.exists()
+        assert run.call_args.args[0] == ["qemu-img", "convert", "-f", fmt, "-O", "qcow2", str(source), str(work)]
 
 
 def test_automatic_resize_rejected_before_guest_or_qemu_execution():
@@ -738,6 +794,22 @@ def test_automatic_resize_rejected_before_guest_or_qemu_execution():
         with __import__('pytest').raises(EngineError,match='overlap'):
             _validate_recipe({'storage_resize':options('/dev/sda2',1024)},image())
     run.assert_not_called();guest.assert_not_called()
+
+
+@pytest.mark.parametrize("inspected_work", [True, False])
+def test_storage_rebuild_uses_same_working_disk_scan_for_planning(tmp_path, inspected_work):
+    from forge.storage import StorageError, rebuild
+
+    source = tmp_path / "working.qcow2"
+    source.write_bytes(qcow_header())
+    passed, refreshed = {"evidence": "passed"}, {"evidence": "refreshed"}
+    with patch.object(ImageEngine, "inspect", return_value=refreshed) as inspect, \
+         patch("forge.storage.plan_rebuild", return_value={"ready": False, "blockers": ["test"]}) as plan:
+        with pytest.raises(StorageError, match="test"):
+            rebuild(source, tmp_path / "rebuilt", passed, {"storage_rebuild": {"enabled": True}},
+                    lambda _: None, inspected_work=inspected_work)
+        assert inspect.call_count == int(not inspected_work)
+        assert plan.call_args.args[0] is (passed if inspected_work else refreshed)
 
 
 def test_gcp_archive_preserves_sparse_disk_extents_and_virtual_size(tmp_path):
