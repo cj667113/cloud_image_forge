@@ -111,7 +111,7 @@ def _matches(actual, desired):
                for key in ("ocpuConstraints", "memoryConstraints"))
 
 
-def apply(bundle, *, image_id=None, import_image=False, profile=None, region=None,
+def apply(bundle, *, image_id=None, import_image=False, import_archive=False, profile=None, region=None,
           exact_shapes=False, timeout=3600, run=subprocess.run, sleep=time.sleep):
     """Apply the selected shapes and optionally remove other associations."""
     bundle = Path(bundle).resolve()
@@ -130,7 +130,7 @@ def apply(bundle, *, image_id=None, import_image=False, profile=None, region=Non
         raise ApplyError("Invalid image import configuration")
     if image_id is not None:
         image_id = _image_id(image_id)
-    if image_id and import_image:
+    if sum(bool(mode) for mode in (image_id, import_image, import_archive)) > 1:
         raise ApplyError("Choose an existing image or a new import")
     identity = {"imports": imports, "entries": entries, "profile": profile, "region": region}
     fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True, allow_nan=False).encode()).hexdigest()
@@ -168,6 +168,8 @@ def apply(bundle, *, image_id=None, import_image=False, profile=None, region=Non
         state = _load(state_path) if state_path.exists() else {"version": 1, "fingerprint": fingerprint}
         if state.get("fingerprint") != fingerprint:
             raise ApplyError("Bundle or CLI profile/region changed since the saved run; use a separate extracted bundle for a different import")
+        if (import_image or import_archive) and state.get("import_started") and bool(state.get("archive_import")) != import_archive:
+            raise ApplyError("This bundle already tracks an import in another format. Resume with the original command or --image-id")
         if image_id:
             if state.get("image_id") and state["image_id"] != image_id:
                 raise ApplyError("This bundle already tracks a different imported image")
@@ -179,16 +181,20 @@ def apply(bundle, *, image_id=None, import_image=False, profile=None, region=Non
         if not state.get("image_id"):
             if state.get("import_started"):
                 raise ApplyError("The previous import outcome is unknown. Find that image in OCI and rerun with --image-id; another import will not be submitted")
-            if not import_image:
-                raise ApplyError("Use --import-image or --image-id IMAGE_OCID")
+            if not (import_image or import_archive):
+                raise ApplyError("Use --import-image, --import-archive or --image-id IMAGE_OCID")
             if _placeholder(imports):
                 raise ApplyError("Fill in the REPLACE_* values in image-import.json before importing")
+            if import_archive:
+                # The configured location must point to the uploaded archive.
+                imports.pop("sourceImageType", None)
             if imports.get("sourceImageType") not in (None, "QCOW2", "VMDK"):
                 raise ApplyError("The OCI CLI only accepts QCOW2/VMDK sourceImageType; omit that field for an OCI archive")
             method = "from-object-uri" if imports.get("uri") else "from-object"
             required = {"compartmentId", "uri"} if method == "from-object-uri" else {"compartmentId", "namespace", "bucketName", "name"}
             if not all(isinstance(imports.get(key), str) and imports[key] for key in required):
                 raise ApplyError("Image import configuration lacks its compartment or object location")
+            state["archive_import"] = import_archive
             state["import_started"] = True
             _save(state_path, state)
             imported = cli(["compute", "image", "import", method], imports)
@@ -272,6 +278,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--import-image", action="store_true", help="Import the uploaded object specified in image-import.json")
+    mode.add_argument("--import-archive", action="store_true", help="Import a .oci archive at the configured Object Storage location and apply the selected shapes")
     mode.add_argument("--image-id", help="Apply shapes to an existing imported image")
     parser.add_argument("--exact-shapes", action="store_true",
                         help="Remove other compatible shapes after verifying all shapes in this bundle")

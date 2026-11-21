@@ -427,6 +427,13 @@ def compatibility_plan(inspection: dict, config: OciConfig, allow_network=False,
     return plan
 
 
+ARCHIVE_IMPORT_HELP = (
+    "For a .oci archive, set the uploaded archive's object name or URI in image-import.json and run:\n"
+    "   python3 apply-oci.py --import-archive\n"
+    "This imports the archive, applies the selected public shapes, and verifies their registration.\n"
+)
+
+
 EXACT_SHAPES_HELP = (
     "To keep only the selected shapes on the imported image, run:\n"
     "   python3 apply-oci.py --image-id IMAGE_OCID --exact-shapes\n"
@@ -506,7 +513,7 @@ def bundle_files(config: OciConfig, artifact: dict) -> dict[str, str]:
         "Use an OCI CLI version that supports the selected launch mode; older releases may reject ACCELERATEDPV.\n"
         "The command waits for AVAILABLE, applies all shape-compatibility.json names/limits, and verifies the complete requested list.\n"
         "By default, other shapes and existing unspecified bounds are preserved.\n"
-        + EXACT_SHAPES_HELP +
+        + ARCHIVE_IMPORT_HELP + EXACT_SHAPES_HELP +
         "Rerun the same command after a partial failure: saved state prevents a second import and matching shapes are skipped.\n"
         "If an import response was lost, find the created image in OCI and resume with --image-id; no blind import retry occurs.\n"
         "Keep .forge-oci-apply-state.json with this extracted bundle. Use a separate extraction for another import/profile.\n"
@@ -571,7 +578,10 @@ def download_bundle(path: Path, filename: str | None = None, *, architecture=Non
                     data = (json.dumps(manifest, indent=2, ensure_ascii=False) + "\n").encode()
             elif has_manifest and entry.filename == "apply-oci.py":
                 data = Path(__file__).with_name("oci_apply.py").read_bytes()
-            elif has_manifest and entry.filename == "README.txt" and b"--exact-shapes" not in data:
-                data += b"\n" + EXACT_SHAPES_HELP.encode()
+            elif has_manifest and entry.filename == "README.txt":
+                if b"--import-archive" not in data:
+                    data += b"\n" + ARCHIVE_IMPORT_HELP.encode()
+                if b"--exact-shapes" not in data:
+                    data += b"\n" + EXACT_SHAPES_HELP.encode()
             updated.writestr(entry, data)
     return output.getvalue()

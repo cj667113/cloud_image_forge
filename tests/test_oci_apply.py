@@ -93,6 +93,27 @@ class FakeCli:
         return sum(operation in command for command, _ in self.calls)
 
 
+def test_alternate_archive_import_registers_missing_arm_shape_and_resumes(tmp_path):
+    name = "BM.Standard.A4.48"
+    bundle(tmp_path, entries=[{"shapeName": name}], arch="aarch64")
+    path = tmp_path / "image-import.json"
+    imports = {**json.loads(path.read_text()), "sourceImageType": "QCOW2", "name": "uploaded/image (1).oci"}
+    path.write_text(json.dumps(imports))
+    cli = FakeCli()
+    cli.fail_shape = name
+    with pytest.raises(ApplyError, match="failed"):
+        apply(tmp_path, import_archive=True, run=cli)
+    request = cli.calls[0][1]
+    assert request["name"] == imports["name"] and "sourceImageType" not in request
+    assert json.loads(path.read_text()) == imports
+    with pytest.raises(ApplyError, match="another format"):
+        apply(tmp_path, import_image=True, run=cli)
+    cli.fail_shape = None
+    result = apply(tmp_path, import_archive=True, run=cli)
+    assert result["verified_shapes"] == [name] and cli.count("import") == 1
+    assert apply(tmp_path, image_id=IMAGE, run=cli)["verified_shapes"] == [name]
+
+
 @pytest.mark.parametrize("uri,method", [(False, "from-object"), (True, "from-object-uri")])
 def test_one_command_import_wait_apply_every_shape_and_verify(tmp_path, uri, method):
     cli = FakeCli([{ "shape": "VM.Unrelated.Existing", "ocpu-constraints": {"min": 0.125}, "memory-constraints": None}])

@@ -233,7 +233,7 @@ An image's supported-shape list is a separate control-plane resource. `oci compu
 
 The Exports card and completed build identify the inspected architecture and every selected public shape. An OCI archive with a selection must contain the same effective list and limits in `additionalMetadata.shapeCompatibilities`. Forge checks the guest CPU architecture and each serialized shape entry before publishing the file. It checks older downloads too. With no selection, OCI assigns the imported image’s compatibility list.
 
-Public shape names and internal archive identifiers can differ, especially for bare metal. The Oracle version-2 reference confirms several x86 VM names, and FreeBSD’s ARM64 exporter confirms `VM.Standard.A1.Flex` and `VM.Standard.A2.Flex`. Bare-metal profiles with equal preparation settings share one row per architecture. You can edit the included shapes in OCI compatibility. A bare-metal archive uses the selected public shape name when no native alias is installed, embeds the saved limits and capability descriptors, and uses the Oracle v2 reference format UUID by default. Oracle recognition of public bare-metal identifiers on import is unverified. Other shapes still require a known archive mapping. The standalone QCOW2 and OCI configuration support applying the public shape through the OCI API. [FreeBSD ARM exporter](https://lists.freebsd.org/archives/dev-commits-src-all/2025-March/052583.html)
+Public shape names and internal archive identifiers can differ, especially for bare metal. The Oracle version-2 reference confirms several x86 VM names, and FreeBSD’s ARM64 exporter confirms `VM.Standard.A1.Flex` and `VM.Standard.A2.Flex`. Bare-metal profiles with equal preparation settings share one row per architecture. You can edit the included shapes in OCI compatibility. A bare-metal archive uses the selected public shape name when no native alias is installed, embeds the saved limits and capability descriptors, and uses the Oracle v2 reference format UUID by default. An observed Ubuntu ARM64 Console import omitted the selected `BM.Standard.A4.48` association even though the archive contained that exact public name. Register the public shape after import and verify the service list. Other shapes still require a known archive mapping. The standalone QCOW2 and OCI configuration support applying the public shape through the OCI API. [FreeBSD ARM exporter](https://lists.freebsd.org/archives/dev-commits-src-all/2025-March/052583.html)
 
 #### Registering a native archive identifier
 
@@ -258,7 +258,7 @@ services:
 
 #### Applying the selected public shapes in OCI
 
-Upload the image, fill in the object location and compartment in `image-import.json`, and run the companion command.
+For a new `.oci` import, point `image-import.json` at the uploaded archive and run `python3 apply-oci.py --import-archive`. The helper imports the archive, waits for availability, adds the selected public shapes and reads them back. For the original disk, fill in its object location and compartment and run the companion command.
 
 ```sh
 python3 apply-oci.py --import-image

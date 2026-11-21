@@ -55,6 +55,7 @@ function exportShapeSelection(artifact) {
     known: Array.isArray(rows) || artifact.oci_config?.compatible_shape_count === 0,
     shapes: names.map(name => ({name, matched: added.has(name)})),
     blocker: artifact.oci_archive_blocker,
+    applyAfterImport: artifact.oci_config && !artifact.oci_archive_blocker && names.some(name => name.startsWith('BM.')) ? artifact.id : null,
   };
 }
 function exportShapeMarkup(selection) {
@@ -64,9 +65,12 @@ function exportShapeMarkup(selection) {
   const badge = shape => `<li${shape.matched ? ' title="Automatically matched to the selected hardware profile"' : ''}>${esc(shape.name)}${shape.matched ? '<span class="export-shape-match">Matched</span>' : ''}</li>`;
   const list = rows => `<ul class="export-shape-list" aria-label="Selected OCI shapes">${rows.map(badge).join('')}</ul>`;
   const rest = shapes.slice(4);
+  const afterImport = selection.applyAfterImport
+    ? `<details class="export-more-shapes"><summary>Register bare-metal shapes after import</summary><p>OCI can omit these shapes during import. Extract the <a href="/api/artifacts/${encodeURIComponent(selection.applyAfterImport)}/oci-bundle" download>OCI configuration ZIP</a> and run this command with the imported image’s OCID.</p><code>python3 apply-oci.py --image-id IMAGE_OCID</code></details>`
+    : '';
   return `<div class="export-shapes"><p class="export-shapes-heading">Selected OCI shapes${arch ? ` <span>· ${esc(arch)}</span>` : ''}</p>${shapes.length
     ? list(shapes.slice(0,4)) + (rest.length ? `<details class="export-more-shapes"><summary>View ${rest.length} more ${rest.length === 1 ? 'shape' : 'shapes'}</summary>${list(rest)}</details>` : '')
-    : `<p class="export-shapes-empty">${known ? `None selected ${helpHint(ociDefaultShapesHint, 'Default OCI shape compatibility')}` : 'Selection unavailable for this export'}</p>`}${blocker ? `<p class="export-shape-blocker"><strong>.oci unavailable.</strong> ${esc(blocker)}</p>` : ''}</div>`;
+    : `<p class="export-shapes-empty">${known ? `None selected ${helpHint(ociDefaultShapesHint, 'Default OCI shape compatibility')}` : 'Selection unavailable for this export'}</p>`}${blocker ? `<p class="export-shape-blocker"><strong>.oci unavailable.</strong> ${esc(blocker)}</p>` : ''}${afterImport}</div>`;
 }
 function exportModel(artifact) {
   const source=state.images.find(image=>image.id===artifact.image_id);
