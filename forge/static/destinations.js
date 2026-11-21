@@ -13,6 +13,13 @@ function destinationProfiles() {
     !profile.group_id && (!['aarch64','x86_64'].includes(arch) || profile.architecture===arch));
 }
 function restoreDestinationProfile(select, id) {
+  const profiles = destinationState.catalog?.profiles || [];
+  const shared = profiles.find(profile => profile.variants?.includes(id) && [...select.options].some(option => option.value === profile.id));
+  if (shared) {
+    select.value = shared.id;
+    updateDestinationVariants(id);
+    return;
+  }
   if (![...select.options].some(option=>option.value===id)) {
     const member=destinationState.catalog?.profiles.find(profile=>profile.id===id && profile.group_id && profile.architecture===sourceArchitecture());
     if (!member) return;
@@ -21,6 +28,7 @@ function restoreDestinationProfile(select, id) {
     select.add(option);
   }
   select.value=id;
+  updateDestinationVariants();
 }
 function automaticDestinationProvider() { return ($('input[name="target"]:checked')?.value||'oci')==='oci'?'oci':'generic'; }
 function automaticDestinationLabel() {
@@ -31,19 +39,35 @@ function renderDestinationProfile() {
   const profiles=destinationProfiles(),arch=sourceArchitecture();
   const groups=[['vm','Virtual machines'],['bare_metal','Bare metal']].map(([target,label])=>{
     const options=profiles.filter(profile=>profile.target===target).map(profile=>
-      `<option value="${esc(profile.id)}">${esc(profile.label)}${!arch?` · ${esc(profile.architecture)}`:''}</option>`);
+      `<option value="${esc(profile.id)}">${esc(profile.label)}${profile.variants ? ' · Generic' : ''}${!arch?` · ${esc(profile.architecture)}`:''}</option>`);
     return `<optgroup label="${label}">${options.join('')}</optgroup>`;
   });
-  return `<label class="field destination-profile-field">Destination profile<select id="destination-profile"><option value="auto" selected>${esc(automaticDestinationLabel())}</option>${groups.join('')}<option value="custom">Custom settings</option></select>${helpHint('Shapes on the same row use the same hardware preparation. Selecting the row includes each shape in the OCI configuration. You can edit the list under OCI compatibility.','Destination profiles')}</label>
+  return `<label class="field destination-profile-field">Destination profile<select id="destination-profile"><option value="auto" selected>${esc(automaticDestinationLabel())}</option>${groups.join('')}<option value="custom">Custom settings</option></select>${helpHint('Shapes on the same row use the same hardware preparation. For a shared row, choose listed OCI shapes or generic hardware settings. Edit individual shapes under OCI compatibility.','Destination profiles')}</label>
+    <label id="destination-variant-field" class="field" hidden>Apply settings<select id="destination-variant"></select></label>
     <p class="destination-profile-status" id="destination-profile-loading" role="status" hidden>Applying destination defaults…</p>
     <div class="destination-profile-actions"><button type="button" class="button secondary small" id="destination-profile-apply" data-destination-action="apply" hidden>Reapply profile</button></div>
     <div id="destination-profile-summary" class="destination-profile-summary" hidden></div><div id="destination-resolved-shapes"></div>
     <div id="destination-profile-error" class="notice error" role="alert" hidden></div><div id="destination-profile-warnings" hidden></div>
     ${destinationState.error?`<div class="notice warning">Destination catalog unavailable. Use Custom settings or retry.<button type="button" class="button ghost small" data-destination-action="reload">Retry</button></div>`:''}`;
 }
+function updateDestinationVariants(savedId) {
+  const profiles = destinationState.catalog?.profiles || [];
+  const row = profiles.find(profile => profile.id === $('#destination-profile')?.value);
+  const select = $('#destination-variant');
+  const choices = (row?.variants || []).map(id => profiles.find(profile => profile.id === id));
+  select.replaceChildren();
+  $('#destination-variant-field').hidden = !choices.length;
+  for (const profile of choices) {
+    const label = profile.provider === 'generic' ? 'Generic hardware only' :
+      profile.shapes.length ? 'OCI defaults and listed shapes' : 'OCI defaults without shapes';
+    select.add(new Option(label, profile.id));
+  }
+  const preferred = savedId || choices.find(profile => profile.provider === automaticDestinationProvider())?.id;
+  if (preferred) select.value = preferred;
+}
 function selectedDestinationProfileId() {
   const value=$('#destination-profile')?.value;
-  return value==='auto'?`${automaticDestinationProvider()}:${sourceArchitecture()}:vm`:value==='custom'?null:value;
+  return value==='auto'?`${automaticDestinationProvider()}:${sourceArchitecture()}:vm`:value==='custom'?null:($('#destination-variant')?.value || value);
 }
 function destinationSelection() {
   return {profile_id:selectedDestinationProfileId(),source:$('#platform-source').value,strategy:$('#platform-strategy').value,nic_driver:$('#platform-nic').value||null};
@@ -148,7 +172,7 @@ function syncDestinationEditor() {
 function useCustomDestination() {
   if(!$('#destination-profile'))return;
   if($('#platform-strategy').value==='auto')$('#platform-strategy').value=studioSession().destination?.platform_migration?.strategy||'reconfigure';
-  $('#destination-profile').value='custom';delete studioSession().destination;delete studioSession().destinationPending;renderDestinationResult(null);setDestinationLoading(false);$('#platform-advanced').open=true;
+  $('#destination-profile').value='custom';updateDestinationVariants();delete studioSession().destination;delete studioSession().destinationPending;renderDestinationResult(null);setDestinationLoading(false);$('#platform-advanced').open=true;
 }
 function scheduleDestinationResolution(options) {
   const imageId=state.selected,requestId=++destinationState.scheduledRequest;
@@ -159,10 +183,17 @@ document.addEventListener('change',event=>{
   const input=event.target;
   if(input.name==='target'){
     $('#destination-profile option[value="auto"]').textContent=automaticDestinationLabel();
-    if($('#destination-profile').value==='auto'&&$('#platform-enabled').checked)scheduleDestinationResolution({syncOci:studioSession().destinationOciPrepare?.profileId!==selectedDestinationProfileId()});
+    const shared = Boolean($('#destination-variant')?.options.length);
+    if (shared) {
+      const remembered = studioSession().destinationOciPrepare?.profileId;
+      const restoreOci = automaticDestinationProvider() === 'oci' && [...$('#destination-variant').options].some(option => option.value === remembered);
+      updateDestinationVariants(restoreOci ? remembered : undefined);
+    }
+    if((shared||$('#destination-profile').value==='auto')&&$('#platform-enabled').checked)scheduleDestinationResolution({syncOci:studioSession().destinationOciPrepare?.profileId!==selectedDestinationProfileId()});
   }
   if(input.id==='oci-prepare'&&studioSession().destinationOciPrepare?.profileId===selectedDestinationProfileId()){studioSession().destinationOciPrepare.prepare=input.checked;studioSession().destinationOciPrepare.manual=true;}
-  if(input.id==='destination-profile'){applyDestinationNicDefault();scheduleDestinationResolution();syncDestinationEditor();}
+  if(input.id==='destination-profile')updateDestinationVariants();
+  if(input.id==='destination-profile'||input.id==='destination-variant'){applyDestinationNicDefault();scheduleDestinationResolution();syncDestinationEditor();}
   if(input.id==='platform-enabled'&&input.checked){applyDestinationNicDefault();scheduleDestinationResolution();}
   if(['platform-strategy','platform-source','platform-nic'].includes(input.id)&&$('#destination-profile')?.value!=='custom')scheduleDestinationResolution({syncOci:false});
   if(['platform-target','platform-boot','platform-network'].includes(input.id)){useCustomDestination();syncOciPlatformChoices();updatePlatformStudio();invalidateStudioPlans('platform');}

@@ -34,7 +34,7 @@ def test_group_shares_preparation_and_exports_each_named_shape(group_id, arch, s
     listed = [p for p in profiles.values() if p["architecture"] == arch and "group_id" not in p]
     assert [p["id"] for p in listed if set(shapes).intersection(p["shapes"])] == [group_id]
     assert all(p in listed for p in profiles.values() if p["architecture"] == arch and
-               (p["network_attachment"] == "accelerated" or not p["shapes"]))
+               (p["network_attachment"] == "accelerated" or (not p["shapes"] and not p.get("group_id"))))
 
     source = image(arch)
     grouped = resolve_destination(source, {"profile_id": group_id})
@@ -74,6 +74,28 @@ def test_bare_metal_picker_groups_equal_overrides_and_keeps_saved_single_shape(a
         assert saved["oci_defaults"]["capabilities"] == grouped["oci_defaults"]["capabilities"]
         assert saved["platform_migration"] == grouped["platform_migration"]
         assert saved["shape_compatibility_resolution"]["effective_shapes"] == [{"shape": p["shape"]}]
+
+
+@pytest.mark.parametrize("arch", ["aarch64", "x86_64"])
+@pytest.mark.parametrize("target", ["vm", "bare_metal"])
+def test_generic_alias_shares_hardware_but_preserves_its_export_semantics(arch, target):
+    profiles = {p["id"]: p for p in destination_catalog()["profiles"]}
+    generic = profiles[f"generic:{arch}:{target}"]
+    row = profiles[generic["group_id"]]
+    assert row["shapes"] and row["architecture"] == arch and row["target"] == target
+    variants = [row["id"], generic["id"]]
+    if target == "vm":
+        general = profiles[f"oci:{arch}:vm"]
+        assert general["group_id"] == row["id"]
+        variants.append(general["id"])
+    assert row["variants"] == variants
+    options = {"nic_driver": "mlx5_core"} if target == "bare_metal" else {}
+    plans = [resolve_destination(image(arch), {"profile_id": key, "strategy": "reconfigure", **options}) for key in variants]
+    assert all(p["platform_migration"] == plans[0]["platform_migration"] for p in plans)
+    assert plans[1]["oci_defaults"] is None
+    assert plans[0]["oci_defaults"]["import_options"]["shape_compatibility"] == [{"shape": name} for name in row["shapes"]]
+    if target == "vm":
+        assert plans[2]["oci_defaults"]["import_options"]["shape_compatibility"] == []
 
 
 def test_group_splits_when_a_member_requires_different_network_preparation(monkeypatch):

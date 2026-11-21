@@ -138,6 +138,22 @@ def destination_catalog():
         profiles.insert(profiles.index(first), group)
         for member in members:
             member["group_id"] = group_id
+    # Share a picker row across providers when all hardware overrides agree.
+    # Each variant still resolves its own provider settings and exact shape list.
+    def hardware(profile):
+        return {key: value for key, value in settings(profile).items()
+                if key not in {"provider", "sources", "group_id", "variants"}}
+
+    for generic in (p for p in profiles if p["provider"] == "generic"):
+        candidates = [p for p in profiles if p["provider"] == "oci" and "group_id" not in p
+                      and hardware(p) == hardware(generic)]
+        if not candidates:
+            continue
+        primary = max(candidates, key=lambda p: len(p["shapes"]))
+        variants = [generic, *(p for p in candidates if p is not primary and not p["shapes"])]
+        primary["variants"] = [primary["id"], *(p["id"] for p in variants)]
+        for variant in variants:
+            variant["group_id"] = primary["id"]
     return {"version": 1, "checked_on": "2026-11-21", "profiles": deepcopy(profiles),
             "nic_drivers": list(NIC_DRIVERS), "sources": list(SOURCES)}
 
