@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -68,6 +69,12 @@ class Store:
 
     def connect(self):
         return sqlite3.connect(self.path, timeout=30)
+
+    def archive_cache_dir(self, artifact_id):
+        # Older restored IDs need not be UUIDs. Keep one private directory per
+        # record, independently of the artifact's name or shared build folder.
+        name = hashlib.sha256(artifact_id.encode()).hexdigest()
+        return self.path.parent / "oci-downloads" / name
 
     def create(self, record_kind: str, **data) -> dict:
         data = {"id": uuid.uuid4().hex, "created_at": now(), **data}
@@ -189,6 +196,10 @@ class Store:
                 path.unlink(missing_ok=True)
         elif directory.exists():
             shutil.rmtree(directory)
+        if kind == "artifact":
+            cache = self.archive_cache_dir(record_id)
+            if not cache.parent.is_symlink() and cache.is_dir() and not cache.is_symlink():
+                shutil.rmtree(cache)
 
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -224,6 +235,13 @@ class Store:
         # Only named workspace subdirectories are managed here. Published
         # artifacts and successfully imported sources are always retained.
         root = self.path.parent
+        caches = root / "oci-downloads"
+        if caches.is_dir() and not caches.is_symlink():
+            active = {self.archive_cache_dir(item["id"]) for item in artifacts}
+            for cache in caches.iterdir():
+                if (cache.is_dir() and not cache.is_symlink()
+                        and (cache not in active or not (cache / "verified.json").is_file())):
+                    shutil.rmtree(cache)
         keep_sources = {item["id"] for item in images if item["status"] == "ready" or item.get("deleting")}
         keep_builds = {Path(item["path"]).parent.name for item in artifacts}
         for folder, keep in ((root / "images", keep_sources), (root / "builds", keep_builds)):

@@ -24,7 +24,11 @@ The recipe's optional `oci` object contains:
 
 Omitted capability settings inherit the selected schema's defaults. Defaults still undergo guest-readiness checks. A newly supplied schema can expose additional capability keys or values, but additional keys without a guest adapter are exported with a warning and require separate validation. Loading a schema is not a live OCI account connection.
 
-Successful OCI builds provide an **OCI configuration** download at `/api/artifacts/{id}/oci-bundle`:
+In **Exports**, **Download .oci** saves an OCI image archive containing `image_metadata.json` and `output.QCOW2`. A completed OCI QCOW2 with saved configuration can supply both the original disk download and the archive. If an older export lacks OS labels, Forge reads them from the exported disk. The first archive download packages and verifies the existing QCOW2 using workspace roughly equal to the exported file size. Later downloads reuse that archive. Deleting the export also removes its cached archive.
+
+For a QCOW2 export, the companion ZIP's import command uses the primary QCOW2 filename and type. If you import the downloadable `.oci` through the OCI Console, use `python3 apply-oci.py --image-id IMAGE_OCID` from the companion to apply the selected public shape entries.
+
+The **OCI configuration** ZIP at `/api/artifacts/{id}/oci-bundle` contains these files.
 
 | ZIP member | Intended use |
 | --- | --- |

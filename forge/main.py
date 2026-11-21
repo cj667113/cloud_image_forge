@@ -1,6 +1,8 @@
 """HTTP application and streaming local-file import."""
 from collections import Counter
 from contextlib import asynccontextmanager
+import asyncio
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -25,6 +27,7 @@ from .jobs import Jobs
 from .models import (ObjectLocation, Recipe, OciPlanRequest, OciSchemaRequest, UefiPlanRequest,
                      StoragePlanRequest, PlatformPlanRequest, DestinationSelection, MountPlanRequest)
 from .oci import catalog as oci_catalog, compatibility_plan
+from .oci_archive import ArchiveSpaceError, archive_download, can_download_archive
 from .store import Store, artifact_name
 from . import transfers
 
@@ -58,8 +61,11 @@ class BodyLimitMiddleware:
         await self.app(scope, bounded_receive, send)
 
 
-def public(record: dict) -> dict:
-    return {key: value for key, value in record.items() if key not in {"path", "source_path", "oci_bundle_path"}}
+def public(record: dict, *, artifact=False) -> dict:
+    result = {key: value for key, value in record.items() if key not in {"path", "source_path", "oci_bundle_path"}}
+    if artifact:
+        result["oci_archive_available"] = can_download_archive(record)
+    return result
 
 
 def session_cookie(secret: str, expires: int) -> str:
@@ -147,6 +153,7 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
         return JSONResponse({"detail": str(exc)}, 400)
 
     downloads = Counter()
+    archive_locks = {}
 
     def get_record(kind: str, record_id: str):
         record = app.state.store.get(kind, record_id)
@@ -199,16 +206,17 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
         # revision. Accept weak validators/lists, without interpreting arbitrary
         # client values as SQL or returning them in response headers.
         matches = set()
+        prefix = f"forge-{kind}-v{'2' if kind == 'artifact' else '1'}-"
         if len(validators) <= 8192:
             for item in validators.split(","):
-                matched = re.fullmatch(r'(?:W/)?"forge-' + kind + r'-v1-([0-9a-f]{32})"', item.strip())
+                matched = re.fullmatch(r'(?:W/)?"' + prefix + r'([0-9a-f]{32})"', item.strip())
                 if matched:
                     matches.add(matched.group(1))
         revision, records = app.state.store.inventory(kind, matches, any_version=validators.strip() == "*")
-        headers = {"ETag": f'"forge-{kind}-v1-{revision}"'}
+        headers = {"ETag": f'"{prefix}{revision}"'}
         if records is None:
             return Response(status_code=304, headers=headers)
-        data = records if kind == "job" else [public(item) for item in records]
+        data = records if kind == "job" else [public(item, artifact=kind == "artifact") for item in records]
         return JSONResponse(data, headers=headers)
 
     class RenameItem(BaseModel):
@@ -232,7 +240,7 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
                     name += suffix
             if len(name) > 200:
                 raise HTTPException(422, "Names can be at most 200 characters including the file extension.")
-            return public(app.state.store.update(kind, record_id, name=name))
+            return public(app.state.store.update(kind, record_id, name=name), artifact=kind == "artifact")
 
     def delete_item(kind: str, record_id: str):
         with app.state.jobs.inspection_lock:
@@ -468,7 +476,7 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
 
     @app.get("/api/artifacts/{artifact_id}")
     def artifact_detail(artifact_id: str):
-        return public(get_record("artifact", artifact_id))
+        return public(get_record("artifact", artifact_id), artifact=True)
 
     def download_record(artifact_id: str):
         # A request-scoped dependency holds a read claim through FileResponse's
@@ -483,6 +491,7 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
                 downloads[artifact_id] -= 1
                 if not downloads[artifact_id]:
                     del downloads[artifact_id]
+                    archive_locks.pop(artifact_id, None)
 
     @app.get("/api/artifacts/{artifact_id}/download")
     def download_artifact(artifact: dict = Depends(download_record)):
@@ -490,9 +499,32 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
             raise HTTPException(410, "The artifact file is no longer present")
         return FileResponse(artifact["path"], media_type="application/octet-stream", filename=artifact_name(artifact))
 
+    @app.get("/api/artifacts/{artifact_id}/oci-archive")
+    async def download_oci_archive(artifact: dict = Depends(download_record)):
+        if not can_download_archive(artifact):
+            raise HTTPException(404, "An OCI archive download requires a QCOW2 export with saved OCI settings.")
+        store = app.state.store
+        lock = archive_locks.setdefault(artifact["id"], asyncio.Lock())
+        async with lock:
+            try:
+                path = await run_in_threadpool(archive_download, store.archive_cache_dir(artifact["id"]),
+                                               artifact, app.state.jobs.inspect_export_os)
+            except FileNotFoundError as exc:
+                raise HTTPException(410, "The QCOW2 export file is no longer present.") from exc
+            except ArchiveSpaceError as exc:
+                raise HTTPException(507, str(exc)) from exc
+            except (ValueError, RuntimeError) as exc:
+                raise HTTPException(409, str(exc)) from exc
+            except OSError as exc:
+                if exc.errno == errno.ENOSPC:
+                    raise HTTPException(507, "Insufficient workspace for the OCI archive.") from exc
+                raise HTTPException(500, "Could not prepare the OCI archive. Retry the download.") from exc
+        name = Path(artifact_name(artifact)).with_suffix(".oci").name
+        return FileResponse(path, media_type="application/octet-stream", filename=name)
+
     @app.get("/api/artifacts/{artifact_id}/manifest")
     def artifact_manifest(artifact_id: str):
-        artifact = public(get_record("artifact", artifact_id))
+        artifact = public(get_record("artifact", artifact_id), artifact=True)
         return JSONResponse(artifact, headers={"Content-Disposition": f'attachment; filename="forge-{artifact_id}.json"'})
 
     @app.get("/api/artifacts/{artifact_id}/oci-bundle")

@@ -28,6 +28,10 @@ def test_conditional_inventory_preserves_public_shape_and_omits_unchanged_body(c
     response = client.get(f"/api/{path}")
     assert response.status_code == 200 and response.headers["cache-control"] == "no-store"
     expected = record if kind == "job" else {key: value for key, value in record.items() if key not in {"path", "source_path", "oci_bundle_path"}}
+    if kind == "artifact":
+        expected["oci_archive_available"] = False
+        old_schema = response.headers["etag"].replace("-v2-", "-v1-")
+        assert client.get("/api/artifacts", headers={"If-None-Match": old_schema}).status_code == 200
     assert response.json() == [expected]
     tag = response.headers["etag"]
     for validator in (tag, "W/" + tag, '"unrelated", W/' + tag, "*"):

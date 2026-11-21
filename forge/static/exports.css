@@ -13,6 +13,7 @@
 @media(max-width:1050px){.export-row-main{grid-template-columns:minmax(0,1fr);gap:14px}.export-row-actions{justify-content:flex-start}}
 @media(max-width:600px){.export-row-main{padding:16px 14px;gap:12px}.export-name-line{gap:7px;margin-bottom:7px}.export-name{font-size:13px}.export-meta{font-size:10px;gap:3px 11px}.export-toggle,.export-warning-count{font-size:11px;min-height:28px}.export-row-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px}.export-row-actions .button{font-size:11px;padding:9px 8px;gap:5px;min-height:38px}.export-upload-suffix{display:none}.export-detail-panel{padding:16px 14px}.export-detail-heading{align-items:flex-start;flex-direction:column;gap:10px;margin-bottom:18px}.export-properties{grid-template-columns:1fr 1fr;gap:15px 14px}.export-properties dd{font-size:11px}.export-properties dt{font-size:10px}.export-secondary-actions{gap:8px}.export-warnings ul{font-size:11px;padding-left:17px}.export-error{margin:0 14px 14px}.exports-empty{padding:30px 18px}}
 @media(max-width:380px){.export-properties{grid-template-columns:1fr}.export-row-actions .button{font-size:10px;padding-inline:6px}.export-row-actions .icon{width:13px;height:13px}}
+@media(max-width:600px){.export-row-actions .export-upload:nth-child(3){grid-column:1/-1}}
 @media(pointer:coarse){.export-row-actions .button,.export-secondary-actions .button{min-height:44px}.export-toggle,.export-warning-count,.export-warnings summary{min-height:32px}}
 @media(prefers-reduced-motion:reduce){.export-chevron,.export-warnings summary:before{transition:none}}
 

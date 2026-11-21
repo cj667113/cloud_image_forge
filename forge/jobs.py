@@ -135,3 +135,9 @@ class Jobs:
 
     def close(self):
         self.executor.shutdown(wait=True, cancel_futures=True)
+
+    def inspect_export_os(self, path):
+        # Historical exports without saved OS labels use the same single
+        # appliance worker as builds and inspections.
+        from .engine import read_export_os
+        return self.executor.submit(read_export_os, path).result()

@@ -282,6 +282,19 @@ def _mount(handle, root: str, readonly: bool) -> dict:
     return {mountpoint: device for device, mountpoint in handle.mountpoints().items()}
 
 
+def read_export_os(path: Path):
+    """Identify a legacy export without running a complete build inspection."""
+    from .destinations import _operating_system
+    if _input_format(path) != "qcow2":
+        raise EngineError("The published disk is not a standalone QCOW2")
+    with _guest(path, "qcow2", readonly=True) as guest:
+        root = _roots(guest)
+        return _operating_system({
+            "os": {"name": guest.inspect_get_product_name(root), "distro": guest.inspect_get_distro(root)},
+            "oci_evidence": {"os_version": {"major": guest.inspect_get_major_version(root),
+                                            "minor": guest.inspect_get_minor_version(root)}}})
+
+
 def _roots(handle) -> str:
     roots = handle.inspect_os()
     if len(roots) != 1:
@@ -985,6 +998,7 @@ class ImageEngine:
             with output.open("rb") as stream:
                 output_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
         work.unlink()
+        from .destinations import _operating_system
         return {"artifact_path": str(output), "filename": output.name, "format": final_format,
                 "architecture": normalize_arch(result_inspection["os"]["arch"]),
                 "virtual_size": virtual_size, "sha256": output_sha256, "warnings": warnings,
@@ -994,4 +1008,5 @@ class ImageEngine:
                 "platform_migration": platform_result, "ssh_access": ssh_result,
                 "mount_reconciliation": mount_result,
                 **({"shape_compatibility_resolution": shape_resolution} if shape_resolution is not None else {}),
+                **({"oci_archive_os": _operating_system(result_inspection)} if oci_config and final_format == "qcow2" else {}),
                 **({"oci_archive": archive_receipt} if archive_receipt is not None else {})}

@@ -16,6 +16,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import struct
@@ -52,6 +53,10 @@ OBSERVED_SHAPE_NAMES = {name: name for name in (
 
 class OciArchiveError(ValueError):
     """An archive cannot be produced or its exact contents cannot be verified."""
+
+
+class ArchiveSpaceError(OciArchiveError):
+    """The archive and its free-space reserve exceed the workspace capacity."""
 
 
 def _config(config):
@@ -269,7 +274,7 @@ def _unlink_owned(path, identity):
         pass
 
 
-def write_archive(destination, qcow2, config, inspection, log, *, shape_resolution=None):
+def write_archive(destination, qcow2, config, inspection, log, *, shape_resolution=None, expected_disk_sha256=None):
     """Publish one private .oci file exclusively after streamed verification.
 
 An existing destination is never replaced. Failures remove only this call's
@@ -295,7 +300,7 @@ owned temporary/output inode; the input file is opened read-only throughout.
             _check_qcow2(source)
             size = _archive_size(len(metadata_bytes), initial.st_size)
             if shutil.disk_usage(destination.parent).free < size + WORKSPACE_RESERVE:
-                raise OciArchiveError("Insufficient workspace for the OCI archive and reserved free space")
+                raise ArchiveSpaceError("Insufficient workspace for the OCI archive and reserved free space")
             descriptor, name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
             temporary = Path(name)
             with os.fdopen(descriptor, "w+b") as output:
@@ -309,6 +314,8 @@ owned temporary/output inode; the input file is opened read-only throughout.
                     archive.addfile(_member(DISK_NAME, initial.st_size), disk)
                 if disk.size != initial.st_size:
                     raise OciArchiveError("QCOW2 source length changed while packaging")
+                if expected_disk_sha256 is not None and disk.digest.hexdigest() != expected_disk_sha256:
+                    raise OciArchiveError("The QCOW2 checksum differs from the published export")
                 _unchanged(source, qcow2, initial)
                 output.flush()
                 os.fsync(output.fileno())
@@ -338,3 +345,64 @@ owned temporary/output inode; the input file is opened read-only throughout.
         raise
     finally:
         _unlink_owned(temporary, owned)
+
+
+def can_download_archive(artifact):
+    recipe = artifact.get("recipe") or {}
+    return (artifact.get("format") == "qcow2" and artifact.get("target", recipe.get("target")) == "oci"
+            and isinstance(recipe.get("oci"), dict)
+            and bool(re.fullmatch(r"[0-9a-f]{64}", artifact.get("sha256") or "")))
+
+
+def archive_download(cache_dir, artifact, inspect_os):
+    """Materialize a verified, resumable alternate download for one published QCOW2.
+
+    The caller serializes first downloads of this export and holds a download
+    claim through the HTTP response. Renaming the export changes its suggested
+    filename only, so the packaged disk can continue to serve range requests.
+    """
+    source = Path(artifact["path"])
+    original = source.lstat()
+    if not stat.S_ISREG(original.st_mode) or original.st_size != artifact["size"]:
+        raise OciArchiveError("The published QCOW2 file type or size has changed")
+    config = _config(artifact["recipe"]["oci"])
+    labels = artifact.get("oci_archive_os") or {}
+    resolution = artifact.get("shape_compatibility_resolution")
+    if resolution is None:
+        # Earlier companions emitted only the public shapes saved in the recipe.
+        resolution = {"effective_shapes": [row.model_dump() for row in config.import_options.shape_compatibility]}
+    inputs = json.dumps([artifact["sha256"], _identity(original), labels, resolution, config.model_dump()],
+                        sort_keys=True, separators=(",", ":")).encode()
+    signature = hashlib.sha256(inputs).hexdigest()
+    output = cache_dir / "image.oci"
+    marker = cache_dir / "verified.json"
+    if cache_dir.is_symlink() or cache_dir.parent.is_symlink():
+        raise OciArchiveError("The OCI download directory is unavailable")
+    try:
+        if marker.is_file() and not marker.is_symlink() and marker.stat().st_size < 4096:
+            cached = json.loads(marker.read_bytes())
+            cached_stat = output.lstat()
+            if (stat.S_ISREG(cached_stat.st_mode) and cached == {
+                    "inputs": signature, "archive": list(_identity(cached_stat))}):
+                return output
+    except (FileNotFoundError, ValueError):
+        pass
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir)
+    cache_dir.mkdir(parents=True, mode=0o700)
+    try:
+        if not all(labels.get(key) or getattr(config.import_options, key) for key in
+                   ("operating_system", "operating_system_version")):
+            # Historical records may predate saved OS labels or outlive their
+            # import. Read only OS identification from the actual exported disk.
+            labels = {**inspect_os(source), **labels}
+        config = config.model_copy(update={"import_options": config.import_options.model_copy(update=labels)})
+        write_archive(output, source, config, {}, lambda _: None, shape_resolution=resolution,
+                      expected_disk_sha256=artifact["sha256"])
+        if _identity(original) != _identity(source.lstat()):
+            raise OciArchiveError("The QCOW2 changed while preparing the download")
+        marker.write_text(json.dumps({"inputs": signature, "archive": _identity(output.lstat())}))
+    except BaseException:
+        shutil.rmtree(cache_dir)
+        raise
+    return output
