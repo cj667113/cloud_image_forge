@@ -206,6 +206,7 @@ function restoreEditorDraft(draft) {
     const node = fields.find(element => kind === 'id' ? element.id === key : kind === 'file' ? element.dataset.file === key : kind === 'partition' ? element.dataset.partition === key : kind === 'rebuild' ? element.dataset.rebuildDevice === key : kind === 'oci-default' ? element.dataset.ociDefault === key : element.dataset.ociAllowed === key && element.value === value);
     if (!node || node.type === 'file') continue;
     if (node.type === 'checkbox' || node.type === 'radio') node.checked = item.checked;
+    else if (node.id === 'destination-profile') restoreDestinationProfile(node, item.value);
     else if (node.tagName !== 'SELECT' || [...node.options].some(option => option.value === item.value)) node.value = item.value;
   }
   const legacyMountPolicy=draft.fields.find(item=>item.key[0]==='id'&&item.key[1]==='mount-policy-auto');

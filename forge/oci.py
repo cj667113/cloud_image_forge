@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, Strict
 from uuid import UUID
 
 from .architecture import normalize_arch
+from .oci_shapes import AMD_STANDARD_PV, ARM_STANDARD_PV, resolve_shape_compatibility
 
 
 SOURCES = [
@@ -37,14 +38,12 @@ ACCELERATED_VM_SHAPES = {"VM.Standard.E6.Ax.Flex", "VM.DenseIO.E6.Ax.Flex",
 # Exact documented shapes only: similar names do not establish attachment support.
 SHAPE_NETWORK_TYPES = {
     **{shape: frozenset({"PARAVIRTUALIZED", "ACCELERATEDPV"}) for shape in ACCELERATED_VM_SHAPES},
-    "VM.Standard.E4.Flex": frozenset({"PARAVIRTUALIZED", "VFIO"}),
-    "VM.Standard.E5.Flex": frozenset({"PARAVIRTUALIZED", "VFIO"}),
-    "VM.Standard.E6.Flex": frozenset({"PARAVIRTUALIZED", "VFIO"}),
+    **{shape: frozenset({"PARAVIRTUALIZED", "VFIO"}) for shape in (*AMD_STANDARD_PV, *ARM_STANDARD_PV)},
 }
-ARM_SHAPES = {"VM.Standard.A1.Flex", "VM.Standard.A2.Flex", "VM.Standard.A4.Flex", "VM.Standard.A4.Ax.Flex",
+ARM_SHAPES = {*ARM_STANDARD_PV, "VM.Standard.A4.Ax.Flex",
               "BM.Standard.A1.160", "BM.Standard.A4.48", "BM.Standard.A4.Ax.48"}
-X86_SHAPES = {"VM.Standard3.Flex", "VM.Standard4.Ax.Flex", "VM.Standard.E4.Flex", "VM.Standard.E5.Flex",
-              "VM.Standard.E6.Flex", "VM.Standard.E6.Ax.Flex", "VM.DenseIO.E4.Flex", "VM.DenseIO.E5.Flex",
+X86_SHAPES = {*AMD_STANDARD_PV, "VM.Standard3.Flex", "VM.Standard4.Ax.Flex",
+              "VM.Standard.E6.Ax.Flex", "VM.DenseIO.E4.Flex", "VM.DenseIO.E5.Flex",
               "VM.DenseIO.E6.Ax.Flex", "VM.Optimized3.Flex", "BM.Standard3.64", "BM.Standard4.Ax.120",
               "BM.Standard.E4.128", "BM.Standard.E5.192", "BM.Standard.E6.256", "BM.Standard.E6.Ax.192"}
 
@@ -381,7 +380,6 @@ def compatibility_plan(inspection: dict, config: OciConfig, allow_network=False,
         plan["warnings"].append("Select the target tenancy's global capability schema version before applying the exported OCI configuration.")
     if config.import_options.launch_mode != mode:
         plan["warnings"].append("Import launch mode differs from the preferred image capability. Apply the capability schema after import and verify OCI's resulting launch settings.")
-    from .oci_shapes import resolve_shape_compatibility
     shape_resolution = resolve_shape_compatibility(inspection, config, platform_migration)
     plan["shape_compatibility_resolution"] = shape_resolution
     plan["warnings"].extend(shape_resolution["warnings"])

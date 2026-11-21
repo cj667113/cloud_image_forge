@@ -9,7 +9,18 @@ async function loadDestinationCatalog() {
 }
 function destinationProfiles() {
   const arch=sourceArchitecture();
-  return (destinationState.catalog?.profiles||[]).filter(profile=>!['aarch64','x86_64'].includes(arch)||profile.architecture===arch);
+  return (destinationState.catalog?.profiles||[]).filter(profile=>
+    !profile.group_id && (!['aarch64','x86_64'].includes(arch) || profile.architecture===arch));
+}
+function restoreDestinationProfile(select, id) {
+  if (![...select.options].some(option=>option.value===id)) {
+    const member=destinationState.catalog?.profiles.find(profile=>profile.id===id && profile.group_id && profile.architecture===sourceArchitecture());
+    if (!member) return;
+    const option=new Option(member.label, member.id);
+    option.hidden=true;
+    select.add(option);
+  }
+  select.value=id;
 }
 function automaticDestinationProvider() { return ($('input[name="target"]:checked')?.value||'oci')==='oci'?'oci':'generic'; }
 function automaticDestinationLabel() {
@@ -18,7 +29,17 @@ function automaticDestinationLabel() {
 }
 function renderDestinationProfile() {
   const profiles=destinationProfiles(),arch=sourceArchitecture();
-  return `<label class="field destination-profile-field">Destination profile<select id="destination-profile"><option value="auto" selected>${esc(automaticDestinationLabel())}</option>${[['vm','Virtual machines'],['bare_metal','Bare metal']].map(([kind,label])=>`<optgroup label="${label}">${profiles.filter(profile=>profile.target===kind).map(profile=>`<option value="${esc(profile.id)}">${esc(profile.label)}${!arch?` · ${esc(profile.architecture)}`:''}</option>`).join('')}</optgroup>`).join('')}<option value="custom">Custom settings</option></select>${helpHint('Profiles choose destination attachments from the catalog, using the inspected CPU architecture. They do not infer where the source last ran or prove it will boot. Custom settings keep explicit hardware overrides. Required preparation packages are downloaded automatically from guest repositories.','Destination profiles')}</label><p class="destination-profile-status" id="destination-profile-loading" role="status" hidden>Applying destination defaults…</p><div class="destination-profile-actions"><button type="button" class="button secondary small" id="destination-profile-apply" data-destination-action="apply" hidden>Reapply profile</button></div><div id="destination-profile-summary" class="destination-profile-summary" hidden></div><div id="destination-resolved-shapes"></div><div id="destination-profile-error" class="notice error" role="alert" hidden></div><div id="destination-profile-warnings" hidden></div>${destinationState.error?`<div class="notice warning">Destination catalog unavailable. Use Custom settings or retry.<button type="button" class="button ghost small" data-destination-action="reload">Retry</button></div>`:''}`;
+  const groups=[['vm','Virtual machines'],['bare_metal','Bare metal']].map(([target,label])=>{
+    const options=profiles.filter(profile=>profile.target===target).map(profile=>
+      `<option value="${esc(profile.id)}">${esc(profile.label)}${!arch?` · ${esc(profile.architecture)}`:''}</option>`);
+    return `<optgroup label="${label}">${options.join('')}</optgroup>`;
+  });
+  return `<label class="field destination-profile-field">Destination profile<select id="destination-profile"><option value="auto" selected>${esc(automaticDestinationLabel())}</option>${groups.join('')}<option value="custom">Custom settings</option></select>${helpHint('Shapes on the same row use the same hardware preparation. Selecting the row includes each shape in the OCI configuration. You can edit the list under OCI compatibility.','Destination profiles')}</label>
+    <p class="destination-profile-status" id="destination-profile-loading" role="status" hidden>Applying destination defaults…</p>
+    <div class="destination-profile-actions"><button type="button" class="button secondary small" id="destination-profile-apply" data-destination-action="apply" hidden>Reapply profile</button></div>
+    <div id="destination-profile-summary" class="destination-profile-summary" hidden></div><div id="destination-resolved-shapes"></div>
+    <div id="destination-profile-error" class="notice error" role="alert" hidden></div><div id="destination-profile-warnings" hidden></div>
+    ${destinationState.error?`<div class="notice warning">Destination catalog unavailable. Use Custom settings or retry.<button type="button" class="button ghost small" data-destination-action="reload">Retry</button></div>`:''}`;
 }
 function selectedDestinationProfileId() {
   const value=$('#destination-profile')?.value;
@@ -52,7 +73,7 @@ function applyDestinationOci(defaults,strategy) {
   $('#oci-shape-mode').value=defaults.import_options.shape_compatibility_mode||'auto';
   for(const [field,key] of [['oci-operating-system','operating_system'],['oci-os-version','operating_system_version']])$(`#${field}`).value=defaults.import_options[key]||'';
   $('#oci-shapes').innerHTML='';
-  // Explicit profile selection replaces the advertised shape list with that destination.
+  // Apply every shape named in the selected row.
   for(const shape of defaults.import_options.shape_compatibility||[]){addOciShape(false);const row=$$('.oci-shape-row').at(-1);$('[data-shape-field="shape"]',row).value=shape.shape;}
   const prepare=typeof defaults.guest?.prepare==='boolean'?defaults.guest.prepare:strategy!=='preserve';
   studioSession().destinationOciPrepare={profileId:selectedDestinationProfileId(),prepare,manual:false};

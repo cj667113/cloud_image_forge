@@ -10,9 +10,16 @@ import re
 from .architecture import normalize_arch
 from .oci import ACCELERATED_VM_SHAPES, ARM_SHAPES, X86_SHAPES
 from .oci_guest import HARDWARE_NIC_DRIVERS, verified_nic_bundle
+from .oci_shapes import AMD_STANDARD_PV, ARM_STANDARD_PV, resolve_shape_compatibility
 
 
 NIC_DRIVERS = ("auto", *sorted(HARDWARE_NIC_DRIVERS))
+# These Standard Flex families share a guest device profile within their ISA.
+# Ax, DenseIO and physical machines have distinct hardware requirements.
+VM_PROFILE_GROUPS = {
+    "oci:arm-standard-pv": ARM_STANDARD_PV,
+    "oci:amd-standard-pv": tuple(AMD_STANDARD_PV),
+}
 SOURCES = ["https://docs.oracle.com/en-us/iaas/Content/Compute/References/computeshapes.htm",
            "https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/edit-launch-options.htm",
            "https://docs.oracle.com/en-us/iaas/Content/Compute/References/bringyourownimage.htm"]
@@ -88,6 +95,7 @@ def _profile(identifier, architecture, target, provider, shape=None):
     accelerated = shape in ACCELERATED_VM_SHAPES
     return {"id": identifier, "label": shape or f"{'General OCI' if provider == 'oci' else 'Generic'} {'ARM64' if architecture == 'aarch64' else 'x86_64'} {'bare metal' if bare else 'VM'}",
             "provider": provider, "architecture": architecture, "target": target, "shape": shape,
+            "shapes": [shape] if shape else [],
             "boot_attachment": "iscsi" if bare else "paravirtualized",
             "network_attachment": "vfio" if bare else "accelerated" if accelerated else "paravirtualized",
             "firmware": "UEFI_64" if bare or architecture == "aarch64" else None,
@@ -103,7 +111,21 @@ def destination_catalog():
                     for architecture in ("aarch64", "x86_64") for target in ("vm", "bare_metal"))
     profiles.extend(_profile(f"oci:{architecture}:vm", architecture, "vm", "oci")
                     for architecture in ("aarch64", "x86_64"))
-    return {"version": 1, "checked_on": "2026-10-28", "profiles": deepcopy(profiles),
+    by_shape = {profile["shape"]: profile for profile in profiles if profile["shape"]}
+    for group_id, shapes in VM_PROFILE_GROUPS.items():
+        members = [by_shape[name] for name in shapes if name in by_shape]
+        if len(members) != len(shapes):
+            continue
+        first = members[0]
+        settings = {key: value for key, value in first.items() if key not in {"id", "label", "shape", "shapes"}}
+        if any(member[key] != value for member in members[1:] for key, value in settings.items()):
+            continue
+        label = ", ".join(shapes[:-1]) + " and " + shapes[-1]
+        group = {**settings, "id": group_id, "label": label, "shape": None, "shapes": list(shapes)}
+        profiles.insert(profiles.index(first), group)
+        for member in members:
+            member["group_id"] = group_id
+    return {"version": 1, "checked_on": "2026-11-21", "profiles": deepcopy(profiles),
             "nic_drivers": list(NIC_DRIVERS), "sources": list(SOURCES)}
 
 
@@ -168,15 +190,17 @@ def resolve_destination(inspection, selection):
                     "Compute.SecureBoot": False, "Compute.AMD_SecureEncryptedVirtualization": False,
                     "Storage.Iscsi.MultipathDeviceSupported": False, "Network.IPv6Only": False}
         capabilities.update({key: {"default_value": value, "values": None} for key, value in optional.items()})
-        result["oci_defaults"] = {"capabilities": capabilities,
-                                  "import_options": {"launch_mode": launch, "shape_compatibility": [{"shape": profile["shape"]}] if profile["shape"] else [],
-                                                     **_operating_system(inspection)}}
+        import_options = {"launch_mode": launch, "shape_compatibility": [{"shape": name} for name in profile["shapes"]],
+                          **_operating_system(inspection)}
+        if len(profile["shapes"]) > 1:
+            # The chosen row lists exact targets. Honor later edits to that list.
+            import_options["shape_compatibility_mode"] = "manual"
+        result["oci_defaults"] = {"capabilities": capabilities, "import_options": import_options}
     result["ready"] = not result["blockers"]
     if result["ready"]:
         _select_preparation(inspection, result["platform_migration"], result["oci_defaults"], strategy)
         result["required_packages"] = _required_packages(inspection, result["platform_migration"], profile["provider"], result["oci_defaults"])
     if result["oci_defaults"]:
-        from .oci_shapes import resolve_shape_compatibility
         result["shape_compatibility_resolution"] = resolve_shape_compatibility(
             inspection, result["oci_defaults"], result["platform_migration"])
     return result

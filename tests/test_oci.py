@@ -253,6 +253,19 @@ def accelerated_config(**options):
                      import_options={"launch_mode": "ACCELERATEDPV", **options})
 
 
+def test_accelerated_only_network_cannot_advertise_standard_arm_group(ready_guest_plan):
+    from forge.destinations import resolve_destination
+
+    source = {"os": {"arch": "aarch64"}}
+    selected = resolve_destination(source, {"profile_id": "oci:arm-standard-pv"})
+    shapes = selected["oci_defaults"]["import_options"]["shape_compatibility"]
+    config = accelerated_config(shape_compatibility_mode="manual", shape_compatibility=shapes)
+    plan = compatibility_plan(source, config)
+    assert not plan["ready_to_build"]
+    for row in shapes:
+        assert any(row["shape"] in message and "supports only" in message for message in plan["blockers"])
+
+
 def test_accelerated_handoff_preserves_network_and_launch_mode(ready_guest_plan):
     config = accelerated_config(shape_compatibility=[{"shape": "VM.Standard.E6.Ax.Flex"}])
     plan = compatibility_plan({"os": {"arch": "x86_64"}}, config)

@@ -1,6 +1,6 @@
 # OCI image compatibility
 
-The host observations date from **2026-10-28**. The Standard E4/E5/E6 Flex compatibility group was checked against Oracle's shape and networking references on **2026-11-21**.
+The host observations date from **2026-10-28**. The Standard A1/A2/A4 and E4/E5/E6 Flex destination groups were checked against Oracle's shape and networking references on **2026-11-21**.
 
 OCI image compatibility has three parts: the software and boot layout inside the disk, the image's cloud capability schema, and the hardware/network/storage selected when an instance is launched. A QCOW2 conversion only changes the disk container. Declaring a capability does not install a driver or prove that an instance boots.
 
@@ -227,7 +227,7 @@ Memory encryption and Secure Boot are instance `platformConfig` properties, resp
 
 An image's supported-shape list is a separate control-plane resource. `oci compute image-shape-compatibility-entry add` accepts CLI JSON fields `imageId`, `shapeName`, and optional `memoryConstraints`/`ocpuConstraints`. The memory object uses integer `minInGBs`/`maxInGBs`; the OCPU object uses integer `min`/`max`. These describe tested bounds for an image and shape; they do not resize the guest disk, translate machine code, or manufacture missing CPU/device support. [Shape compatibility command](https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/compute/image-shape-compatibility-entry/add.html), [memory constraints](https://docs.oracle.com/en-us/iaas/tools/dotnet/latest/api/Oci.CoreService.Models.ImageMemoryConstraints.html), [OCPU constraints](https://docs.oracle.com/en-us/iaas/tools/dotnet/latest/api/Oci.CoreService.Models.ImageOcpuConstraints.html)
 
-Forge writes effective `VM.Standard.E4.Flex`, `VM.Standard.E5.Flex`, and `VM.Standard.E6.Flex` entries into `.oci` metadata at `additionalMetadata.shapeCompatibilities`, with their exact limits. These public-to-internal name mappings were observed in the supplied Oracle version-2 export. The same metadata structure and OCPU/GiB constraint keys appear in the [published FreeBSD OCI exporter](https://lists.freebsd.org/archives/dev-commits-src-all/2025-March/052583.html). This is evidence for the bounded export mapping, not a published universal Oracle metadata contract. No source image IDs, unrelated source shapes, or inferred bare-metal internal names are copied. The archive receipt lists `embedded_shapes` and `companion_only_shapes`; every effective entry remains in the companion for public-API application and verification.
+Forge embeds selected shape entries and their configured limits in `.oci` metadata at `additionalMetadata.shapeCompatibilities`. The supplied Oracle version-2 export confirms the internal names for Standard E4/E5/E6 Flex. FreeBSD's ARM64 OCI exporter confirms the names for Standard A1/A2 Flex. The archive receipt lists `embedded_shapes` and `companion_only_shapes`. Every selected shape, including Standard A4 Flex, appears in the companion for application and verification through the public OCI API. [FreeBSD OCI exporter](https://lists.freebsd.org/archives/dev-commits-src-all/2025-March/052583.html)
 
 After uploading the image and filling the object location and compartment in `image-import.json`, the companion provides one command:
 

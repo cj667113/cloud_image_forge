@@ -97,6 +97,27 @@ def test_multiple_observed_vm_shapes_are_embedded_with_exact_limits():
     assert config.model_dump() == before
 
 
+def test_arm_group_keeps_all_shapes_in_companion_and_embeds_published_mappings(tmp_path):
+    from forge.destinations import resolve_destination
+    from forge.oci import bundle_files
+
+    selected = resolve_destination(INSPECTION, {"profile_id": "oci:arm-standard-pv"})
+    config = OciConfig.model_validate(selected["oci_defaults"])
+    config.import_options.shape_compatibility[1].max_ocpus = 4
+    path = tmp_path / "arm.oci"
+    receipt = subject.write_archive(path, qcow(tmp_path / "source.qcow2"), config, INSPECTION, lambda _: None)
+    with tarfile.open(path) as archive:
+        metadata = json.load(archive.extractfile("image_metadata.json"))
+    embedded = metadata["additionalMetadata"]["shapeCompatibilities"]
+    assert [entry["internalShapeName"] for entry in embedded] == ["VM.Standard.A1.Flex", "VM.Standard.A2.Flex"]
+    assert embedded[1]["ocpuConstraints"] == {"max": 4}
+    assert receipt["shape_compatibility"]["companion_only_shapes"] == ["VM.Standard.A4.Flex"]
+    files = bundle_files(config, {"format": "oci"})
+    entries = json.loads(files["shape-compatibility.json"])["entries"]
+    assert [entry["shapeName"] for entry in entries] == ["VM.Standard.A1.Flex", "VM.Standard.A2.Flex", "VM.Standard.A4.Flex"]
+    assert entries[1]["ocpuConstraints"] == {"max": 4}
+
+
 def test_unmapped_shapes_are_not_guessed_or_copied_from_source_metadata():
     config = OciConfig(import_options={"shape_compatibility_mode": "manual", "shape_compatibility": [
         {"shape": "VM.Standard.E4.Flex", "max_ocpus": 8}, {"shape": "BM.Standard.E5.192"}]})

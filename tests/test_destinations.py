@@ -1,4 +1,5 @@
 from copy import deepcopy
+import json
 
 import pytest
 
@@ -17,6 +18,55 @@ def test_catalog_has_exact_architecture_shapes_without_invented_nics():
     assert all(item["nic_driver"] in {None, "auto"} for item in profiles.values())
     profiles["oci:VM.Standard.A1.Flex"]["sources"].clear()
     assert destination_catalog()["sources"]
+
+
+@pytest.mark.parametrize("group_id,arch,shapes", [
+    ("oci:arm-standard-pv", "aarch64", ["VM.Standard.A1.Flex", "VM.Standard.A2.Flex", "VM.Standard.A4.Flex"]),
+    ("oci:amd-standard-pv", "x86_64", ["VM.Standard.E4.Flex", "VM.Standard.E5.Flex", "VM.Standard.E6.Flex"]),
+])
+def test_group_shares_preparation_and_exports_each_named_shape(group_id, arch, shapes):
+    from forge.oci import OciConfig, bundle_files
+
+    profiles = {item["id"]: item for item in destination_catalog()["profiles"]}
+    group = profiles[group_id]
+    assert group["shapes"] == shapes
+    assert group["label"] == f"{shapes[0]}, {shapes[1]} and {shapes[2]}"
+    listed = [p for p in profiles.values() if p["architecture"] == arch and "group_id" not in p]
+    assert [p["id"] for p in listed if set(shapes).intersection(p["shapes"])] == [group_id]
+    assert all(p in listed for p in profiles.values() if p["architecture"] == arch and
+               (p["network_attachment"] == "accelerated" or p["target"] == "bare_metal" or not p["shapes"]))
+
+    source = image(arch)
+    grouped = resolve_destination(source, {"profile_id": group_id})
+    assert grouped["ready"]
+    for name in shapes:
+        exact = resolve_destination(source, {"profile_id": "oci:" + name})
+        assert exact["profile"]["group_id"] == group_id
+        assert exact["oci_defaults"]["import_options"]["shape_compatibility"] == [{"shape": name}]
+        assert grouped["platform_migration"] == exact["platform_migration"]
+        assert grouped["oci_defaults"]["capabilities"] == exact["oci_defaults"]["capabilities"]
+        assert grouped["oci_defaults"]["guest"] == exact["oci_defaults"]["guest"]
+        assert grouped["required_packages"] == exact["required_packages"]
+    config = OciConfig.model_validate(grouped["oci_defaults"])
+    assert config.import_options.shape_compatibility_mode == "manual"
+    resolution = grouped["shape_compatibility_resolution"]
+    assert resolution["effective_shapes"] == [{"shape": name} for name in shapes]
+    files = bundle_files(config, {"format": "oci", "shape_compatibility_resolution": resolution})
+    assert [r["shapeName"] for r in json.loads(files["shape-compatibility.json"])["entries"]] == shapes
+
+    wrong_arch = "aarch64" if arch == "x86_64" else "x86_64"
+    assert not resolve_destination(image(wrong_arch), {"profile_id": group_id})["ready"]
+
+
+def test_group_splits_when_a_member_requires_different_network_preparation(monkeypatch):
+    from forge import destinations
+
+    monkeypatch.setattr(destinations, "ACCELERATED_VM_SHAPES", destinations.ACCELERATED_VM_SHAPES | {"VM.Standard.A2.Flex"})
+    profiles = {p["id"]: p for p in destination_catalog()["profiles"]}
+    assert "oci:arm-standard-pv" not in profiles
+    for generation in ("A1", "A2", "A4"):
+        assert "group_id" not in profiles[f"oci:VM.Standard.{generation}.Flex"]
+    assert profiles["oci:VM.Standard.A2.Flex"]["network_attachment"] == "accelerated"
 
 
 @pytest.mark.parametrize("shape,network,launch", [

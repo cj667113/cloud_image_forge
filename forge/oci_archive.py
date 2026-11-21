@@ -40,12 +40,13 @@ LAUNCH_CAPABILITIES = {
     "pvEncryptionInTransitEnabled": "Storage.ParaVirtualization.EncryptionInTransit",
     "consistentVolumeNamingEnabled": "Storage.ConsistentVolumeNaming",
 }
-# Exact names observed in the user's Oracle-exported version-2 metadata.
-# The structure/constraint units also appear in FreeBSD's published exporter:
+# The AMD names appear in Oracle-exported version-2 metadata. The ARM names
+# appear in the arm64 shape table of FreeBSD's published OCI exporter:
 # https://lists.freebsd.org/archives/dev-commits-src-all/2025-March/052583.html
 # This is an observed archive convention, not a public API mapping guarantee.
 # In particular, bare-metal internal names differ and are never synthesized.
 OBSERVED_SHAPE_NAMES = {name: name for name in (
+    "VM.Standard.A1.Flex", "VM.Standard.A2.Flex",
     "VM.Standard.E4.Flex", "VM.Standard.E5.Flex", "VM.Standard.E6.Flex")}
 
 
@@ -86,7 +87,7 @@ def shape_metadata(config, shape_resolution=None):
                 for row in entries if row["shapeName"] in OBSERVED_SHAPE_NAMES]
     return {"entries": embedded, "embedded_shapes": [row["internalShapeName"] for row in embedded],
             "companion_only_shapes": [row["shapeName"] for row in entries if row["shapeName"] not in OBSERVED_SHAPE_NAMES],
-            "mapping_basis": "Observed Oracle version-2 export; verify the imported shape list through the public OCI API"}
+            "mapping_basis": "Exact names from an Oracle version-2 export and the FreeBSD ARM64 OCI exporter"}
 
 
 def image_metadata(config, inspection, *, shape_resolution=None):

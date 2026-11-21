@@ -16,6 +16,7 @@ SOURCES = [
     "https://docs.oracle.com/en-us/iaas/Content/Compute/References/computeshapes.htm",
     "https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/edit-launch-options.htm",
 ]
+ARM_STANDARD_PV = ("VM.Standard.A1.Flex", "VM.Standard.A2.Flex", "VM.Standard.A4.Flex")
 # Standard limits only. Extended-memory configurations are left to explicit
 # entries; they must never be silently inferred for another shape.
 AMD_STANDARD_PV = {
