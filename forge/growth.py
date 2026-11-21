@@ -223,7 +223,7 @@ def verify_growth(inspection, plan, *, expected_disk_size=None):
 
 def grow(source_work: Path, destination: Path, inspection, options, disk_size_gib, log):
     from .engine import ImageEngine, _guest, _run
-    fresh = ImageEngine().inspect(source_work)
+    fresh = ImageEngine().inspect(source_work, include_editor=False)
     plan = plan_growth(fresh, options, disk_size_gib)
     if not plan["ready"]:
         raise StorageError("Automatic growth blocked: " + " ".join(plan["blockers"]))
@@ -260,7 +260,7 @@ def grow(source_work: Path, destination: Path, inspection, options, disk_size_gi
                     g.e2fsck(action["device"],forceall=True)
                     g.resize2fs(action["device"])
             g.sync()
-        final = ImageEngine().inspect(destination)
+        final = ImageEngine().inspect(destination, include_editor=False)
         checked = verify_growth(final,plan)
         if not checked["ready"]:
             raise StorageError("Growth verification failed: " + " ".join(checked["blockers"]))

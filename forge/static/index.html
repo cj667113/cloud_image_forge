@@ -15,6 +15,7 @@
   <link rel="stylesheet" href="/access.css">
   <link rel="stylesheet" href="/destinations.css">
   <link rel="stylesheet" href="/mounts.css">
+  <script src="/library.js" defer></script>
   <script src="/wizard.js" defer></script>
   <script src="/studio.js" defer></script>
   <script src="/systemd.js" defer></script>
@@ -80,6 +81,20 @@
     <div id="import-error" class="notice error" role="alert" hidden></div><div id="upload-progress-wrap" hidden><div class="progress-heading"><span>Uploading source</span><span id="upload-percent">0%</span></div><progress id="upload-progress" max="100" value="0"></progress></div>
     <div class="dialog-footer"><button type="button" class="button secondary" data-close="import-dialog">Cancel</button><button id="import-submit" class="button primary" type="submit">Import image<svg class="icon"><use href="#i-arrow"/></svg></button></div>
   </form></dialog>
+  <dialog id="library-dialog" aria-labelledby="library-title">
+    <form id="library-form">
+      <div class="dialog-heading"><h2 id="library-title"></h2></div>
+      <p id="library-description" class="muted" hidden></p>
+      <label id="library-name-field" class="field" for="library-name">Name
+        <input id="library-name" type="text" autocomplete="off" required>
+      </label>
+      <div id="library-error" class="notice error" role="alert" hidden></div>
+      <div class="dialog-footer">
+        <button type="button" class="button secondary" id="library-cancel">Cancel</button>
+        <button type="submit" class="button primary" id="library-confirm"></button>
+      </div>
+    </form>
+  </dialog>
   <dialog id="auth-dialog" aria-labelledby="auth-title"><form id="auth-form"><div class="dialog-heading"><div><h2 id="auth-title">Connect to workspace</h2></div><button type="button" class="icon-button" data-close="auth-dialog" aria-label="Close connection"><svg class="icon"><use href="#i-close"/></svg></button></div><p class="muted">Use the access token configured on your server.</p><label class="field">Access token<input id="auth-token" type="password" autocomplete="current-password" required></label><div id="auth-error" class="notice error" hidden role="alert"></div><div class="dialog-footer"><button class="button primary" type="submit">Connect<svg class="icon"><use href="#i-arrow"/></svg></button></div></form></dialog>
   <dialog id="s3-dialog" aria-labelledby="s3-title"><form id="s3-form"><div class="dialog-heading"><div><h2 id="s3-title">Upload export to S3</h2></div><button type="button" class="icon-button" data-close="s3-dialog" aria-label="Close S3 upload"><svg class="icon"><use href="#i-close"/></svg></button></div><p class="muted" id="s3-artifact-name"></p><label class="field">Destination S3 URI<input id="s3-url" placeholder="s3://my-bucket/images/custom-image.qcow2" required></label><details class="editor-disclosure"><summary>S3 connection options <span class="disclosure-meta">Optional</span></summary><div class="details-content form-grid"><label class="field">S3 endpoint <span class="optional">optional</span><input id="s3-endpoint" type="url" placeholder="https://s3.example.com"></label><label class="field">Region <span class="optional">optional</span><input id="s3-region" placeholder="us-east-1"></label></div></details><p class="field-help">Uses server credentials. Existing object keys may be replaced.</p><div id="s3-error" class="notice error" hidden role="alert"></div><div class="dialog-footer"><button type="button" class="button secondary" data-close="s3-dialog">Cancel</button><button class="button primary" type="submit">Upload image<svg class="icon"><use href="#i-upload"/></svg></button></div></form></dialog>
   <div id="toast" class="toast" role="status" hidden></div>

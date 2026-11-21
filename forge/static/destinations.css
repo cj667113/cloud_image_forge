@@ -6,3 +6,5 @@
 #destination-profile-error{overflow-wrap:anywhere}
 .destination-profile-status{line-height:1.5}
 @media(max-width:600px){.destination-profile-actions .button{min-height:40px}}
+
+.oci-resolved-details{margin-top:16px}.oci-resolved-list{list-style:none!important;padding:0!important;margin:0 0 12px!important;display:grid;gap:10px}.oci-resolved-list li{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}.oci-resolved-list code{overflow-wrap:anywhere;font-size:12px}.oci-resolved-list li>span:not(.help-anchor){font-size:11px;color:var(--muted)}

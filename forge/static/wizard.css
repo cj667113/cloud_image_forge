@@ -812,3 +812,5 @@
   .wizard-source-import{padding:8px 2px;}
   .wizard-source-import .button{min-height:42px;}
 }
+
+.wizard-result-progress .wizard-build-stage{margin:12px 0 6px;font-size:13px;color:var(--ink);overflow-wrap:anywhere}.wizard-build-elapsed{font-size:11px;color:var(--muted)}

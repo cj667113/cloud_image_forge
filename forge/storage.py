@@ -548,7 +548,11 @@ def reconcile_mounts(work: Path, previous_inspection=None, policy="auto", log=la
             _write_guest(g, "/etc/fstab", plan["content"])
             _relabel_edited_files(g, ["/etc/fstab"])
         log(f"Reconciled {len(plan['changes'])} local mount reference(s) against actual filesystem identities")
-    final = _inspect_mount_image(work, policy=generation_policy)
+    # A write needs independent readback. With no write, the preflight is
+    # already a read-only inspection of this working disk. Remove historical
+    # mapping context when evaluating the preserved file against today's IDs.
+    final = (_inspect_mount_image(work, policy=generation_policy) if changed else
+             mount_plan_for_policy(plan, generation_policy, require_original=True))
     expected_hash = hashlib.sha256(plan["content"].encode()).hexdigest() if changed else plan["file_state"]["sha256"]
     if not final.get("file_state") or final["file_state"]["sha256"] != expected_hash:
         raise StorageError("Mount reconciliation readback did not match the expected fstab")
@@ -1590,7 +1594,7 @@ def rebuild(source_work: Path, destination: Path, inspection: dict, recipe: dict
     if source_work == destination:
         raise StorageError("Rebuild source and destination must be different files")
     log("Refreshing storage evidence in the source working image before filesystem rebuild")
-    fresh = ImageEngine().inspect(source_work)
+    fresh = ImageEngine().inspect(source_work, include_editor=False)
     # Projection is preview-only. The actual source must already have had its
     # fstab reconciled and freshly inspected before rebuilding LVM identities.
     plan = plan_rebuild(fresh, options, recipe.get("disk_size_gib"), mount_policy="preserve", project_references=False)

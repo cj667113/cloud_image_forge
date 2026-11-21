@@ -58,6 +58,31 @@ def _required_packages(inspection, platform_options, provider, oci_defaults):
     return sorted(packages)
 
 
+def _select_preparation(inspection, platform, oci_defaults, strategy):
+    """Resolve a guided selection to the same concrete strategies accepted by builds."""
+    from .oci import OciConfig, compatibility_plan
+    from .platform import plan_platform
+
+    if strategy == "auto":
+        preserve = {**platform, "strategy": "preserve", "install_packages": False,
+                    "configure_network": False, "configure_serial_console": False}
+        if oci_defaults:
+            config = OciConfig.model_validate({**oci_defaults, "guest": {"prepare": False}})
+            if compatibility_plan(inspection, config, platform_migration=preserve,
+                                  project_platform=False)["ready_to_build"]:
+                platform.update(preserve)
+            else:
+                # Hardware preparation may supply all missing OCI prerequisites.
+                # Actual validate-only execution checks the written disk again.
+                planned = {**platform, "install_packages": True}
+                validation = compatibility_plan(inspection, config, True, platform_migration=planned)
+                oci_defaults["guest"] = {"prepare": not validation["ready_to_build"]}
+        elif plan_platform(inspection, preserve, target_provider="generic")["ready"]:
+            platform.update(preserve)
+    if oci_defaults:
+        oci_defaults.setdefault("guest", {"prepare": platform["strategy"] != "preserve"})
+
+
 def _profile(identifier, architecture, target, provider, shape=None):
     bare = target == "bare_metal"
     accelerated = shape in ACCELERATED_VM_SHAPES
@@ -94,11 +119,11 @@ def resolve_destination(inspection, selection):
     arch = normalize_arch(inspection.get("os", {}).get("arch"))
     if arch != profile["architecture"]:
         result["blockers"].append(f"This destination requires {profile['architecture']}, but the image is {arch}. CPU architecture conversion is not supported.")
-    source, strategy = selection.get("source", "unknown"), selection.get("strategy", "reconfigure")
+    source, strategy = selection.get("source", "unknown"), selection.get("strategy", "auto")
     if source not in {"unknown", "vm", "bare_metal"}:
         result["blockers"].append("Source must be unknown, VM or bare metal; prior hardware is not inferred from the image.")
-    if strategy not in {"preserve", "reconfigure"}:
-        result["blockers"].append("Select Preserve & validate or Reconfigure.")
+    if strategy not in {"auto", "preserve", "reconfigure"}:
+        result["blockers"].append("Select Automatic, Preserve & validate, or Reconfigure.")
     nic = selection.get("nic_driver", profile["nic_driver"])
     if nic is not None and nic not in NIC_DRIVERS:
         result["blockers"].append("Select a supported physical NIC driver.")
@@ -113,10 +138,11 @@ def resolve_destination(inspection, selection):
         result["warnings"].append("Automatic NIC bundle: " + (", ".join(result["nic_drivers"]) or "unverified") + ". The destination NIC remains unverified.")
     if not profile["requires_nic_driver"]:
         nic = None
-    result["platform_migration"] = {"enabled": True, "strategy": strategy, "source": source, "target": profile["target"],
+    concrete = "preserve" if strategy == "preserve" else "reconfigure"
+    result["platform_migration"] = {"enabled": True, "strategy": concrete, "source": source, "target": profile["target"],
                                     "boot_attachment": profile["boot_attachment"], "network_attachment": profile["network_attachment"],
                                     "nic_driver": nic, "install_packages": False,
-                                    "configure_network": strategy == "reconfigure", "configure_serial_console": strategy == "reconfigure"}
+                                    "configure_network": concrete == "reconfigure", "configure_serial_console": concrete == "reconfigure"}
     firmware = profile["firmware"] or inspection.get("boot", {}).get("recommended_firmware")
     if firmware not in {"UEFI_64", "BIOS"}:
         firmware = "UEFI_64" if "UEFI_64" in inspection.get("boot", {}).get("supported_firmware", []) else None
@@ -147,5 +173,10 @@ def resolve_destination(inspection, selection):
                                                      **_operating_system(inspection)}}
     result["ready"] = not result["blockers"]
     if result["ready"]:
+        _select_preparation(inspection, result["platform_migration"], result["oci_defaults"], strategy)
         result["required_packages"] = _required_packages(inspection, result["platform_migration"], profile["provider"], result["oci_defaults"])
+    if result["oci_defaults"]:
+        from .oci_shapes import resolve_shape_compatibility
+        result["shape_compatibility_resolution"] = resolve_shape_compatibility(
+            inspection, result["oci_defaults"], result["platform_migration"])
     return result

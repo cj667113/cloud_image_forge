@@ -18,7 +18,7 @@ function automaticDestinationLabel() {
 }
 function renderDestinationProfile() {
   const profiles=destinationProfiles(),arch=sourceArchitecture();
-  return `<label class="field destination-profile-field">Destination profile<select id="destination-profile"><option value="auto" selected>${esc(automaticDestinationLabel())}</option>${[['vm','Virtual machines'],['bare_metal','Bare metal']].map(([kind,label])=>`<optgroup label="${label}">${profiles.filter(profile=>profile.target===kind).map(profile=>`<option value="${esc(profile.id)}">${esc(profile.label)}${!arch?` · ${esc(profile.architecture)}`:''}</option>`).join('')}</optgroup>`).join('')}<option value="custom">Custom settings</option></select>${helpHint('Profiles choose destination attachments from the catalog, using the inspected CPU architecture. They do not infer where the source last ran or prove it will boot. Custom settings keep explicit hardware overrides. Required preparation packages are downloaded automatically from guest repositories.','Destination profiles')}</label><p class="destination-profile-status" id="destination-profile-loading" role="status" hidden>Applying destination defaults…</p><div class="destination-profile-actions"><button type="button" class="button secondary small" id="destination-profile-apply" data-destination-action="apply" hidden>Reapply profile</button></div><div id="destination-profile-summary" class="destination-profile-summary" hidden></div><div id="destination-profile-error" class="notice error" role="alert" hidden></div><div id="destination-profile-warnings" hidden></div>${destinationState.error?`<div class="notice warning">Destination catalog unavailable. Use Custom settings or retry.<button type="button" class="button ghost small" data-destination-action="reload">Retry</button></div>`:''}`;
+  return `<label class="field destination-profile-field">Destination profile<select id="destination-profile"><option value="auto" selected>${esc(automaticDestinationLabel())}</option>${[['vm','Virtual machines'],['bare_metal','Bare metal']].map(([kind,label])=>`<optgroup label="${label}">${profiles.filter(profile=>profile.target===kind).map(profile=>`<option value="${esc(profile.id)}">${esc(profile.label)}${!arch?` · ${esc(profile.architecture)}`:''}</option>`).join('')}</optgroup>`).join('')}<option value="custom">Custom settings</option></select>${helpHint('Profiles choose destination attachments from the catalog, using the inspected CPU architecture. They do not infer where the source last ran or prove it will boot. Custom settings keep explicit hardware overrides. Required preparation packages are downloaded automatically from guest repositories.','Destination profiles')}</label><p class="destination-profile-status" id="destination-profile-loading" role="status" hidden>Applying destination defaults…</p><div class="destination-profile-actions"><button type="button" class="button secondary small" id="destination-profile-apply" data-destination-action="apply" hidden>Reapply profile</button></div><div id="destination-profile-summary" class="destination-profile-summary" hidden></div><div id="destination-resolved-shapes"></div><div id="destination-profile-error" class="notice error" role="alert" hidden></div><div id="destination-profile-warnings" hidden></div>${destinationState.error?`<div class="notice warning">Destination catalog unavailable. Use Custom settings or retry.<button type="button" class="button ghost small" data-destination-action="reload">Retry</button></div>`:''}`;
 }
 function selectedDestinationProfileId() {
   const value=$('#destination-profile')?.value;
@@ -49,12 +49,14 @@ function applyDestinationOci(defaults,strategy) {
     if(key==='Compute.Firmware'){state.ociFirmwareEdited=true;if($('#oci-firmware-confirm'))$('#oci-firmware-confirm').checked=true;}
   }
   $('#oci-launch-mode').value=defaults.import_options.launch_mode;
+  $('#oci-shape-mode').value=defaults.import_options.shape_compatibility_mode||'auto';
   for(const [field,key] of [['oci-operating-system','operating_system'],['oci-os-version','operating_system_version']])$(`#${field}`).value=defaults.import_options[key]||'';
   $('#oci-shapes').innerHTML='';
   // Explicit profile selection replaces the advertised shape list with that destination.
   for(const shape of defaults.import_options.shape_compatibility||[]){addOciShape(false);const row=$$('.oci-shape-row').at(-1);$('[data-shape-field="shape"]',row).value=shape.shape;}
-  studioSession().destinationOciPrepare={profileId:selectedDestinationProfileId(),prepare:true};
-  $('#oci-enabled').checked=true;$('#oci-prepare').checked=strategy!=='preserve';markOciChanged();
+  const prepare=typeof defaults.guest?.prepare==='boolean'?defaults.guest.prepare:strategy!=='preserve';
+  studioSession().destinationOciPrepare={profileId:selectedDestinationProfileId(),prepare,manual:false};
+  $('#oci-enabled').checked=true;$('#oci-prepare').checked=prepare;markOciChanged();
 }
 function renderDestinationIssues(issues) {
   notice('#destination-profile-error',issues.join(' '));
@@ -67,7 +69,7 @@ function setDestinationLoading(loading) {
 function renderDestinationResult(result) {
   const profile=result?.profile,summary=$('#destination-profile-summary');if(!summary)return;
   summary.hidden=!profile;
-  if(profile){const attachment={paravirtualized:'PV',accelerated:'Accelerated PV',vfio:'Physical NIC',iscsi:'Firmware iSCSI'};summary.innerHTML=`<span><strong>${esc(architectureName(profile.architecture))}</strong></span><span>${profile.target==='bare_metal'?'Bare metal':'Virtual machine'}</span><span>${esc(attachment[profile.boot_attachment]||profile.boot_attachment)} boot</span><span>${esc(attachment[profile.network_attachment]||profile.network_attachment)} network</span>`;}
+  if(profile){const attachment={paravirtualized:'PV',accelerated:'Accelerated PV',vfio:'Physical NIC',iscsi:'Firmware iSCSI'};summary.innerHTML=`<span><strong>${esc(architectureName(profile.architecture))}</strong></span><span>${profile.target==='bare_metal'?'Bare metal':'Virtual machine'}</span><span>${esc(attachment[profile.boot_attachment]||profile.boot_attachment)} boot</span><span>${esc(attachment[profile.network_attachment]||profile.network_attachment)} network</span>${$('#platform-strategy')?.value==='auto'&&result.platform_migration?`<span>Hardware: <strong>${result.platform_migration.strategy==='preserve'?'preserve':'prepare'}</strong></span>`:''}`;}
   const blockers=[...(result?.blockers||[]),...(result?.schema_error?[result.schema_error]:[])];renderDestinationIssues(blockers);$('#destination-profile-apply').hidden=!result?.schema_error;
   const warnings=$('#destination-profile-warnings'),notesOpen=$('details',warnings)?.open??state.editorDrafts[state.selected]?.disclosures?.['destination-notes'];warnings.hidden=!result?.warnings?.length;warnings.innerHTML=result?.warnings?.length?`<details class="editor-disclosure" data-disclosure="destination-notes"${notesOpen?' open':''}><summary>Profile notes <span class="disclosure-meta">${result.warnings.length}</span></summary><div class="details-content"><ul>${result.warnings.map(item=>`<li>${esc(item)}</li>`).join('')}</ul></div></details>`:'';
 }
@@ -100,13 +102,17 @@ async function resolveDestinationProfile({apply=true,syncOci=true}={}) {
       for(const [key,id] of Object.entries({source:'platform-source',target:'platform-target',boot_attachment:'platform-boot',network_attachment:'platform-network',nic_driver:'platform-nic'}))$(`#${id}`).value=config[key]||'';
       if(result.profile?.provider==='oci'){$('#target-oci').checked=true;updateExport();}
       result.schema_error=destinationOciIssue(result.oci_defaults);
-      if(!result.schema_error&&syncOci)applyDestinationOci(result.oci_defaults,selection.strategy);
-      else if(!result.schema_error&&result.oci_defaults&&session.destinationOciPrepare?.profileId===selection.profile_id)$('#oci-prepare').checked=selection.strategy!=='preserve'&&session.destinationOciPrepare.prepare;
+      if(!result.schema_error&&syncOci)applyDestinationOci(result.oci_defaults,config.strategy);
+      else if(!result.schema_error&&result.oci_defaults&&session.destinationOciPrepare?.profileId===selection.profile_id) {
+        const managed=session.destinationOciPrepare;
+        if(!managed.manual)managed.prepare=typeof result.oci_defaults.guest?.prepare==='boolean'?result.oci_defaults.guest.prepare:config.strategy!=='preserve';
+        $('#oci-prepare').checked=selection.strategy==='preserve'?false:managed.prepare;
+      }
       if(selection.strategy==='preserve')preservePlatformConfiguration();
-      applyDestinationPackageRequirements(result,selection.strategy);
+      applyDestinationPackageRequirements(result,config.strategy);
       state.editorRevision++;invalidateStudioPlans('platform');
     }
-    result.selection=JSON.stringify(destinationSelection());result.snapshot=snapshot;session.destination=result;renderDestinationResult(result);updatePlatformStudio();
+    result.selection=JSON.stringify(destinationSelection());result.snapshot=snapshot;session.destination=result;renderDestinationResult(result);updatePlatformStudio();if(syncOci&&!result.schema_error)rememberOciShapeResolution(result.shape_compatibility_resolution);
   }catch(error){if(state.selected===imageId&&state.editorRevision===revision&&studioInspectionKey()===snapshot){notice('#destination-profile-error',errorText(error));$('#destination-profile-apply').hidden=false;}}
   finally{if(session.destinationPending===requestId){delete session.destinationPending;if(state.selected===imageId){setDestinationLoading(false);syncDestinationEditor();wizardUpdate();}}}
 }
@@ -115,10 +121,12 @@ function syncDestinationEditor() {
   $('#destination-profile option[value="auto"]').textContent=automaticDestinationLabel();
   const result=studioSession().destination;if(result?.selection===JSON.stringify(destinationSelection())&&result.snapshot===studioInspectionKey())renderDestinationResult(result);
   else if($('#platform-enabled').checked&&$('#destination-profile').value!=='custom'){$('#destination-profile-apply').hidden=false;if(!$('#destination-profile-error').textContent)notice('#destination-profile-error','Reapply the profile to check its defaults against this inspection.');}
+  $('#platform-strategy option[value=auto]').disabled=$('#destination-profile').value==='custom';
   $('#platform-advanced').open=$('#destination-profile').value==='custom'||$('#platform-advanced').open;
 }
 function useCustomDestination() {
   if(!$('#destination-profile'))return;
+  if($('#platform-strategy').value==='auto')$('#platform-strategy').value=studioSession().destination?.platform_migration?.strategy||'reconfigure';
   $('#destination-profile').value='custom';delete studioSession().destination;delete studioSession().destinationPending;renderDestinationResult(null);setDestinationLoading(false);$('#platform-advanced').open=true;
 }
 function scheduleDestinationResolution(options) {
@@ -132,7 +140,7 @@ document.addEventListener('change',event=>{
     $('#destination-profile option[value="auto"]').textContent=automaticDestinationLabel();
     if($('#destination-profile').value==='auto'&&$('#platform-enabled').checked)scheduleDestinationResolution({syncOci:studioSession().destinationOciPrepare?.profileId!==selectedDestinationProfileId()});
   }
-  if(input.id==='oci-prepare'&&studioSession().destinationOciPrepare?.profileId===selectedDestinationProfileId())studioSession().destinationOciPrepare.prepare=input.checked;
+  if(input.id==='oci-prepare'&&studioSession().destinationOciPrepare?.profileId===selectedDestinationProfileId()){studioSession().destinationOciPrepare.prepare=input.checked;studioSession().destinationOciPrepare.manual=true;}
   if(input.id==='destination-profile'){applyDestinationNicDefault();scheduleDestinationResolution();syncDestinationEditor();}
   if(input.id==='platform-enabled'&&input.checked){applyDestinationNicDefault();scheduleDestinationResolution();}
   if(['platform-strategy','platform-source','platform-nic'].includes(input.id)&&$('#destination-profile')?.value!=='custom')scheduleDestinationResolution({syncOci:false});

@@ -525,6 +525,40 @@ def test_oci_build_publishes_complete_downloadable_configuration(client, monkeyp
         assert "isPvEncryptionInTransitEnabled" in json.loads(archive.read("instance-launch-fragment.json"))
 
 
+@pytest.mark.parametrize("options", [{}, {"object_name": "image.qcow2"},
+                                     {"object_uri": "https://object.example/release.qcow2"}])
+def test_oci_export_rename_keeps_download_and_companion_in_sync(client, monkeypatch, options):
+    image_id = imported(client)
+    monkeypatch.setattr("forge.oci_guest.plan_guest", lambda *a, **k: {"changes": [], "blockers": [], "warnings": []})
+    response = client.post(f"/api/images/{image_id}/build", json={"oci": {"import_options": options}})
+    artifact_id = finished(client, response.json()["job_id"])["result"]["artifact_id"]
+    base = f"/api/artifacts/{artifact_id}"
+
+    def contents():
+        response = client.get(base + "/oci-bundle")
+        assert response.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+            return {name: archive.read(name) for name in archive.namelist()}
+
+    before = contents()
+    renamed = client.patch(base, json={"name": "Release candidate"})
+    assert renamed.status_code == 200, renamed.text
+    name = renamed.json()["name"]
+    assert name == "Release candidate.qcow2"
+    disk = client.get(base + "/download")
+    assert disk.content == b"test-output" and disk.status_code == 200
+    assert client.get(base + "/manifest").json()["name"] == name
+    after = contents()
+    assert before.keys() == after.keys()
+    assert json.loads(after["artifact.json"]) == {**json.loads(before["artifact.json"]), "name": name}
+    previous_import = json.loads(before["image-import.json"])
+    assert json.loads(after["image-import.json"]) == (previous_import if options else {**previous_import, "name": name})
+    for member in before.keys() - {"artifact.json", "image-import.json"}:
+        assert before[member] == after[member]
+    assert client.patch(base, json={"name": "image.qcow2"}).status_code == 200
+    assert contents() == before
+
+
 def test_oci_archive_uses_existing_download_and_s3_flows(client, monkeypatch):
     image_id = imported(client)
     monkeypatch.setattr("forge.oci_guest.plan_guest", lambda *a, **k: {"changes": [], "blockers": [], "warnings": []})
@@ -553,7 +587,7 @@ def test_oci_archive_uses_existing_download_and_s3_flows(client, monkeypatch):
         assert set(archive.getnames()) == {"image_metadata.json", "output.QCOW2"}
     config = client.get(f"/api/artifacts/{artifact_id}/oci-bundle")
     with zipfile.ZipFile(io.BytesIO(config.content)) as archive:
-        assert json.loads(archive.read("image-import.json"))["sourceImageType"] == "OCI"
+        assert "sourceImageType" not in json.loads(archive.read("image-import.json"))
     def upload(location, path, settings, log):
         assert path.name == "image.oci" and path.read_bytes() == download.content
         return {"url": "s3://example/image.oci", "size": path.stat().st_size}

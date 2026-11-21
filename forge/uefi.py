@@ -524,7 +524,7 @@ def migrate(work: Path, inspection: dict, options: dict, allow_network: bool, lo
             g.write(f"/boot/efi/EFI/{plan['vendor']}/grub.cfg", forward.encode())
             g.write("/boot/efi/EFI/BOOT/grub.cfg", forward.encode())
         _verify_configuration(g, plan, inspection, esp_uuid)
-    after = ImageEngine().inspect(work)
+    after = ImageEngine().inspect(work, include_editor=False)
     if not _preserved(baseline, after.get("uefi_migration", {}).get("layout", {})):
         raise EngineError("Migration verification found changed original disk structures")
     supported = after.get("boot", {}).get("supported_firmware", [])

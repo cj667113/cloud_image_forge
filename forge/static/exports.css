@@ -15,3 +15,15 @@
 @media(max-width:380px){.export-properties{grid-template-columns:1fr}.export-row-actions .button{font-size:10px;padding-inline:6px}.export-row-actions .icon{width:13px;height:13px}}
 @media(pointer:coarse){.export-row-actions .button,.export-secondary-actions .button{min-height:44px}.export-toggle,.export-warning-count,.export-warnings summary{min-height:32px}}
 @media(prefers-reduced-motion:reduce){.export-chevron,.export-warnings summary:before{transition:none}}
+
+/* Secondary library actions on the source selector and export disclosure. */
+.source-name-row,.library-actions{display:flex;align-items:center;gap:10px}
+.source-name-row{justify-content:space-between;flex-wrap:wrap;gap:2px 12px;margin-bottom:4px}
+.source-name-row label{font-size:12px;font-weight:600}
+.library-actions{gap:2px;flex-wrap:wrap}
+.library-action{border:0;border-radius:4px;background:transparent;color:var(--ink);padding:5px 8px;font-size:12px;line-height:1.5}
+.library-action:hover,.library-action:focus-visible{background:#eee8df}
+.library-action[data-library-action="delete"]{color:#a43625}
+.export-file-links{margin:0 0 18px}
+#library-description{overflow-wrap:anywhere}
+@media(pointer:coarse){.library-action{min-height:44px}}

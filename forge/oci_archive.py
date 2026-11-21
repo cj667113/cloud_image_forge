@@ -22,7 +22,7 @@ import struct
 import tarfile
 import tempfile
 
-from .oci import OciConfig, capability_schema
+from .oci import OciConfig, ShapeCompatibility, capability_schema
 
 
 METADATA_NAME = "image_metadata.json"
@@ -40,6 +40,13 @@ LAUNCH_CAPABILITIES = {
     "pvEncryptionInTransitEnabled": "Storage.ParaVirtualization.EncryptionInTransit",
     "consistentVolumeNamingEnabled": "Storage.ConsistentVolumeNaming",
 }
+# Exact names observed in the user's Oracle-exported version-2 metadata.
+# The structure/constraint units also appear in FreeBSD's published exporter:
+# https://lists.freebsd.org/archives/dev-commits-src-all/2025-March/052583.html
+# This is an observed archive convention, not a public API mapping guarantee.
+# In particular, bare-metal internal names differ and are never synthesized.
+OBSERVED_SHAPE_NAMES = {name: name for name in (
+    "VM.Standard.E4.Flex", "VM.Standard.E5.Flex", "VM.Standard.E6.Flex")}
 
 
 class OciArchiveError(ValueError):
@@ -58,7 +65,31 @@ def _json_bytes(value):
     return result
 
 
-def image_metadata(config, inspection):
+def shape_entries(config, shape_resolution=None):
+    rows = (shape_resolution["effective_shapes"] if shape_resolution is not None
+            else [row.model_dump() for row in config.import_options.shape_compatibility])
+    shapes = [ShapeCompatibility.model_validate(row) for row in rows]
+    if len(shapes) > 100 or len({row.shape for row in shapes}) != len(shapes):
+        raise OciArchiveError("Invalid effective shape compatibility list")
+    entries = []
+    for row in shapes:
+        entries.append({"shapeName": row.shape,
+                        "ocpuConstraints": {k: v for k, v in (("min", row.min_ocpus), ("max", row.max_ocpus)) if v is not None} or None,
+                        "memoryConstraints": {k: v for k, v in (("minInGBs", row.min_memory_gbs), ("maxInGBs", row.max_memory_gbs)) if v is not None} or None})
+    return entries
+
+
+def shape_metadata(config, shape_resolution=None):
+    entries = shape_entries(config, shape_resolution)
+    embedded = [{"internalShapeName": OBSERVED_SHAPE_NAMES[row["shapeName"]],
+                 "ocpuConstraints": row["ocpuConstraints"], "memoryConstraints": row["memoryConstraints"]}
+                for row in entries if row["shapeName"] in OBSERVED_SHAPE_NAMES]
+    return {"entries": embedded, "embedded_shapes": [row["internalShapeName"] for row in embedded],
+            "companion_only_shapes": [row["shapeName"] for row in entries if row["shapeName"] not in OBSERVED_SHAPE_NAMES],
+            "mapping_basis": "Observed Oracle version-2 export; verify the imported shape list through the public OCI API"}
+
+
+def image_metadata(config, inspection, *, shape_resolution=None):
     """Derive export metadata without claiming the selected firmware boots.
 
 This also runs before a planned migration. Final inspection and OCI validation
@@ -67,6 +98,9 @@ must establish guest compatibility separately, after the migration completes.
     from .destinations import _operating_system
 
     config = _config(config)
+    if shape_resolution is None:
+        from .oci_shapes import resolve_shape_compatibility
+        shape_resolution = resolve_shape_compatibility(inspection, config)
     labels = _operating_system(inspection)
     operating_system = labels.get("operating_system") or config.import_options.operating_system
     version = labels.get("operating_system_version") or config.import_options.operating_system_version
@@ -87,16 +121,22 @@ must establish guest compatibility separately, after the migration completes.
               "imageCapabilityData": capabilities,
               "imageCapsFormatVersion": config.image_caps_format_version,
               "operatingSystem": operating_system, "operatingSystemVersion": version}
+    shapes = shape_metadata(config, shape_resolution)
+    if shapes["entries"]:
+        result["additionalMetadata"] = {"shapeCompatibilities": shapes["entries"]}
     _json_bytes(result)
     return result
 
 
-def _warnings(config):
+def _warnings(config, shape_resolution=None):
     result = []
     if not config.image_caps_format_version:
         result.append("No OCI archive capability-format UUID was supplied: imageCapabilityData and imageCapsFormatVersion are null. The archive retains its launch options; apply additional selected capabilities from the companion OCI configuration after import.")
-    if config.import_options.shape_compatibility:
-        result.append("Selected shape compatibility and shape limits are retained in the companion OCI configuration, not embedded as Oracle internal shape metadata in this archive; apply them after import.")
+    shapes = shape_metadata(config, shape_resolution)
+    if shapes["embedded_shapes"]:
+        result.append("Shape compatibility is embedded for the observed Oracle archive mappings: " + ", ".join(shapes["embedded_shapes"]) + ". Run the companion apply-oci.py command to verify or apply every requested shape and limit after import.")
+    if shapes["companion_only_shapes"]:
+        result.append("No verified internal archive mapping exists for: " + ", ".join(shapes["companion_only_shapes"]) + ". These shapes and limits are retained in the companion OCI configuration; apply them with apply-oci.py after import.")
     return result
 
 
@@ -178,7 +218,7 @@ def _verify_archive(output, metadata, disk_size, disk_sha256):
     output.seek(0)
     archive = _HashReader(output)
     expected = [(METADATA_NAME, len(metadata), 0), (DISK_NAME, disk_size, 512 + _padded(len(metadata)))]
-    with tarfile.open(fileobj=archive, mode="r|") as contents:
+    with tarfile.open(fileobj=archive, mode="r|", bufsize=CHUNK_SIZE) as contents:
         for name, size, offset in expected:
             item = contents.next()
             if (item is None or item.name != name or item.size != size or item.type != tarfile.REGTYPE
@@ -228,14 +268,17 @@ def _unlink_owned(path, identity):
         pass
 
 
-def write_archive(destination, qcow2, config, inspection, log):
+def write_archive(destination, qcow2, config, inspection, log, *, shape_resolution=None):
     """Publish one private .oci file exclusively after streamed verification.
 
 An existing destination is never replaced. Failures remove only this call's
 owned temporary/output inode; the input file is opened read-only throughout.
 """
     config = _config(config)
-    metadata = image_metadata(config, inspection)
+    if shape_resolution is None:
+        from .oci_shapes import resolve_shape_compatibility
+        shape_resolution = resolve_shape_compatibility(inspection, config)
+    metadata = image_metadata(config, inspection, shape_resolution=shape_resolution)
     metadata_bytes = _json_bytes(metadata)
     destination, qcow2 = Path(destination), Path(qcow2)
     if destination.exists() or destination.is_symlink():
@@ -259,7 +302,8 @@ owned temporary/output inode; the input file is opened read-only throughout.
                 owned = output_stat.st_dev, output_stat.st_ino
                 log("Packaging OCI archive: image_metadata.json and output.QCOW2")
                 disk = _HashReader(source)
-                with tarfile.open(fileobj=output, mode="w|", format=_tar_format(initial.st_size)) as archive:
+                with tarfile.open(fileobj=output, mode="w|", format=_tar_format(initial.st_size),
+                                  bufsize=CHUNK_SIZE, copybufsize=CHUNK_SIZE) as archive:
                     archive.addfile(_member(METADATA_NAME, len(metadata_bytes)), io.BytesIO(metadata_bytes))
                     archive.addfile(_member(DISK_NAME, initial.st_size), disk)
                 if disk.size != initial.st_size:
@@ -284,7 +328,8 @@ owned temporary/output inode; the input file is opened read-only throughout.
                            "disk_sha256": disk.digest.hexdigest(),
                            "metadata_sha256": hashlib.sha256(metadata_bytes).hexdigest(), "metadata": metadata,
                            "capability_mode": "embedded" if config.image_caps_format_version else "deferred",
-                           "warnings": _warnings(config)}
+                           "shape_compatibility": {key: value for key, value in shape_metadata(config, shape_resolution).items() if key != "entries"},
+                           "warnings": _warnings(config, shape_resolution)}
         return receipt
     except BaseException:
         if published:

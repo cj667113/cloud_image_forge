@@ -1,16 +1,19 @@
 """HTTP application and streaming local-file import."""
+from collections import Counter
 from contextlib import asynccontextmanager
 import fcntl
 import hashlib
 import hmac
 from pathlib import Path
+import re
 import shutil
 import time
+import unicodedata
 from urllib.parse import urlsplit, unquote
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
@@ -22,7 +25,7 @@ from .jobs import Jobs
 from .models import (ObjectLocation, Recipe, OciPlanRequest, OciSchemaRequest, UefiPlanRequest,
                      StoragePlanRequest, PlatformPlanRequest, DestinationSelection, MountPlanRequest)
 from .oci import catalog as oci_catalog, compatibility_plan
-from .store import Store
+from .store import Store, artifact_name
 from . import transfers
 
 
@@ -143,10 +146,14 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
     async def transfer_error(request, exc):
         return JSONResponse({"detail": str(exc)}, 400)
 
+    downloads = Counter()
+
     def get_record(kind: str, record_id: str):
         record = app.state.store.get(kind, record_id)
         if record is None:
             raise HTTPException(404, f"{kind.capitalize()} not found")
+        if record.get("deleting"):
+            raise HTTPException(409, "Deletion is in progress. Retry deleting the item if cleanup was interrupted.")
         return record
 
     def queue_capacity():
@@ -186,9 +193,80 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
         response.delete_cookie("forge_session")
         return response
 
+    def inventory_response(kind: str, request: Request):
+        validators = request.headers.get("if-none-match", "")
+        # Tags contain only our public schema identifier, kind and opaque DB
+        # revision. Accept weak validators/lists, without interpreting arbitrary
+        # client values as SQL or returning them in response headers.
+        matches = set()
+        if len(validators) <= 8192:
+            for item in validators.split(","):
+                matched = re.fullmatch(r'(?:W/)?"forge-' + kind + r'-v1-([0-9a-f]{32})"', item.strip())
+                if matched:
+                    matches.add(matched.group(1))
+        revision, records = app.state.store.inventory(kind, matches, any_version=validators.strip() == "*")
+        headers = {"ETag": f'"forge-{kind}-v1-{revision}"'}
+        if records is None:
+            return Response(status_code=304, headers=headers)
+        data = records if kind == "job" else [public(item) for item in records]
+        return JSONResponse(data, headers=headers)
+
+    class RenameItem(BaseModel):
+        name: str = Field(min_length=1, max_length=200)
+
+    def rename_item(kind: str, record_id: str, body: RenameItem):
+        with app.state.jobs.inspection_lock:
+            record = get_record(kind, record_id)
+            name = body.name.strip()
+            if (not name or name in {".", ".."} or "/" in name or "\\" in name
+                    or any(unicodedata.category(c) in {"Cc", "Cs"} for c in body.name)):
+                raise HTTPException(422, "Enter a name without path separators or control characters.")
+            if kind == "artifact":
+                original = record.get("filename") or Path(record["path"]).name
+                suffix = ".tar.gz" if original.lower().endswith(".tar.gz") else Path(original).suffix
+                if suffix:
+                    if name.lower().endswith(suffix.lower()):
+                        name = name[:-len(suffix)].strip()
+                    if not name or name in {".", ".."}:
+                        raise HTTPException(422, "Enter a name before the file extension.")
+                    name += suffix
+            if len(name) > 200:
+                raise HTTPException(422, "Names can be at most 200 characters including the file extension.")
+            return public(app.state.store.update(kind, record_id, name=name))
+
+    def delete_item(kind: str, record_id: str):
+        with app.state.jobs.inspection_lock:
+            if kind == "artifact" and downloads[record_id]:
+                raise HTTPException(409, "Wait for the download to finish before deleting this export.")
+            try:
+                app.state.store.delete_item(kind, record_id)
+            except KeyError as exc:
+                raise HTTPException(404, f"{kind.capitalize()} not found") from exc
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
+            except OSError as exc:
+                raise HTTPException(500, "Could not finish removing the workspace files. Retry deletion.") from exc
+        return Response(status_code=204)
+
+    @app.patch("/api/images/{image_id}")
+    def rename_image(image_id: str, body: RenameItem):
+        return rename_item("image", image_id, body)
+
+    @app.delete("/api/images/{image_id}", status_code=204)
+    def delete_image(image_id: str):
+        return delete_item("image", image_id)
+
+    @app.patch("/api/artifacts/{artifact_id}")
+    def rename_artifact(artifact_id: str, body: RenameItem):
+        return rename_item("artifact", artifact_id, body)
+
+    @app.delete("/api/artifacts/{artifact_id}", status_code=204)
+    def delete_artifact(artifact_id: str):
+        return delete_item("artifact", artifact_id)
+
     @app.get("/api/images")
-    def images():
-        return [public(item) for item in app.state.store.list("image")]
+    def images(request: Request):
+        return inventory_response("image", request)
 
     @app.get("/api/oci/catalog")
     def get_oci_catalog():
@@ -286,6 +364,8 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
             raise HTTPException(410, "The source file is no longer present. Import the image again.")
         try:
             job = app.state.jobs.inspect_image(image)
+        except KeyError as exc:
+            raise HTTPException(404, "Image not found") from exc
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
         return {"image_id": image["id"], "job_id": job["id"]}
@@ -375,27 +455,40 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
         return {"job_id": job["id"]}
 
     @app.get("/api/jobs")
-    def jobs():
-        return app.state.store.list("job")
+    def jobs(request: Request):
+        return inventory_response("job", request)
 
     @app.get("/api/jobs/{job_id}")
     def job_detail(job_id: str):
         return get_record("job", job_id)
 
     @app.get("/api/artifacts")
-    def artifacts():
-        return [public(item) for item in app.state.store.list("artifact")]
+    def artifacts(request: Request):
+        return inventory_response("artifact", request)
 
     @app.get("/api/artifacts/{artifact_id}")
     def artifact_detail(artifact_id: str):
         return public(get_record("artifact", artifact_id))
 
+    def download_record(artifact_id: str):
+        # A request-scoped dependency holds a read claim through FileResponse's
+        # final chunk (including range requests, exceptions and disconnects).
+        with app.state.jobs.inspection_lock:
+            artifact = get_record("artifact", artifact_id)
+            downloads[artifact_id] += 1
+        try:
+            yield artifact
+        finally:
+            with app.state.jobs.inspection_lock:
+                downloads[artifact_id] -= 1
+                if not downloads[artifact_id]:
+                    del downloads[artifact_id]
+
     @app.get("/api/artifacts/{artifact_id}/download")
-    def download_artifact(artifact_id: str):
-        artifact = get_record("artifact", artifact_id)
+    def download_artifact(artifact: dict = Depends(download_record)):
         if not Path(artifact["path"]).is_file():
             raise HTTPException(410, "The artifact file is no longer present")
-        return FileResponse(artifact["path"], media_type="application/octet-stream", filename=artifact["name"])
+        return FileResponse(artifact["path"], media_type="application/octet-stream", filename=artifact_name(artifact))
 
     @app.get("/api/artifacts/{artifact_id}/manifest")
     def artifact_manifest(artifact_id: str):
@@ -403,23 +496,30 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
         return JSONResponse(artifact, headers={"Content-Disposition": f'attachment; filename="forge-{artifact_id}.json"'})
 
     @app.get("/api/artifacts/{artifact_id}/oci-bundle")
-    def oci_bundle(artifact_id: str):
-        artifact = get_record("artifact", artifact_id)
+    def oci_bundle(artifact_id: str, artifact: dict = Depends(download_record)):
         path = artifact.get("oci_bundle_path")
         if not path:
             raise HTTPException(404, "This artifact has no OCI capability configuration")
         if not Path(path).is_file():
             raise HTTPException(410, "OCI configuration file is no longer present")
-        return FileResponse(path, media_type="application/zip", filename=f"oci-configuration-{artifact_id[:8]}.zip")
+        filename = f"oci-configuration-{artifact_id[:8]}.zip"
+        original = artifact.get("filename") or Path(artifact["path"]).name
+        name = artifact_name(artifact)
+        if name != original:
+            from .oci import renamed_bundle
+            return Response(renamed_bundle(Path(path), name), media_type="application/zip",
+                            headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+        return FileResponse(path, media_type="application/zip", filename=filename)
 
     @app.post("/api/artifacts/{artifact_id}/upload", status_code=202)
     def upload_artifact(artifact_id: str, location: ObjectLocation):
         queue_capacity()
-        artifact = get_record("artifact", artifact_id)
         transfers.validate_location(location.model_dump(), settings, s3_only=True)
-        if not Path(artifact["path"]).is_file():
-            raise HTTPException(410, "The artifact file is no longer present")
-        job = app.state.jobs.upload(artifact, location.model_dump())
+        with app.state.jobs.inspection_lock:
+            artifact = get_record("artifact", artifact_id)
+            if not Path(artifact["path"]).is_file():
+                raise HTTPException(410, "The artifact file is no longer present")
+            job = app.state.jobs.upload(artifact, location.model_dump())
         return {"job_id": job["id"]}
 
     static = Path(__file__).parent / "static"

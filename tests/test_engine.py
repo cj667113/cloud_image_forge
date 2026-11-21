@@ -1,5 +1,6 @@
 """Safety invariants and conversion orchestration; no libguestfs installation needed."""
 from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -156,12 +157,17 @@ class InspectionTests(unittest.TestCase):
                     patch("forge.systemd.inspect_systemd", return_value=systemd) as systemd_scan, \
                     patch("forge.oci_guest.inspect_guest", return_value={}) as oci:
                 result = ImageEngine().inspect(source)
+                events.clear()
+                working = ImageEngine().inspect(source, include_editor=False)
             self.assertEqual(events, ["boot", "root"])
             self.assertEqual(result["boot"], boot)
             self.assertEqual(result["systemd"], systemd)
             self.assertEqual(result["services"], [])
             systemd_scan.assert_called_once_with(g)
-            oci.assert_called_once_with(g, "/dev/sda2", [], [], boot=boot)
+            self.assertEqual(oci.call_count, 2)
+            oci.assert_called_with(g, "/dev/sda2", [], [], boot=boot)
+            self.assertEqual(working, {key: value for key, value in result.items()
+                                       if key not in {"files", "services", "systemd"}})
 
 
 class FstabTests(unittest.TestCase):
@@ -304,7 +310,7 @@ class BuildTests(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
     def test_mount_failure_blocks_artifact_conversion_and_preserves_source(self):
-        def reject(work, receipt):
+        def reject(work, receipt, *, inspection):
             self.assertFalse((work.parent / "image.qcow2").exists())
             self.assertEqual((work.parent.parent / "source.qcow2").read_bytes(), qcow_header())
             return {"ready": False, "blockers": ["Root UUID changed unexpectedly"]}
@@ -321,8 +327,9 @@ class BuildTests(unittest.TestCase):
             {**common, "boot_reference_check_required": False}]
         self.verify_mount_boot_references.return_value = {"ready": False, "blockers": ["Stale initramfs root selector"]}
         with self.assertRaisesRegex(EngineError, "Final boot mount verification.*Stale initramfs"):
-            self.run_build()
+            self.run_build(extra_recipe={"files": [{"path": "/etc/crontab", "content": "# edited\n"}]})
         receipt = self.verify_mount_boot_references.call_args.args[1]
+        self.assertEqual(self.reconcile_mounts.call_count, 2)
         self.assertTrue(receipt["boot_reference_check_required"])
         self.assertEqual(receipt["changes"][0]["from"], "UUID=stale")
 
@@ -455,6 +462,52 @@ class BuildTests(unittest.TestCase):
                 self.assertEqual(len(conversions), 2 if final_ready else 1)
                 self.assertEqual(source.read_bytes(), original)
 
+    def test_combined_preparation_passes_pending_receipt_and_revalidates_after_later_writes(self):
+        from forge.oci import OciConfig
+        for sparsify in (False, True):
+            with self.subTest(sparsify=sparsify):
+                info = inspection()
+                pending = {"version": 1, "test_pending": True}
+                completed = {"warnings": [], "combined_platform": True, "combined_verified": True,
+                             "verified_initrds": {"test": {"sha256": "a" * 64}}, "_inspection": info}
+                plan = {"requested": True, "ready": True, "blockers": [], "warnings": [], "required_modules": ["ahci"]}
+                recipe = {"target": "oci", "oci": OciConfig().model_dump(), "sparsify": sparsify,
+                          "platform_migration": {"enabled": True, "strategy": "reconfigure", "source": "unknown", "target": "vm",
+                                                 "boot_attachment": "paravirtualized", "network_attachment": "paravirtualized"}}
+                with patch("forge.platform.plan_platform", return_value=plan), \
+                        patch("forge.platform.prepare_platform", return_value={"warnings": [], "deferred_initramfs": pending, "_inspection": info}) as hardware, \
+                        patch("forge.platform.verify_platform", return_value={"ready": True, "blockers": []}), \
+                        patch("forge.oci.compatibility_plan", return_value={"blockers": []}), \
+                        patch("forge.oci_guest.prepare_guest", return_value=completed) as provider, \
+                        patch("forge.oci_guest.verify_shared_preparation", return_value={"ready": True, "blockers": []}) as verify:
+                    result, commands = self.run_build(extra_recipe=recipe)
+                self.assertTrue(hardware.call_args.kwargs["defer_initramfs_to_oci"])
+                self.assertIs(provider.call_args.kwargs["deferred_platform"], pending)
+                self.assertEqual(provider.call_args.kwargs["extra_required_modules"], ["ahci"])
+                verify.assert_called_once()
+                self.assertIs(verify.call_args.args[3], completed)
+                self.assertEqual(any(command[0] == "virt-sparsify" for command in commands), sparsify)
+                self.assertEqual(result["format"], "qcow2")
+
+    def test_incomplete_or_invalidated_combined_preparation_cannot_publish(self):
+        from forge.oci import OciConfig
+        for complete in (False, True):
+            with self.subTest(complete=complete):
+                plan = {"requested": True, "ready": True, "blockers": [], "warnings": [], "required_modules": ["ahci"]}
+                receipt = {"warnings": [], "combined_platform": True, "combined_verified": complete,
+                           "verified_initrds": {"test": {"sha256": "a" * 64}}}
+                with patch("forge.platform.plan_platform", return_value=plan), \
+                        patch("forge.platform.prepare_platform", return_value={"warnings": [], "deferred_initramfs": {"pending": True}}), \
+                        patch("forge.platform.verify_platform", return_value={"ready": True, "blockers": []}), \
+                        patch("forge.oci.compatibility_plan", return_value={"blockers": []}), \
+                        patch("forge.oci_guest.prepare_guest", return_value=receipt), \
+                        patch("forge.oci_guest.verify_shared_preparation", return_value={"ready": False, "blockers": ["Archive digest changed"]}) as verify:
+                    with self.assertRaisesRegex(EngineError, "Archive digest changed" if complete else "not completed"):
+                        self.run_build(extra_recipe={"target": "oci", "oci": OciConfig().model_dump(),
+                            "platform_migration": {"enabled": True, "strategy": "reconfigure", "source": "unknown", "target": "vm",
+                                                   "boot_attachment": "paravirtualized", "network_attachment": "paravirtualized"}})
+                    self.assertEqual(verify.call_count, 1 if complete else 0)
+
     def run_build(self, *, output_format="qcow2", compare_failure=False, virtual_size=10 * GIB,
                   guest_arch="x86_64", architecture_change=False, mount_policy="auto", extra_recipe=None):
         temp = tempfile.TemporaryDirectory()
@@ -500,7 +553,7 @@ class BuildTests(unittest.TestCase):
     def test_labels_policy_is_carried_through_reconciliation_and_published_receipt(self):
         result, commands = self.run_build(mount_policy="labels")
         self.assertEqual(result["mount_reconciliation"]["policy"], "labels")
-        self.assertEqual(len(self.reconcile_mounts.call_args_list), 2)
+        self.assertEqual(self.reconcile_mounts.call_count, 1)
         self.assertTrue(all(call.args[2] == "labels" for call in self.reconcile_mounts.call_args_list))
         self.verify_mounts.assert_called_once()
         self.assertTrue(any(command[:2] == ["qemu-img", "compare"] for command in commands))
@@ -569,7 +622,8 @@ class BuildTests(unittest.TestCase):
     def test_oci_archive_wraps_the_checked_qcow2_and_publishes_verified_metadata(self):
         import tarfile
         recipe = {"target": "oci", "oci": {"guest": {"prepare": False}, "import_options": {
-            "operating_system": "Ubuntu", "operating_system_version": "26.04.1"}}}
+            "operating_system": "Ubuntu", "operating_system_version": "26.04.1",
+            "shape_compatibility": [{"shape": "VM.Standard.E5.Flex", "max_ocpus": 8}]}}}
         def prepared(work, inspected, *args, **kwargs):
             return {"_inspection": inspected, "warnings": []}
         with patch("forge.oci.compatibility_plan", return_value={"blockers": []}), \
@@ -578,6 +632,8 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(result["filename"], "image.oci")
         self.assertEqual(result["format"], "oci")
         self.assertTrue(result["oci_archive"]["verified"])
+        with Path(result["artifact_path"]).open("rb") as archive_bytes:
+            self.assertEqual(result["sha256"], hashlib.file_digest(archive_bytes, "sha256").hexdigest())
         self.assertFalse(any("metadata is not bundled" in warning for warning in result["warnings"]))
         self.assertTrue(any(command[:2] == ["qemu-img", "check"] and command[-1].endswith("archive-disk.qcow2") for command in commands))
         self.assertTrue(any(command[:2] == ["qemu-img", "compare"] and command[-1].endswith("archive-disk.qcow2") for command in commands))
@@ -586,6 +642,13 @@ class BuildTests(unittest.TestCase):
             self.assertEqual(archive.extractfile("output.QCOW2").read(), qcow_header())
             metadata = json.load(archive.extractfile("image_metadata.json"))
             self.assertEqual(metadata["operatingSystem"], "Ubuntu")
+        from forge.oci import OciConfig, bundle_files
+        shapes = {entry["internalShapeName"]: entry["ocpuConstraints"] for entry in metadata["additionalMetadata"]["shapeCompatibilities"]}
+        self.assertEqual(set(shapes), {f"VM.Standard.E{generation}.Flex" for generation in (4, 5, 6)})
+        self.assertTrue(all(bounds["max"] == 8 for bounds in shapes.values()))
+        companion = bundle_files(OciConfig.model_validate(recipe["oci"]), result)
+        rows = json.loads(companion["shape-compatibility.json"])["entries"]
+        self.assertEqual({row["shapeName"]: row["ocpuConstraints"] for row in rows}, shapes)
         self.assertFalse((Path(result["artifact_path"]).parent / "archive-disk.qcow2").exists())
 
     def test_failed_qcow_comparison_never_packages_an_oci_archive(self):
@@ -675,3 +738,27 @@ def test_automatic_resize_rejected_before_guest_or_qemu_execution():
         with __import__('pytest').raises(EngineError,match='overlap'):
             _validate_recipe({'storage_resize':options('/dev/sda2',1024)},image())
     run.assert_not_called();guest.assert_not_called()
+
+
+def test_gcp_archive_preserves_sparse_disk_extents_and_virtual_size(tmp_path):
+    import shutil
+    import subprocess
+    import tarfile
+    from forge.engine import _package_gcp
+
+    disk = tmp_path / "disk.raw"
+    with disk.open("wb") as stream:
+        stream.write(b"partition table")
+        stream.seek(8 * MIB)
+        stream.write(b"last sector")
+    archive_path = tmp_path / "image.tar.gz"
+    _package_gcp(archive_path, disk, lambda _: None)
+    with tarfile.open(archive_path, "r:gz") as archive:
+        assert archive.getnames() == ["disk.raw"]
+        member = archive.getmember("disk.raw")
+        assert member.size == disk.stat().st_size
+        with archive.extractfile(member) as archived, disk.open("rb") as original:
+            assert hashlib.file_digest(archived, "sha256").digest() == hashlib.file_digest(original, "sha256").digest()
+        tar = shutil.which("gtar") or shutil.which("tar")
+        if tar and "GNU tar" in subprocess.check_output([tar, "--version"], text=True) and disk.stat().st_blocks * 512 < member.size:
+            assert member.sparse

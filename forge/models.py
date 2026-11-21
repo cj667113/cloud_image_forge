@@ -258,7 +258,7 @@ class PlatformPlanRequest(StrictModel):
 class DestinationSelection(StrictModel):
     profile_id: str = Field(min_length=1, max_length=160, pattern=r"^[A-Za-z0-9:_.-]+$")
     source: Literal["unknown", "vm", "bare_metal"] = "unknown"
-    strategy: Literal["reconfigure", "preserve"] = "reconfigure"
+    strategy: Literal["auto", "reconfigure", "preserve"] = "auto"
     nic_driver: Literal["auto", "ixgbe", "ixgbevf", "i40e", "iavf", "mlx4_en", "mlx5_core", "bnxt_en"] | None = None
 
 

@@ -6,7 +6,7 @@ from pathlib import Path
 from threading import RLock
 
 from .config import Settings
-from .store import Store, now
+from .store import Store, artifact_name, now
 from . import transfers
 
 
@@ -113,12 +113,13 @@ class Jobs:
                         "capability_count": len(config.capabilities),
                         "schema_version": config.global_schema_version,
                         "guest_preparation": config.guest.prepare,
+                        "compatible_shape_count": len((result.get("shape_compatibility_resolution") or {}).get("effective_shapes", config.import_options.shape_compatibility)),
                         "cloud_boot_tested": False,
                     }}
                     log("OCI import, capability schema, launch options and shape configuration are ready to download")
                 # Publish only complete, verified output. Keep the original recipe for reproducibility.
                 artifact = self.store.create("artifact", **result, name=result.get("filename", artifact_path.name),
-                                             path=str(artifact_path), image_id=image["id"], target=recipe["target"],
+                                             path=str(artifact_path), image_id=image["id"], source_name=image.get("name"), target=recipe["target"],
                                              size=artifact_path.stat().st_size, recipe=recipe, **oci_data)
                 log("Artifact verified and ready to download")
                 return {"artifact_id": artifact["id"]}
@@ -129,7 +130,8 @@ class Jobs:
 
     def upload(self, artifact: dict, location: dict):
         return self.submit("upload", lambda log: transfers.upload(location, Path(artifact["path"]), self.settings, log),
-                           image_id=artifact["image_id"], artifact_id=artifact["id"])
+                           image_id=artifact["image_id"], artifact_id=artifact["id"],
+                           source_name=artifact.get("source_name"), artifact_name=artifact_name(artifact))
 
     def close(self):
         self.executor.shutdown(wait=True, cancel_futures=True)

@@ -33,8 +33,8 @@ def execution_capability(arch):
             "guest_commands": reason is None, "reason": reason}
 
 
-def customization_requires_execution(recipe):
-    ssh_access = recipe.get("ssh_access") or {}
+def customization_requires_execution(recipe, *, include_ssh=True):
+    ssh_access = (recipe.get("ssh_access") or {}) if include_ssh else {}
     return bool(any(recipe.get(key) for key in (
         "packages_install", "packages_remove", "services", "kernel_default", "rebuild_initramfs", "regenerate_grub"))
         or ssh_access.get("disable_password_auth") or ssh_access.get("users")

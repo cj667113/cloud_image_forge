@@ -474,6 +474,41 @@ def _merge_mount_receipts(previous, current):
     return result
 
 
+def _package_gcp(output, conversion, log):
+    tar = shutil.which("gtar") or shutil.which("tar")
+    if tar and "GNU tar" in _run([tar, "--version"]):
+        # Keep holes from qemu-img's sparse RAW output. A large empty
+        # region needs only an extent in the provider's oldgnu archive.
+        _run([tar, "--format=oldgnu", "--sparse", "-czf", str(output),
+              "-C", str(conversion.parent), "disk.raw"], log)
+    else:
+        with tarfile.open(output, "w:gz", format=tarfile.GNU_FORMAT) as archive:
+            archive.add(conversion, arcname="disk.raw", recursive=False)
+
+
+def _inspect_editor(g):
+    """Collect wizard-only files and unit dependencies during source inspection."""
+    files = {}
+    editable = list(CONFIG_FILES)
+    for directory, suffix in (("/etc/cron.d", ""), ("/etc/systemd/system", ".service")):
+        if g.is_dir(directory):
+            editable.extend(f"{directory}/{name}" for name in g.ls(directory)
+                            if name.endswith(suffix) and _allowed_file(f"{directory}/{name}"))
+    for filename in editable:
+        if g.is_file(filename) and not g.is_symlink(filename) and g.filesize(filename) <= MIB:
+            value = g.read_file(filename)
+            files[filename] = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+        elif filename in CONFIG_FILES:
+            files[filename] = ""
+    services = set()
+    for directory in ("/usr/lib/systemd/system", "/lib/systemd/system", "/etc/systemd/system"):
+        if g.is_dir(directory):
+            services.update(name for name in g.ls(directory) if SERVICE.fullmatch(name))
+    from .systemd import inspect_systemd
+    systemd = inspect_systemd(g)
+    return {"files": files, "services": sorted(services), "systemd": systemd}
+
+
 class ImageEngine:
     def capabilities(self) -> dict:
         missing = [name for name in TOOLS if not shutil.which(name)]
@@ -488,7 +523,7 @@ class ImageEngine:
                 "kvm": os.access("/dev/kvm", os.R_OK | os.W_OK),
                 "resize": "Partition and LVM growth, offline ext2/3/4 shrink, and a validated filesystem rebuild for supported GPT/UEFI XFS and LVM layouts."}
 
-    def inspect(self, path: Path) -> dict:
+    def inspect(self, path: Path, *, include_editor=True) -> dict:
         path = Path(path)
         fmt = _input_format(path)
         path = path.resolve()
@@ -521,24 +556,7 @@ class ImageEngine:
                     partition["used"] = (stats["blocks"] - stats["bfree"]) * stats["frsize"]
                     partition["free"] = stats["bavail"] * stats["frsize"]
                 partitions.append(partition)
-            files = {}
-            editable = list(CONFIG_FILES)
-            for directory, suffix in (("/etc/cron.d", ""), ("/etc/systemd/system", ".service")):
-                if g.is_dir(directory):
-                    editable.extend(f"{directory}/{name}" for name in g.ls(directory)
-                                    if name.endswith(suffix) and _allowed_file(f"{directory}/{name}"))
-            for filename in editable:
-                if g.is_file(filename) and not g.is_symlink(filename) and g.filesize(filename) <= MIB:
-                    value = g.read_file(filename)
-                    files[filename] = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
-                elif filename in CONFIG_FILES:
-                    files[filename] = ""
-            services = set()
-            for directory in ("/usr/lib/systemd/system", "/lib/systemd/system", "/etc/systemd/system"):
-                if g.is_dir(directory):
-                    services.update(name for name in g.ls(directory) if SERVICE.fullmatch(name))
-            from .systemd import inspect_systemd
-            systemd = inspect_systemd(g)
+            editor = _inspect_editor(g) if include_editor else {}
             os_info = {"name": g.inspect_get_product_name(root), "distro": g.inspect_get_distro(root),
                        "arch": architecture, "root": root}
             kernels = sorted(g.glob_expand("/boot/vmlinuz-*"))
@@ -556,8 +574,8 @@ class ImageEngine:
             ssh_access = inspect_access(g)
         return {"format": fmt, "virtual_size": info["virtual-size"],
                 "actual_size": path.stat().st_size, "allocated_size": info.get("actual-size"),
-                "os": os_info, "execution": execution_capability(architecture), "partitions": partitions, "files": files,
-                "services": sorted(services), "systemd": systemd, "kernels": kernels, "oci_evidence": oci_evidence, "boot": boot,
+                "os": os_info, "execution": execution_capability(architecture), "partitions": partitions, **editor,
+                "kernels": kernels, "oci_evidence": oci_evidence, "boot": boot,
                 "uefi_migration": {"version": 1, "layout": migration_layout, "guest": migration_guest},
                 "storage": storage, "platform": platform, "ssh_access": ssh_access,
                 "mount_reconciliation": platform.get("fstab"),
@@ -714,7 +732,8 @@ class ImageEngine:
                 raise EngineError("OCI preparation blocked: " + " ".join(preflight["blockers"]))
             if recipe.get("output_format") == "oci":
                 from .oci_archive import image_metadata
-                image_metadata(oci_config, inspection)
+                image_metadata(oci_config, inspection,
+                               shape_resolution=preflight.get("shape_compatibility_resolution"))
         if not self.capabilities()["available"]:
             raise EngineError("Image tools are unavailable. Run the supplied Linux Docker container.")
         destination_dir.mkdir(parents=True, exist_ok=True)
@@ -738,43 +757,57 @@ class ImageEngine:
         log("Creating an independent QCOW2 working copy; source remains unchanged")
         _run(["qemu-img", "convert", "-f", fmt, "-O", "qcow2", str(source), str(work)], log)
         initial_mount_receipt = reconcile_mounts(work, inspection, mount_policy, log)
-        resize_inspection = self.inspect(work) if storage_plan["requested"] and initial_mount_receipt["changed"] else inspection
+        resize_inspection = self.inspect(work, include_editor=False) if storage_plan["requested"] and initial_mount_receipt["changed"] else inspection
         from .storage import normalize_rebuild_boot_references
         storage_boot_receipt = normalize_rebuild_boot_references(
             work, resize_inspection, storage_plan.get("projected_boot_updates", []), log)
         if storage_boot_receipt["changed"]:
-            resize_inspection = self.inspect(work)
+            resize_inspection = self.inspect(work, include_editor=False)
+        before_resize = work
         work = self._resize(work, destination_dir, resize_inspection, recipe, log)
         edit_mount_receipt = self._customize(work, resize_inspection, recipe, log)
         mount_receipt = initial_mount_receipt
         if isinstance(edit_mount_receipt, dict):
             mount_receipt = _merge_mount_receipts(mount_receipt, edit_mount_receipt)
-        mount_receipt = _merge_mount_receipts(mount_receipt, reconcile_mounts(work, resize_inspection, mount_policy, log))
+        if (work != before_resize or storage_boot_receipt["changed"] or recipe.get("files")
+                or customization_requires_execution(recipe, include_ssh=False)):
+            # Package scripts, edits and filesystem changes may have altered mounts.
+            mount_receipt = _merge_mount_receipts(mount_receipt, reconcile_mounts(work, resize_inspection, mount_policy, log))
         warnings.extend(mount_receipt.get("warnings", []))
+        prepared_inspection = None
         if migration_plan["requested"]:
-            customized = self.inspect(work)
+            customized = self.inspect(work, include_editor=False)
             migration = migrate(work, customized, migration_options, recipe.get("allow_network", False), log)
             migration_plan = migration["plan"]
             warnings.extend(migration["warnings"])
-            mount_receipt = _merge_mount_receipts(mount_receipt, reconcile_mounts(work, customized, mount_policy, log))
+            reconciled = reconcile_mounts(work, customized, mount_policy, log)
+            mount_receipt = _merge_mount_receipts(mount_receipt, reconciled)
+            if not reconciled["changed"]:
+                prepared_inspection = migration["inspection"]
         platform_receipt = None
-        prepared_inspection = None
         if platform_plan["requested"]:
             # Preservation starts after the user's explicit storage/kernel/file
             # edits. It never substitutes planned readiness for this inspection.
-            customized = self.inspect(work)
+            log("Checking the working disk against the hardware profile")
+            customized = prepared_inspection if prepared_inspection is not None else self.inspect(work, include_editor=False)
             platform_receipt = prepare_platform(work, customized, platform_options, recipe.get("allow_network", False), log,
-                                                oci_config=recipe.get("oci"), target_provider=target, mount_policy=mount_policy)
+                                                oci_config=recipe.get("oci"), target_provider=target, mount_policy=mount_policy,
+                                                inspected_work=True,
+                                                defer_initramfs_to_oci=bool(oci_config and oci_config.guest.prepare))
             prepared_inspection = platform_receipt.pop("_inspection", None)
             warnings.extend(platform_receipt["warnings"])
         if oci_config is not None:
             from .oci_guest import prepare_guest
             # Manual package/configuration edits may invalidate the original evidence.
-            customized = prepared_inspection if prepared_inspection is not None else self.inspect(work)
+            log("Checking the working disk against OCI image requirements")
+            customized = prepared_inspection if prepared_inspection is not None else self.inspect(work, include_editor=False)
             preparation = prepare_guest(work, customized, oci_config.model_dump(),
                                         recipe.get("allow_network", False), log,
                                         extra_required_modules=platform_plan.get("required_modules", []) if platform_plan["requested"] else (),
-                                        platform_migration=platform_options, mount_policy=mount_policy)
+                                        platform_migration=platform_options, mount_policy=mount_policy,
+                                        deferred_platform=(platform_receipt or {}).get("deferred_initramfs"))
+            if (platform_receipt or {}).get("deferred_initramfs") and not preparation.get("combined_verified"):
+                raise EngineError("Deferred hardware initramfs preparation was not completed and verified by OCI preparation.")
             prepared_inspection = preparation.pop("_inspection", None)
             warnings.extend(preparation["warnings"])
             if platform_plan["requested"] and preparation.get("verified_initrds"):
@@ -784,27 +817,26 @@ class ImageEngine:
         if ssh_requested(recipe.get("ssh_access")):
             # Authentication settings are explicit user edits and must follow
             # cloud/provider preparation, which can rewrite cloud-init policy.
-            customized = prepared_inspection if prepared_inspection is not None else self.inspect(work)
+            customized = prepared_inspection if prepared_inspection is not None else self.inspect(work, include_editor=False)
             ssh_receipt = apply_access(work, customized, recipe["ssh_access"], log)
             prepared_inspection = None
             warnings.extend(ssh_receipt["warnings"])
             if platform_plan["requested"] and (platform_options or {}).get("strategy") == "preserve":
                 # Re-establish the hardware preservation baseline after these
                 # explicitly requested auth edits, then enforce it at export.
-                customized = self.inspect(work)
+                customized = self.inspect(work, include_editor=False)
                 platform_receipt = prepare_platform(work, customized, platform_options, recipe.get("allow_network", False), log,
-                                                    oci_config=recipe.get("oci"), target_provider=target, mount_policy=mount_policy)
+                                                    oci_config=recipe.get("oci"), target_provider=target, mount_policy=mount_policy,
+                                                    inspected_work=True)
                 prepared_inspection = platform_receipt.pop("_inspection", None)
         if recipe.get("sparsify", True):
             log("Discarding unused guest filesystem blocks")
             _run(["virt-sparsify", "--in-place", "--format", "qcow2", str(work)], log)
             prepared_inspection = None
-        _run(["qemu-img", "check", "-f", "qcow2", str(work)], log)
-        # Reinspection verifies the root filesystem and mounts libguestfs recognizes;
-        # it is not a complete fstab validator or a substitute for a boot test.
+        # Each real working-image inspection includes a QCOW2 consistency check.
         if prepared_inspection is None:
             log("Inspecting the customized guest")
-            result_inspection = self.inspect(work)
+            result_inspection = self.inspect(work, include_editor=False)
         else:
             log("Using the final inspected guest state; no disk changes since preparation")
             result_inspection = prepared_inspection
@@ -820,7 +852,7 @@ class ImageEngine:
             work = self._resize(work, destination_dir, result_inspection,
                                 {"disk_size_gib": rounded / GIB}, log)
             virtual_size = rounded
-            result_inspection = self.inspect(work)
+            result_inspection = self.inspect(work, include_editor=False)
             if normalize_arch(result_inspection.get("os", {}).get("arch")) != normalize_arch(inspection["os"]["arch"]):
                 raise EngineError("Aligned export changed or lost the guest CPU architecture.")
             if result_inspection["virtual_size"] != rounded:
@@ -858,10 +890,18 @@ class ImageEngine:
                                               target_provider=target, receipt=platform_receipt, mount_policy=mount_policy)
             if not platform_result["ready"]:
                 raise EngineError("Final hardware compatibility verification failed: " + " ".join(platform_result["blockers"]))
+            if platform_receipt and platform_receipt.get("combined_platform"):
+                from .oci_guest import verify_shared_preparation
+                shared = verify_shared_preparation(result_inspection, oci_config, platform_options, platform_receipt,
+                                                   mount_policy=mount_policy)
+                if not shared["ready"]:
+                    raise EngineError("Final combined hardware/OCI verification failed: " + " ".join(shared["blockers"]))
         ssh_result = verify_access(work, ssh_receipt)
         if ssh_result is not None and not ssh_result["ready"]:
             raise EngineError("Final SSH access verification failed: " + " ".join(ssh_result["blockers"]))
-        mount_result = verify_mounts(work, mount_receipt)
+        from .storage import plan_mounts
+        final_mounts = plan_mounts(result_inspection, mount_policy, require_original=True)
+        mount_result = verify_mounts(work, mount_receipt, inspection=final_mounts if final_mounts.get("file_state") else None)
         if not mount_result["ready"]:
             raise EngineError("Final mount verification failed: " + " ".join(mount_result["blockers"]))
         boot_mount_result = verify_mount_boot_references(result_inspection, mount_receipt)
@@ -869,6 +909,10 @@ class ImageEngine:
             raise EngineError("Final boot mount verification failed: " + " ".join(boot_mount_result["blockers"]))
         mount_result.update(policy=mount_policy, changes=mount_receipt.get("changes", []),
                             uuid_map=mount_receipt.get("uuid_map", []), boot_references=boot_mount_result)
+        shape_resolution = None
+        if oci_config is not None:
+            from .oci_shapes import resolve_shape_compatibility
+            shape_resolution = resolve_shape_compatibility(result_inspection, oci_config, platform_options)
         filenames = {"qcow2": "image.qcow2", "raw": "image.raw", "vhd": "image.vhd", "gcp": "image.tar.gz", "oci": "image.oci"}
         output = destination_dir / filenames[final_format]
         conversion = (destination_dir / "disk.raw" if final_format == "gcp" else
@@ -895,26 +939,28 @@ class ImageEngine:
         if final_format == "oci":
             from .oci_archive import write_archive
             log("Packaging output.QCOW2 and image_metadata.json as an OCI image archive")
-            archive_receipt = write_archive(output, conversion, oci_config, result_inspection, log)
+            archive_receipt = write_archive(output, conversion, oci_config, result_inspection, log,
+                                            shape_resolution=shape_resolution)
             warnings.extend(archive_receipt.get("warnings", []))
             conversion.unlink()
         elif final_format == "gcp":
             log("Packaging a root-level disk.raw for Google Cloud")
-            with tarfile.open(output, "w:gz", format=tarfile.GNU_FORMAT) as archive:
-                archive.add(conversion, arcname="disk.raw", recursive=False)
+            _package_gcp(output, conversion, log)
             conversion.unlink()
-        log("Calculating artifact SHA-256")
-        digest = hashlib.sha256()
-        with output.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(8 * MIB), b""):
-                digest.update(chunk)
+        if archive_receipt is not None:
+            output_sha256 = archive_receipt["archive_sha256"]
+        else:
+            log("Calculating artifact SHA-256")
+            with output.open("rb") as stream:
+                output_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
         work.unlink()
         return {"artifact_path": str(output), "filename": output.name, "format": final_format,
                 "architecture": normalize_arch(result_inspection["os"]["arch"]),
-                "virtual_size": virtual_size, "sha256": digest.hexdigest(), "warnings": warnings,
+                "virtual_size": virtual_size, "sha256": output_sha256, "warnings": warnings,
                 "boot": result_inspection.get("boot"),
                 "storage_rebuild": storage_result if not (recipe.get("storage_resize") or {}).get("enabled") else None,
                 "storage_resize": storage_result if (recipe.get("storage_resize") or {}).get("enabled") else None,
                 "platform_migration": platform_result, "ssh_access": ssh_result,
                 "mount_reconciliation": mount_result,
+                **({"shape_compatibility_resolution": shape_resolution} if shape_resolution is not None else {}),
                 **({"oci_archive": archive_receipt} if archive_receipt is not None else {})}

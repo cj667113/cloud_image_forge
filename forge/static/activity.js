@@ -33,9 +33,9 @@ function activityLog(job) {
 }
 function activityLatest(job) {
   if (job.status==='queued') return 'Waiting for the image engine';
-  const lines = Array.isArray(job.logs) ? job.logs : [],latest = lines.at(-1);
-  const line = typeof latest==='string' ? latest : latest ? JSON.stringify(latest) : '';
-  return line.replace(/^\d{4}-\d{2}-\d{2}T\S+\s+/, '').slice(0,220) || 'Working on this image';
+  const lines=(Array.isArray(job.logs)?job.logs:[]).map(line=>typeof line==='string'?line:JSON.stringify(line)).map(line=>line.replace(/^\d{4}-\d{2}-\d{2}T\S+\s+/, '').trim()).filter(Boolean).reverse();
+  const phase=lines.find(line=>!/^Running (?:\S*\/)?(?:qemu-img|virt-customize|virt-sparsify|guestfish|tar|gzip|sha256sum)(?:\s|$)/.test(line));
+  return (phase||lines[0]||'Working on this image').slice(0,220);
 }
 function activityText(node, value) {
   const text = String(value ?? '');
@@ -45,8 +45,10 @@ function activityRecord(job, images, artifacts) {
   const artifactId=job.result?.artifact_id || job.artifact_id || null,artifact=artifacts.get(artifactId);
   const imageId=job.image_id || job.result?.image_id || artifact?.image_id,image=images.get(imageId);
   const kind=job.kind==='s3_upload' ? 'upload' : job.kind || 'other';
-  return {job,kind,title:activityKinds[job.kind] || 'Image operation',source:image?.name || artifact?.name || artifact?.filename || 'Source unavailable',
-    imageId:image?.id || null,artifactId,active:['running','queued'].includes(job.status)};
+  const exportName=artifact?.name || job.artifact_name || artifact?.filename;
+  const sourceName=image?.name || artifact?.source_name || job.source_name;
+  return {job,kind,title:activityKinds[job.kind] || 'Image operation',source:(kind==='upload' ? exportName || sourceName : sourceName || exportName) || 'Source unavailable',
+    imageId:image?.id || null,artifactId:artifact?.id || null,active:['running','queued'].includes(job.status)};
 }
 
 function mountActivity() {

@@ -346,6 +346,13 @@ class FakeGuest:
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_early_microcode_listing_is_not_a_kernel_driver_inventory(self):
+        initrd = "/boot/initramfs-" + VERSION + ".img"
+        guest = FakeGuest({initrd: b"placeholder"})
+        with patch.object(guest, "initrd_list", return_value=["./early_cpio", "kernel/x86/microcode"]):
+            info = inspect_guest(guest, "/dev/root", [], ["/boot/vmlinuz-" + VERSION])
+        self.assertIsNone(info["kernels"][VERSION]["initrd_modules"])
+
     def test_installed_iscsi_module_relocation_is_unique_and_bounded(self):
         g = Mock()
         for name in ("74iscsi", "95iscsi"):
@@ -510,7 +517,11 @@ class PreparationTests(unittest.TestCase):
         profile = config(configure_network=False, configure_cloud_init=False)
         g = Mock()
         g.is_symlink.return_value = False
-        g.is_file.return_value = False
+        grub = "/etc/default/grub"
+        existing = 'GRUB_CMDLINE_LINUX="quiet console=tty0 console=ttyAMA0,115200n8"\n'
+        g.is_file.side_effect = lambda path: path == grub
+        g.filesize.return_value = len(existing)
+        g.read_file.return_value = existing.encode()
         @contextmanager
         def guest(*args, **kwargs):
             yield g
@@ -523,6 +534,7 @@ class PreparationTests(unittest.TestCase):
         self.assertIn("serial-getty@ttyAMA0.service", commands)
         self.assertNotIn("ttyS0", commands)
         self.assertEqual(result["architecture"], "aarch64")
+        self.assertNotIn(grub, [call.args[0] for call in g.write.call_args_list])
 
     def test_oci_rebuild_preserves_physical_driver_and_returns_hash_bound_receipt(self):
         image = inspected()
@@ -635,6 +647,19 @@ def test_oci_projects_iscsi_only_after_valid_platform_plan_without_mutating_sour
         assert plan["platform_migration"]["ready"] is ready
         assert any("firmware discovery" in item for item in actual["blockers"])
     assert image == original
+
+
+def test_validate_only_build_never_uses_planned_hardware_changes_as_actual_evidence():
+    image = inspected()
+    image["oci_evidence"]["network_ready"] = False
+    options = {"enabled": True, "target": "vm", "configure_network": True}
+    conf = config(prepare=False)
+    with patch("forge.platform.plan_platform", return_value={"ready": True, "actions": [], "warnings": [],
+                                                            "blockers": [], "required_modules": []}):
+        from forge.oci import compatibility_plan
+        assert compatibility_plan(image, OciConfig.model_validate(conf), platform_migration=options)["ready_to_build"]
+        with unittest.TestCase().assertRaisesRegex(EngineError, "network initialization"):
+            prepare_guest(Path("work.qcow2"), image, conf, False, lambda _: None, platform_migration=options)
 
 
 if __name__ == "__main__":

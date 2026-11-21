@@ -78,22 +78,50 @@ function updateDisclosureSummaries() {
     node.textContent = $$('[data-oci-allowed]',node.closest('details')).filter(input => input.checked).map(input => ociValueLabel(JSON.parse(input.value))).join(', ') || 'None selected';
   });
   const accelerated = $('#oci-accelerated-note'); if (accelerated) { const issue=ociAcceleratedSchemaError(); accelerated.hidden=!ociAcceleratedKeys().length&&$('#oci-launch-mode')?.value!=='ACCELERATEDPV'; accelerated.className=`notice ${issue?'error':'warning'}`; accelerated.textContent=issue||'Accelerated PV requires a supported Acceleron shape and compatible image. Advertised image capabilities must match the regional schema. Validate with an OCI test launch.'; }
+  updateOciShapeResolution();
   const preparation = $('#oci-preparation-summary'); if (preparation) preparation.textContent = $('#oci-prepare').checked ? 'Enabled' : 'Validate only';
 }
 function toast(message) { const node = $('#toast'); node.textContent = message; node.hidden = false; clearTimeout(toast.timer); toast.timer = setTimeout(() => node.hidden = true, 5000); }
 async function api(path, options = {}) {
   const authGeneration = state.authGeneration || 0;
-  const response = await fetch(`/api${path}`, {credentials:'same-origin',...options,headers:{...(options.body && !(options.body instanceof FormData) ? {'Content-Type':'application/json'} : {}),...options.headers}});
+  const conditional=['/images','/jobs','/artifacts'].includes(path)&&(!options.method||options.method.toUpperCase()==='GET');
+  const records=state.listValidators ||= {},cached=conditional&&records[path]?.authGeneration===authGeneration?records[path]:null;
+  const response = await fetch(`/api${path}`, {credentials:'same-origin',...options,headers:{...(cached?.etag?{'If-None-Match':cached.etag}:{}),...(options.body && !(options.body instanceof FormData) ? {'Content-Type':'application/json'} : {}),...options.headers}});
+  if(response.status===304) {
+    if(authGeneration!==state.authGeneration)return api(path,options);
+    if(cached)return cached.value;
+    throw new Error('The server returned unchanged data without a cached workspace list. Refresh the workspace.');
+  }
   if (response.status === 401) {
     // Startup reads may finish after a new session was established. Retry them with that session.
     if (authGeneration !== state.authGeneration && ['GET','HEAD'].includes((options.method||'GET').toUpperCase())) return api(path,options);
     if (authGeneration === state.authGeneration) { state.authPending = true; if (!$('#auth-dialog').open) $('#auth-dialog').showModal(); }
     throw new Error('Connect with your server access token to continue.');
   }
-  if (!response.ok) { let detail; try { detail = (await response.json()).detail; } catch { /* plain response */ } if (Array.isArray(detail)) detail = detail.map(item => `${item.loc?.slice(1).join('.') || 'Request'}: ${item.msg}`).join('; '); throw new Error(typeof detail === 'string' ? detail : `Request failed (${response.status}).`); }
+  if (!response.ok) { let detail; try { detail = (await response.json()).detail; } catch { /* plain response */ } if (Array.isArray(detail)) detail = detail.map(item => `${item.loc?.slice(1).join('.') || 'Request'}: ${item.msg}`).join('; '); throw Object.assign(new Error(typeof detail === 'string' ? detail : `Request failed (${response.status}).`), {status:response.status}); }
   if (response.status === 204) return null;
-  return response.json();
+  const value=await response.json();
+  if(conditional&&authGeneration===state.authGeneration) { const etag=response.headers.get('ETag');if(etag)records[path]={authGeneration,etag,value};else delete records[path]; }
+  return value;
 }
+function previewContextKey(imageId=state.selected) {
+  const image=state.images.find(item=>item.id===imageId);
+  return JSON.stringify([state.authGeneration,imageId,image?.inspected_at,image?.inspection_status,image?.inspection,state.health?.engine,state.health?.limits]);
+}
+async function requestPreview(kind,body,reuse=false) {
+  const imageId=state.selected,revision=state.editorRevision,context=previewContextKey(imageId),signature=JSON.stringify(body),session=studioSession();
+  const cache=session.previews ||= {},pending=session.previewRequests ||= {},previous=cache[kind],image=studioImage();
+  const reusable=reuse&&!state.authPending&&!state.authLoading&&image?.status==='ready'&&!wizardInspectionPending();
+  if(reusable&&previous?.context===context&&previous.signature===signature&&Date.now()-previous.checkedAt<60000)return previous.plan;
+  if(reusable&&pending[kind]?.context===context&&pending[kind].signature===signature)return pending[kind].promise;
+  const entry={context,signature,promise:api(`/images/${encodeURIComponent(imageId)}/${kind}/plan`,{method:'POST',body:signature})};pending[kind]=entry;
+  try {
+    const plan=await entry.promise;
+    if(pending[kind]===entry&&state.selected===imageId&&state.editorRevision===revision&&previewContextKey(imageId)===context)cache[kind]={context,signature,checkedAt:Date.now(),plan};
+    return plan;
+  } finally { if(pending[kind]===entry)delete pending[kind]; }
+}
+
 function setView(view) {
   if (!['images','jobs','artifacts'].includes(view)) view = 'images';
   if (state.view==='jobs' && view!=='jobs') captureActivityView();
@@ -146,7 +174,7 @@ function bootSummary(inspection, location) {
   return `<div class="boot-card ${mode === 'unknown' || mode === 'missing' ? 'boot-uncertain' : ''}" data-boot-summary="${esc(location)}"><div class="boot-card-heading"><div class="boot-card-title"><span class="boot-icon">${icon('settings')}</span><div><span class="eyebrow">DETECTED BOOT SUPPORT</span><h3>${esc(bootModeLabel(boot))}</h3></div></div><button type="button" class="button secondary small" data-action="refresh-inspection" aria-label="Refresh inspection" title="Refresh source inspection"${refreshing ? ' disabled' : ''}>${icon('refresh')}${refreshing ? 'Refreshing…' : 'Refresh'}</button></div>${refreshNotice}${['missing','dual','unknown'].includes(mode) ? `<p class="boot-description">${esc(message)}</p>` : ''}${boot ? `<p class="boot-scope">Detected offline · boot not verified. ${helpHint("Detection checks installed boot files and disk structures. It does not identify the last VM firmware or prove the image boots.","About boot detection")}</p><details class="boot-evidence"><summary>Detection evidence</summary><div class="details-content"><dl class="detail-list"><div><dt>Partition table</dt><dd>${esc(boot.partition_table || 'Unknown')}</dd></div><div><dt>Supported firmware</dt><dd>${esc((boot.supported_firmware || []).join(', ') || 'Not established')}</dd></div><div><dt>Recommended firmware</dt><dd>${esc(boot.recommended_firmware || (mode === 'dual' ? 'Choose a firmware mode' : 'Not established'))}</dd></div></dl>${evidence.length ? `<ul>${evidence.map(item => `<li>${esc(item)}</li>`).join('')}</ul>` : '<p class="field-help">No detailed boot evidence was recorded.</p>'}${boot.bios_evidence?.length ? `<h4>Legacy BIOS evidence</h4><ul>${boot.bios_evidence.map(item => `<li>${esc(item)}</li>`).join('')}</ul>` : ''}${rows ? `<h4>EFI boot loaders</h4><div class="table-wrap"><table><thead><tr><th>Device</th><th>Loader</th><th>Architecture</th><th>Fallback path</th></tr></thead><tbody>${rows}</tbody></table></div>` : ''}${(boot.warnings || []).map(warning => `<div class="notice warning">${esc(warning)}</div>`).join('')}</div></details>` : '<p class="boot-scope">Source and draft preserved.</p>'}</div>`;
 }
 function captureEditorDraft() {
-  const form = $('#recipe-form'); if (!form) return;
+  const form = $('#recipe-form'); if (!form || !state.images.some(image => image.id === form.dataset.imageId)) return;
   captureSystemdExplorerState(form.dataset.imageId);
   const fields = [];
   for (const node of $$('input,select,textarea',form)) {
@@ -184,6 +212,7 @@ function restoreEditorDraft(draft) {
   if(legacyMountPolicy&&!draft.fields.some(item=>item.key[0]==='id'&&item.key[1]==='mount-policy'))$('#mount-policy').value=legacyMountPolicy.checked?'auto':'preserve';
   if(!draft.fields.some(item=>item.key[0]==='id'&&item.key[1]==='destination-profile'))$('#destination-profile').value='custom';
   if(!draft.fields.some(item=>item.key[0]==='id'&&item.key[1]==='platform-strategy'))$('#platform-strategy').value='reconfigure';
+  if(!draft.fields.some(item=>item.key[0]==='id'&&item.key[1]==='oci-shape-mode'))$('#oci-shape-mode').value='manual';
   $('#oci-schema-status').textContent = state.ociLoadedSchema ? 'Current OCI schema loaded' : 'Bundled catalog';
   $$('details[data-disclosure]').forEach(node => { if (node.dataset.disclosure in (draft.disclosures || {})) node.open = draft.disclosures[node.dataset.disclosure]; });
   setTab(draft.tab);
@@ -209,25 +238,50 @@ async function refreshInspection() {
   try {
     const result = await api(`/images/${encodeURIComponent(imageId)}/inspect`,{method:'POST'});
     toast('Refreshing source inspection. Your customization draft is preserved.');
-    await refresh();
+    await refresh({supersede:true});
     return result;
   } catch (error) { notice('#global-error',errorText(error)); }
   finally { state.inspectionRefreshing = null; const pending = ['queued','running'].includes(state.images.find(image => image.id === state.selected)?.inspection_status); $$('[data-action="refresh-inspection"]').forEach(button => button.disabled = pending); }
 }
 
 function renderImages(force = false) {
-  if (!state.images.length) { state.selected = null; state.renderedImage = null; renderEmpty(); return; }
+  if (!state.images.length) {
+    state.selected = null;
+    if (force || state.renderedImage !== 'empty') {
+      state.renderedImage = 'empty';
+      renderEmpty();
+    }
+    return;
+  }
   if (!state.images.some(image => image.id === state.selected)) state.selected = state.images[0].id;
   const image = state.images.find(item => item.id === state.selected);
-  const signature = `${image.id}:${image.status}:${image.updated_at || ''}:${image.inspected_at || ''}:${image.inspection_status || ''}:${Boolean(image.inspection)}:${JSON.stringify(image.inspection?.boot || null)}`;
-  if (!force && signature === state.renderedImage) { const selector = $('#image-select'); if (selector) selector.innerHTML = state.images.map(item => `<option value="${esc(item.id)}"${item.id === state.selected ? ' selected' : ''}>${esc(item.name)} · ${esc(item.status)}</option>`).join(''); return; }
+  const revision = image.inspected_at || image.updated_at;
+  const signature = JSON.stringify([image.id,image.status,revision,image.inspection_status,image.inspection_error,
+    image.status === 'ready' ? null : libraryName('image', image),Boolean(image.inspection),image.inspection?.boot]);
+  if (!force && signature === state.renderedImage) {
+    const selector = $('#image-select');
+    if (selector && (selector.options.length !== state.images.length || state.images.some((record, index) => {
+      const option = selector.options[index];
+      return option.value !== record.id || option.textContent !== `${libraryName('image', record)} · ${record.status}`;
+    }))) {
+      selector.replaceChildren(...state.images.map(record =>
+        new Option(`${libraryName('image', record)} · ${record.status}`, record.id, false, record.id === state.selected)));
+    }
+    const title = $('.image-banner h2');
+    const name = libraryName('image', image);
+    if (title && title.textContent !== name) title.textContent = name;
+    for (const button of $$('#panel-source [data-library-action]')) {
+      button.setAttribute('aria-label', `${button.textContent} import ${name}`);
+    }
+    return;
+  }
   captureEditorDraft();
   state.renderedImage = signature;
   const draft = state.editorDrafts[image.id];
   state.ociCatalog = draft?.catalog || state.ociBaseCatalog; state.ociLoadedSchema = draft?.loadedSchema || null; state.ociFirmwareEdited = draft?.firmwareEdited || false; state.migrationAutoFirmware = draft?.migrationAutoFirmware || null;
   const inspection = image.inspection || {}, os = inspection.os || {}, partitions = inspection.partitions || [];
   const startupFiles = Object.keys(inspection.files || {}).filter(path => /^\/etc\/(cron\.d\/[^/]+|systemd\/system\/[^/]+\.service)$/.test(path));
-  const banner = `<div class="image-banner"><span class="image-banner-icon">${icon('image')}</span><div><h2>${esc(image.name)}</h2><p>${esc(os.name || os.distro || 'Linux disk image')}${os.arch ? ` · ${esc(architectureName(os.arch))}` : ''} · ${esc((inspection.format || 'inspecting').toUpperCase())}</p></div>${badge(image.status)}</div>`;
+  const banner = `<div class="image-banner"><span class="image-banner-icon">${icon('image')}</span><div><h2>${esc(libraryName('image', image))}</h2><p>${esc(os.name || os.distro || 'Linux disk image')}${os.arch ? ` · ${esc(architectureName(os.arch))}` : ''} · ${esc((inspection.format || 'inspecting').toUpperCase())}</p></div>${badge(image.status)}</div>`;
   if (image.status !== 'ready') { renderWizardEmpty(image); return; }
   $('#image-workspace').innerHTML = banner + `<div id="architecture-worker-notice" class="notice warning compact-notice" hidden></div><form id="recipe-form" data-image-id="${esc(image.id)}" novalidate><div class="editor-tabs" role="tablist" aria-label="Image customization">${[['overview','Overview'],['storage','Storage'],['startup','Startup & cron'],['access','Access'],['mounts','Mounts'],['boot','Boot & kernel'],['oci','OCI compatibility'],['export','Export']].map(([key,label],i) => `<button type="button" role="tab" aria-selected="${!i}" aria-controls="panel-${key}" id="tab-${key}" tabindex="${i ? -1 : 0}" class="editor-tab${i ? '' : ' selected'}" data-tab="${key}">${label}</button>`).join('')}</div><div class="editor-body">
   <section class="editor-panel" role="tabpanel" aria-labelledby="tab-overview" id="panel-overview">${bootSummary(inspection,'overview')}<div class="metric-grid"><div class="metric"><span class="metric-label">Disk capacity ${helpHint('Virtual disk capacity seen by the guest, independent of the compressed file length.','Disk capacity')}</span><strong class="metric-value">${bytes(inspection.virtual_size)}</strong></div><div class="metric"><span class="metric-label">File size ${helpHint('Source file length: the amount transferred when downloading the imported file.','Source file size')}</span><strong class="metric-value">${bytes(inspection.actual_size)}</strong></div><div class="metric"><span class="metric-label">Filesystems / devices</span><strong class="metric-value">${partitions.length}</strong></div><div class="metric"><span class="metric-label">Format</span><strong class="metric-value">${esc((inspection.format || '—').toUpperCase())}</strong></div></div><details class="editor-disclosure" data-disclosure="source-layout"><summary>Disk layout <span class="disclosure-meta">${partitions.length} devices</span></summary><div class="details-content">${partitionTable(partitions)}</div></details><details class="editor-disclosure" data-disclosure="source-guest"><summary>Guest details <span class="disclosure-meta">${esc(architectureName(os.arch))}</span></summary><div class="details-content"><dl class="detail-list"><div><dt>Operating system</dt><dd>${esc(os.name || os.distro || 'Unknown')}</dd></div><div><dt>Detected architecture ${helpHint('The exported image keeps this CPU architecture. Choose a destination shape with the same instruction set.','Detected architecture')}</dt><dd>${esc(architectureName(os.arch))}</dd></div><div><dt>Root device</dt><dd><code>${esc(os.root || 'Unknown')}</code></dd></div></dl></div></details>${(inspection.warnings || []).filter(warning => warning.trim() !== 'Bootability and cloud-agent compatibility require a test launch after export.').map(warning => `<div class="notice warning compact-notice">${esc(warning)}</div>`).join('')}</section>
@@ -317,22 +371,53 @@ async function buildImage(event) {
     const job = await api(`/images/${encodeURIComponent(imageId)}/build`,{method:'POST',body:JSON.stringify(recipe)});
     wizardBuildQueued(imageId,job.job_id);
     toast('Image build queued. Follow its progress in the final step.');
-    await refresh();
+    await refresh({supersede:true});
   } catch(error) { notice('#build-error',errorText(error)); }
   finally { state.buildSubmitting = false; wizardSetBusy(false); }
 }
 function renderArtifacts() { renderExports(); }
 function renderJobs() { renderActivity(); }
 function openJob(id) { return openActivityJob(id); }
-async function refresh({afterAuthentication=false}={}) {
+function updateWorkspaceInventory(images, jobs, artifacts) {
+  const ids = new Set(images.map(image => image.id));
+  for (const image of state.images) {
+    if (ids.has(image.id)) continue;
+    delete state.editorDrafts[image.id];
+    delete wizardState.sessions[image.id];
+    delete studioState.plans[image.id];
+    delete systemdExplorer.sessions[image.id];
+  }
+  if (state.selected && !ids.has(state.selected)) {
+    state.editorRevision++;
+    state.selected = images[0]?.id || null;
+    wizardSession().step = 'source';
+    if (state.editorDrafts[state.selected]) state.editorDrafts[state.selected].tab = 'source';
+  }
+  state.images = images;
+  state.jobs = jobs;
+  state.artifacts = artifacts;
+  if (state.s3WizardImage && !ids.has(state.s3WizardImage)) state.s3WizardImage = null;
+  if ($('#s3-dialog').open && !syncS3Artifact() && !$('#s3-form button[type="submit"]').disabled) {
+    $('#s3-dialog').close();
+    toast('This export was deleted from the workspace.');
+  }
+  $('#image-count').textContent = images.length;
+  $('#artifact-count').textContent = artifacts.length;
+  $('#job-count').textContent = jobs.filter(job => ['running','queued'].includes(job.status)).length || jobs.length;
+  renderImages();
+  renderArtifacts();
+  renderJobs();
+  wizardUpdate();
+}
+async function refresh({afterAuthentication=false, supersede=false}={}) {
   if(state.authLoading&&!afterAuthentication)return;
   const authGeneration=state.authGeneration;
-  if (state.polling&&state.pollingGeneration===authGeneration) return;
+  if (!supersede && state.polling && state.pollingGeneration===authGeneration) return;
   const requestId=state.refreshRequest=(state.refreshRequest||0)+1;
   const current=()=>authGeneration===state.authGeneration&&requestId===state.refreshRequest;
   state.polling = true;
   state.pollingGeneration=authGeneration;
-  try { const [images,jobs,artifacts] = await Promise.all([api('/images'),api('/jobs'),api('/artifacts')]); if(!current())return;state.images = images; state.jobs = jobs; state.artifacts = artifacts; $('#image-count').textContent = images.length; $('#artifact-count').textContent = artifacts.length; const active = jobs.filter(job => ['running','queued'].includes(job.status)).length; $('#job-count').textContent = active || jobs.length; renderImages(); renderArtifacts(); renderJobs(); wizardUpdate(); notice('#global-error',''); if(!state.authLoading)state.authPending = false; }
+  try { const [images,jobs,artifacts] = await Promise.all([api('/images'),api('/jobs'),api('/artifacts')]); if(!current())return;updateWorkspaceInventory(images, jobs, artifacts); notice('#global-error',''); if(!state.authLoading)state.authPending = false; }
   catch(error) { if(current())notice('#global-error',errorText(error)); }
   finally { if(requestId===state.refreshRequest)state.polling = false; }
 }
@@ -354,11 +439,19 @@ $('#import-form').addEventListener('submit',async event => {
   try { state.busy = true; $('#import-submit').disabled = true; let result;
     if (state.importMode === 'file') { if(!state.selectedFile) throw new Error('Choose a local disk image to import.'); const limit = Number(state.health?.limits?.max_upload_gib); if(limit && state.selectedFile.size > limit * 1073741824) throw new Error(`This file exceeds the ${limit} GiB upload limit.`); $('#upload-progress-wrap').hidden = false; $('#upload-progress').value = 0; $('#upload-percent').textContent = '0%'; result = await uploadFile(state.selectedFile); }
     else { const url = $('#import-url').value.trim(); if(!url) throw new Error('Enter an S3 URI or HTTPS URL.'); result = await api('/images/import',{method:'POST',body:JSON.stringify({url,endpoint_url:$('#import-endpoint').value.trim() || null,region:$('#import-region').value.trim() || null})}); }
-    captureEditorDraft(); state.selected = result.image_id; state.editorRevision++; state.renderedImage = null; wizardImported(result.image_id,result.job_id); $('#import-dialog').close(); toast('Source imported. The engine will inspect the disk now.'); await refresh(); setView('images');
+    captureEditorDraft(); state.selected = result.image_id; state.editorRevision++; state.renderedImage = null; wizardImported(result.image_id,result.job_id); $('#import-dialog').close(); toast('Source imported. The engine will inspect the disk now.'); await refresh({supersede:true}); setView('images');
   } catch(error) { if(!state.uploadCancelled) notice('#import-error',errorText(error)); }
   finally { state.uploadXhr = null; state.busy = false; $('#import-submit').disabled = false; $('#upload-progress-wrap').hidden = true; }
 });
-$('#auth-form').addEventListener('submit',async event => { event.preventDefault(); notice('#auth-error',''); const button = $('button[type="submit"]',event.target); button.disabled = true; state.authLoading = true; try { await api('/session',{method:'POST',body:JSON.stringify({token:$('#auth-token').value})}); state.authGeneration++; $('#auth-token').value = ''; $('#auth-dialog').close(); state.authPending = false; toast('Connected to your workspace.'); updateHealth(await api('/health')); try { await loadOciCatalog(); } catch(error) { if(currentOciCatalogOwner(error.catalogOwner))state.ociCatalogError = errorText(error); } await loadDestinationCatalog(); await refresh({afterAuthentication:true}); } catch(error) { notice('#auth-error',errorText(error)); } finally { state.authLoading = false; button.disabled = false; } });
+$('#auth-form').addEventListener('submit',async event => { event.preventDefault(); notice('#auth-error',''); const button = $('button[type="submit"]',event.target); button.disabled = true; state.authLoading = true; try { await api('/session',{method:'POST',body:JSON.stringify({token:$('#auth-token').value})}); state.authGeneration++; $('#auth-token').value = ''; $('#auth-dialog').close(); state.authPending = false; toast('Connected to your workspace.'); updateHealth(await api('/health')); await Promise.all([loadOciCatalog().catch(error=>{if(currentOciCatalogOwner(error.catalogOwner))state.ociCatalogError=errorText(error);}),loadDestinationCatalog()]); await refresh({afterAuthentication:true}); } catch(error) { notice('#auth-error',errorText(error)); } finally { state.authLoading = false; button.disabled = false; } });
+function syncS3Artifact() {
+  const artifact = state.artifacts.find(item => item.id === state.s3Artifact);
+  if (!artifact) return false;
+  const name = libraryName('artifact', artifact);
+  $('#s3-artifact-name').textContent = name;
+  $('#s3-url').placeholder = `s3://my-bucket/images/${name}`;
+  return true;
+}
 $('#s3-form').addEventListener('submit',async event => {
   event.preventDefault(); notice('#s3-error','');
   const button = $('button[type="submit"]',event.target), artifactId = state.s3Artifact, wizardImage = state.s3WizardImage;
@@ -366,9 +459,8 @@ $('#s3-form').addEventListener('submit',async event => {
   try {
     const result = await api(`/artifacts/${encodeURIComponent(artifactId)}/upload`,{method:'POST',body:JSON.stringify({url:$('#s3-url').value.trim(),endpoint_url:$('#s3-endpoint').value.trim() || null,region:$('#s3-region').value.trim() || null})});
     $('#s3-dialog').close(); toast('S3 upload queued.');
-    if (wizardImage) wizardUploadQueued(wizardImage,result.job_id);
-    await refresh();
-    if (wizardImage) { if (state.selected === wizardImage) setView('images'); }
+    await refresh({supersede:true});
+    if (wizardImage && state.images.some(image => image.id === wizardImage)) wizardUploadQueued(wizardImage,result.job_id);
     else { setView('jobs'); openJob(result.job_id); }
   } catch(error) { notice('#s3-error',errorText(error)); }
   finally { button.disabled = false; }
@@ -387,7 +479,15 @@ document.addEventListener('click',event => {
   if(button.dataset.importMode) setImportMode(button.dataset.importMode);
   if(button.dataset.tab) wizardGo(button.dataset.tab);
   if (['add-service','remove-service','oci-add-shape','oci-remove-shape','oci-use-target'].includes(button.dataset.action)) state.editorRevision++;
-  if(button.dataset.s3) { state.s3WizardImage = button.closest('#panel-result') ? state.selected : null; state.s3Artifact = button.dataset.s3; const artifact = state.artifacts.find(item => item.id === state.s3Artifact); $('#s3-artifact-name').textContent = artifact?.name || artifact?.filename || 'Image export'; $('#s3-url').placeholder = `s3://my-bucket/images/${artifact?.name || artifact?.filename || 'custom-image.qcow2'}`; notice('#s3-error',''); compactStudioHelp($('#s3-dialog')); $('#s3-dialog').showModal(); }
+  if (button.dataset.s3) {
+    state.s3WizardImage = button.closest('#panel-result') ? state.selected : null;
+    if (state.s3Artifact !== button.dataset.s3) $('#s3-url').value = '';
+    state.s3Artifact = button.dataset.s3;
+    if (!syncS3Artifact()) return;
+    notice('#s3-error','');
+    compactStudioHelp($('#s3-dialog'));
+    $('#s3-dialog').showModal();
+  }
   if(button.dataset.action === 'open-import') showImport();
   if(button.dataset.action === 'refresh') refresh();
   if(button.dataset.action === 'refresh-inspection') refreshInspection();
@@ -499,7 +599,7 @@ async function previewBootMigration(config = null, beforeBuild = false, allowNet
   try {
     config = config || getBootMigrationConfig();
     if (!config) throw new Error('Enable BIOS-to-UEFI migration to preview the proposed changes.');
-    const plan = await api(`/images/${encodeURIComponent(imageId)}/uefi/plan`,{method:'POST',body:JSON.stringify({boot_migration:config,allow_network:allowNetwork ?? requiredDownloadsEnabled()})});
+    const plan = await requestPreview('uefi',{boot_migration:config,allow_network:allowNetwork ?? requiredDownloadsEnabled()},beforeBuild);
     if (state.selected !== imageId || state.editorRevision !== revision) throw new Error('The source or settings changed. Preview migration again for the current choices.');
     renderMigrationPlan(plan);
     if (beforeBuild && (!plan.ready_to_migrate || plan.blockers?.length)) {
@@ -547,7 +647,8 @@ function renderOciPanel() {
       <label class="field">Object Storage URI <span class="optional">alternative to namespace, bucket, and object</span><input id="oci-object-uri" placeholder="https://objectstorage.region.oraclecloud.com/…" autocomplete="off"><span class="field-help">Presigned URLs become part of the downloaded configuration. Enter one only if you intend to include it.</span></label>
       <div class="form-grid"><label class="field">Freeform tags <span class="optional">JSON object</span><textarea id="oci-freeform-tags" rows="4" spellcheck="false" placeholder='{"environment": "development"}'></textarea></label><label class="field">Defined tags <span class="optional">JSON object</span><textarea id="oci-defined-tags" rows="4" spellcheck="false" placeholder='{"Operations": {"CostCenter": "42"}}'></textarea></label></div>
       <h3 class="subheading">Compatible shapes <span class="disclosure-meta" id="oci-source-architecture"></span></h3><p class="field-help">Use exact OCI shape names for this architecture; CPU and memory limits are optional.</p>
-      <div id="oci-shapes"></div><button type="button" class="button secondary small" data-action="oci-add-shape">${icon('plus')}Add compatible shape</button>
+      <label class="field">Shape matching<select id="oci-shape-mode"><option value="auto">Automatic compatible shapes</option><option value="manual">Only listed shapes</option></select>${helpHint('Automatic includes documented compatible siblings of the listed shapes using the selected architecture, attachment capabilities and size limits. Only listed shapes keeps exactly the entries below. The compatibility check shows the resolved list; OCI availability and a successful boot still need validation.','Shape matching')}</label>
+      <div id="oci-shapes"></div><button type="button" class="button secondary small" data-action="oci-add-shape">${icon('plus')}Add compatible shape</button><div id="oci-resolved-shapes"></div>
     </div></details>
     <details class="editor-disclosure oci-details" data-disclosure="oci-schema"><summary>Metadata & custom schema <span class="disclosure-meta">Advanced</span></summary><div class="details-content">
       <p class="panel-intro">Paste and load a regional OCI global image capability schema. Additional capabilities may require manual guest preparation.</p>
@@ -620,7 +721,7 @@ function getOciConfig() {
   if (boot?.mode === 'dual' && !state.ociFirmwareEdited && state.ociCatalog.capabilities.some(capability => capability.key === 'Compute.Firmware')) throw editorError('Confirm the OCI firmware choice for this dual-mode image.','#oci-firmware-confirm');
   const global_schema = parseOciJson('#oci-schema-json','Global capability schema',null);
   if (JSON.stringify(global_schema) !== JSON.stringify(state.ociLoadedSchema || null)) throw editorError('Load the edited global capability schema before previewing or building.','#oci-schema-json');
-  const import_options = {launch_mode:$('#oci-launch-mode').value,freeform_tags:parseOciJson('#oci-freeform-tags','Freeform tags'),defined_tags:parseOciJson('#oci-defined-tags','Defined tags'),shape_compatibility:[]};
+  const import_options = {launch_mode:$('#oci-launch-mode').value,freeform_tags:parseOciJson('#oci-freeform-tags','Freeform tags'),defined_tags:parseOciJson('#oci-defined-tags','Defined tags'),shape_compatibility:[],shape_compatibility_mode:$('#oci-shape-mode').value};
   const fields = {compartment_id:'oci-compartment',namespace:'oci-namespace',bucket:'oci-bucket',object_name:'oci-object-name',object_uri:'oci-object-uri',display_name:'oci-display-name',operating_system:'oci-operating-system',operating_system_version:'oci-os-version'};
   for (const [key,id] of Object.entries(fields)) { const value = $(`#${id}`).value.trim(); if (value) import_options[key] = value; }
   for (const row of $$('.oci-shape-row')) {
@@ -655,6 +756,36 @@ async function loadOciMetadataReference(input) {
   } catch (error) { if (current()) notice('#oci-metadata-error',errorText(error)); }
   finally { if (input.isConnected) input.value = ''; }
 }
+function ociShapeResolutionKey() {
+  try { return JSON.stringify(getOciConfig()); } catch { return null; }
+}
+function rememberOciShapeResolution(resolution) {
+  if(!resolution||!Array.isArray(resolution.effective_shapes))return;
+  studioSession().shapeResolution={resolution,signature:ociShapeResolutionKey(),context:previewContextKey()};
+  updateOciShapeResolution();
+}
+function currentOciShapeResolution() {
+  const cached=studioSession().shapeResolution;
+  return cached?.signature&&cached.signature===ociShapeResolutionKey()&&cached.context===previewContextKey()?cached.resolution:null;
+}
+function shapeResolutionMarkup(resolution,location) {
+  const bounds=shape=>[['OCPUs',shape.min_ocpus,shape.max_ocpus],['GiB',shape.min_memory_gbs,shape.max_memory_gbs]].filter(([,min,max])=>min||max).map(([unit,min,max])=>`${min||'default'}–${max||'default'} ${unit}`).join(' · ');
+  const added=new Map((resolution.added_shapes||[]).map(item=>[item.shape,item.reason]));
+  return `<details class="editor-disclosure oci-resolved-details" data-disclosure="${location}-resolved-shapes"><summary>Compatible shapes <span class="disclosure-meta">${resolution.effective_shapes.length} · ${resolution.mode==='manual'?'Only listed':'Automatic'}</span></summary><div class="details-content"><ul class="oci-resolved-list">${resolution.effective_shapes.map(item=>`<li><code>${esc(item.shape)}</code>${bounds(item)?`<span>${esc(bounds(item))}</span>`:''}${added.has(item.shape)?helpHint(added.get(item.shape),'Why this shape was added'):''}</li>`).join('')}</ul>${!resolution.effective_shapes.length?'<p class="field-help">List a shape or choose a specific destination profile to resolve compatible shapes.</p>':''}${resolution.skipped_shapes?.length?`<details><summary>Excluded shapes (${resolution.skipped_shapes.length})</summary><ul>${resolution.skipped_shapes.map(item=>`<li><code>${esc(item.shape)}</code>: ${esc(item.reason)}</li>`).join('')}</ul></details>`:''}${resolution.warnings?.length?`<ul class="oci-warnings">${resolution.warnings.map(item=>`<li>${esc(item)}</li>`).join('')}</ul>`:''}<p class="field-help">Offline matching. Availability and a successful OCI launch are still unverified.</p></div></details>`;
+}
+function updateOciShapeResolution() {
+  if(!$('#oci-shape-mode'))return;
+  const resolution=currentOciShapeResolution();
+  for(const location of ['oci','destination']) {
+    const host=$(`#${location}-resolved-shapes`);if(!host)continue;
+    const visible=Boolean(resolution)&&($('#oci-enabled')?.checked||location==='oci');
+    const signature=JSON.stringify([visible,resolution,location]);
+    if(host.dataset.signature===signature)continue;
+    const markup=visible?shapeResolutionMarkup(resolution,location):location==='oci'?'<p class="field-help">Check compatibility to resolve the shape list.</p>':'';
+    const opened=$('details',host)?.open??state.editorDrafts[state.selected]?.disclosures?.[`${location}-resolved-shapes`];
+    host.innerHTML=markup;host.dataset.signature=signature;if($('details',host))$('details',host).open=Boolean(opened);
+  }
+}
 function setOciPlanMessage(message, status = 'stale') {
   const panel = $('#oci-plan');
   if (!panel) return;
@@ -687,9 +818,9 @@ async function previewOci(config = null, beforeBuild = false, migrationOverride 
     const migration = migrationOverride === undefined ? getBootMigrationConfig() : migrationOverride;
     const platform = platformOverride === undefined ? getPlatformMigrationConfig() : platformOverride;
     setOciPlanMessage('Checking compatibility…', 'loading');
-    const plan = await api(`/images/${encodeURIComponent(imageId)}/oci/plan`,{method:'POST',body:JSON.stringify({oci:config,mount_policy:mountPolicyOverride ?? getMountPolicy(),allow_network:networkOverride ?? requiredDownloadsEnabled(),...(migration ? {boot_migration:migration} : {}),...(platform ? {platform_migration:platform} : {})})});
+    const plan = await requestPreview('oci',{oci:config,mount_policy:mountPolicyOverride ?? getMountPolicy(),allow_network:networkOverride ?? requiredDownloadsEnabled(),...(migration ? {boot_migration:migration} : {}),...(platform ? {platform_migration:platform} : {})},beforeBuild);
     if (state.selected !== imageId || state.editorRevision !== revision) throw new Error('The source or settings changed. Preview the OCI settings again for the current choices.');
-    if (ownsPanel()) renderOciPlan(plan);
+    if (ownsPanel()) { rememberOciShapeResolution(plan.shape_compatibility_resolution); renderOciPlan(plan); }
     if (beforeBuild && plan.blockers?.length) { setTab('oci'); $('#oci-plan').scrollIntoView({behavior:'smooth',block:'center'}); throw new Error('The OCI compatibility plan has blockers. Resolve them in the OCI compatibility step before building.'); }
     return plan;
   } catch (error) {
@@ -743,8 +874,7 @@ async function start() {
   try {
     updateHealth(await api('/health'));
     if(ownsStartup()) {
-      try { await loadOciCatalog(); } catch(error) { if(ownsStartup()&&currentOciCatalogOwner(error.catalogOwner))state.ociCatalogError = errorText(error); }
-      if(ownsStartup())await loadDestinationCatalog();
+      await Promise.all([loadOciCatalog().catch(error=>{if(ownsStartup()&&currentOciCatalogOwner(error.catalogOwner))state.ociCatalogError=errorText(error);}),loadDestinationCatalog()]);
       if(ownsStartup())await refresh();
     }
   } catch(error) { if(ownsStartup()){notice('#global-error',errorText(error));renderEmpty();} }

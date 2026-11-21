@@ -83,6 +83,52 @@ def test_global_api_version_is_never_archive_format_version():
     assert result["imageCapabilityData"] is result["imageCapsFormatVersion"] is None
 
 
+def test_multiple_observed_vm_shapes_are_embedded_with_exact_limits():
+    config = OciConfig(import_options={"shape_compatibility": [
+        {"shape": "VM.Standard.E5.Flex", "min_ocpus": 2, "max_ocpus": 4,
+         "min_memory_gbs": 8, "max_memory_gbs": 64}]})
+    inspection = {**deepcopy(INSPECTION), "os": {"distro": "ubuntu", "name": "Ubuntu 26.04.1 LTS", "arch": "x86_64"}}
+    before = config.model_dump()
+    metadata = subject.image_metadata(config, inspection)
+    shapes = metadata["additionalMetadata"]["shapeCompatibilities"]
+    assert {row["internalShapeName"] for row in shapes} == {"VM.Standard.E4.Flex", "VM.Standard.E5.Flex", "VM.Standard.E6.Flex"}
+    assert all(row["ocpuConstraints"] == {"min": 2, "max": 4} for row in shapes)
+    assert all(row["memoryConstraints"] == {"minInGBs": 8, "maxInGBs": 64} for row in shapes)
+    assert config.model_dump() == before
+
+
+def test_unmapped_shapes_are_not_guessed_or_copied_from_source_metadata():
+    config = OciConfig(import_options={"shape_compatibility_mode": "manual", "shape_compatibility": [
+        {"shape": "VM.Standard.E4.Flex", "max_ocpus": 8}, {"shape": "BM.Standard.E5.192"}]})
+    inspection = {**deepcopy(INSPECTION), "additionalMetadata": {"shapeCompatibilities": [{"internalShapeName": "unsafe-source-default"}]}}
+    metadata = subject.image_metadata(config, inspection)
+    assert metadata["additionalMetadata"] == {"shapeCompatibilities": [
+        {"internalShapeName": "VM.Standard.E4.Flex", "ocpuConstraints": {"max": 8}, "memoryConstraints": None}]}
+    info = subject.shape_metadata(config)
+    assert info["companion_only_shapes"] == ["BM.Standard.E5.192"]
+    assert any("BM.Standard.E5.192" in text and "apply-oci.py" in text for text in subject._warnings(config))
+
+
+def test_final_resolution_is_identical_in_archive_and_companion(tmp_path):
+    from forge.oci import bundle_files
+    config = OciConfig(import_options={"shape_compatibility": [{"shape": "VM.Standard.E5.Flex"}]})
+    resolution = {"effective_shapes": [{"shape": "VM.Standard.E4.Flex", "min_ocpus": 2, "max_ocpus": 6},
+                                        {"shape": "VM.Standard.E5.Flex", "max_memory_gbs": 128}]}
+    source = qcow(tmp_path / "source.qcow2")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    output = tmp_path / "image.oci"
+    receipt = subject.write_archive(output, source, config, INSPECTION, lambda _: None, shape_resolution=resolution)
+    files = bundle_files(config, {"format": "oci", "shape_compatibility_resolution": resolution})
+    public = json.loads(files["shape-compatibility.json"])["entries"]
+    with tarfile.open(output) as archive:
+        assert archive.getnames() == ["image_metadata.json", "output.QCOW2"]
+        embedded = json.load(archive.extractfile("image_metadata.json"))["additionalMetadata"]["shapeCompatibilities"]
+    assert embedded == [{"internalShapeName": row["shapeName"], "ocpuConstraints": row["ocpuConstraints"], "memoryConstraints": row["memoryConstraints"]} for row in public]
+    assert receipt["shape_compatibility"]["embedded_shapes"] == [row["shapeName"] for row in public]
+    assert receipt["shape_compatibility"]["companion_only_shapes"] == []
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == digest
+
+
 def test_unknown_os_needs_explicit_labels():
     with pytest.raises(subject.OciArchiveError, match="operating system"):
         subject.image_metadata(OciConfig(), {})

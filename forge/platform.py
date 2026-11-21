@@ -810,6 +810,45 @@ def _initrd_path(version, kernel, backend):
     return kernel.get("initrd") or f"/boot/initramfs-{version}.img"
 
 
+def _shared_kernel_state(inspection, backend):
+    """Identify existing kernel bytes and the one initrd both adapters address."""
+    hardware = inspection.get("platform", {})
+    kernels = hardware.get("kernels", {})
+    provider = inspection.get("oci_evidence", {}).get("kernels", {})
+    portability = hardware.get("portability", {})
+    hashes = portability.get("hashes", {})
+    if not kernels or set(kernels) != set(provider) or portability.get("errors"):
+        return None
+    result = {}
+    for version, kernel in kernels.items():
+        path = _initrd_path(version, kernel, backend)
+        digest = kernel.get("initrd_sha256", "")
+        kernel_hash = hashes.get("/boot/vmlinuz-" + version, "")
+        if (kernel.get("initrd") != path or provider[version].get("initrd") != path
+                or not re.fullmatch(r"[0-9a-f]{64}", digest or "")
+                or not re.fullmatch(r"sha256:[0-9a-f]{64}", kernel_hash)):
+            return None
+        result[version] = {"path": path, "sha256": digest, "kernel_sha256": kernel_hash}
+    return result
+
+
+def _can_share_oci_rebuild(inspection, options, plan, config, mount_policy):
+    """A conservative optimization; missing evidence keeps the separate passes."""
+    from .oci import OciConfig, compatibility_plan
+    if not config or options.get("strategy", "reconfigure") != "reconfigure":
+        return False
+    model = config if isinstance(config, OciConfig) else OciConfig.model_validate(config)
+    if not model.guest.prepare or plan.get("packages") or not _shared_kernel_state(inspection, plan["initramfs_backend"]):
+        return False
+    # This is only scheduling eligibility. After the platform writes, OCI plans
+    # again against actual evidence with every projection disabled.
+    provider = compatibility_plan(inspection, model, False, platform_migration=options, mount_policy=mount_policy)
+    return (not provider["blockers"] and not provider["packages"]
+            and provider["initramfs_backend"] == plan["initramfs_backend"]
+            and provider["network_backend"] == plan["network_backend"]
+            and provider["iscsi_boot"] == (options["boot_attachment"] == "iscsi"))
+
+
 def _initramfs_script(inspection, plan, options):
     commands = ["set -eu"]
     for version, kernel in inspection["platform"]["kernels"].items():
@@ -990,7 +1029,8 @@ def verify_platform(inspection, options, *, oci_config=None, target_provider="oc
     return plan
 
 
-def prepare_platform(work: Path, inspection, options, allow_network, log, *, oci_config=None, target_provider="oci", mount_policy="auto"):
+def prepare_platform(work: Path, inspection, options, allow_network, log, *, oci_config=None, target_provider="oci", mount_policy="auto",
+                     inspected_work=False, defer_initramfs_to_oci=False):
     from .engine import EngineError, ImageEngine, _guest, _mount, _roots, _run, _run_guest_script, _validate_fstab
     options = _dict(options)
     plan = plan_platform(inspection, options, allow_network, oci_config, target_provider, mount_policy=mount_policy)
@@ -1001,7 +1041,7 @@ def prepare_platform(work: Path, inspection, options, allow_network, log, *, oci
     if options.get("strategy") == "preserve":
         # Re-read the actual working image after the user's explicit edits.
         # This branch never opens a writable guest or runs a guest command.
-        current = ImageEngine().inspect(work)
+        current = inspection if inspected_work else ImageEngine().inspect(work, include_editor=False)
         final = verify_platform(current, options, oci_config=oci_config, target_provider=target_provider, mount_policy=mount_policy)
         if not final["ready"]:
             raise EngineError("Existing hardware configuration cannot be preserved: " + " ".join(final["blockers"]))
@@ -1013,14 +1053,18 @@ def prepare_platform(work: Path, inspection, options, allow_network, log, *, oci
         log("Platform: " + action)
     original_network_backend = plan.get("network_backend")
     if plan["packages"]:
+        log("Installing hardware preparation packages: " + ", ".join(plan["packages"]))
         _run(["virt-customize", "--format", "qcow2", "-a", str(work), "--network", "--install", ",".join(plan["packages"])], log)
-        inspection = ImageEngine().inspect(work)
+        log("Checking hardware prerequisites after package installation")
+        inspection = ImageEngine().inspect(work, include_editor=False)
         # Installing an initrd helper must not select a different root renderer.
         inspection["platform"]["network_backend"] = original_network_backend
         plan = plan_platform(inspection, options, False, oci_config, target_provider, mount_policy=mount_policy)
         if not plan["ready"]:
             raise EngineError("Platform prerequisites remain missing after package installation: " + " ".join(plan["blockers"]))
     evidence = inspection["platform"]
+    deferred = bool(defer_initramfs_to_oci and _can_share_oci_rebuild(inspection, options, plan, oci_config, mount_policy))
+    shared_before = _shared_kernel_state(inspection, plan["initramfs_backend"]) if deferred else None
     backup = BACKUPS + "/" + uuid4().hex
     commands = ["set -eu"]
     if options["boot_attachment"] == "iscsi" and plan["network_backend"] != "NetworkManager":
@@ -1069,12 +1113,27 @@ def prepare_platform(work: Path, inspection, options, allow_network, log, *, oci
                     commands.append("netplan generate")
             if options.get("configure_serial_console", True):
                 commands.append(f"systemctl --root=/ enable serial-getty@{plan['serial_device']}.service")
-            commands.append(_initramfs_script(inspection, plan, options))
-            commands.append("update-grub" if evidence["tools"].get("update-grub") else "grub2-mkconfig -o /boot/grub2/grub.cfg")
+            if not deferred:
+                commands.append(_initramfs_script(inspection, plan, options))
+                commands.append("update-grub" if evidence["tools"].get("update-grub") else "grub2-mkconfig -o /boot/grub2/grub.cfg")
             _write(g, PROFILE, json.dumps({"options": options, "required_modules": plan["required_modules"],
                                           "mount_policy": mount_policy, "provider_supported": plan["provider_supported"], "boot_tested": False}, indent=2) + "\n", backup)
+        log("Applying hardware configuration; OCI will rebuild and verify the combined driver set once" if deferred
+            else f"Rebuilding and verifying hardware drivers for {len(evidence['kernels'])} kernel(s)")
         _run_guest_script(work, "\n".join(commands), log)
-        after = ImageEngine().inspect(work)
+        log("Inspecting the prepared hardware configuration and boot files")
+        after = ImageEngine().inspect(work, include_editor=False)
+        if deferred:
+            if _shared_kernel_state(after, plan["initramfs_backend"]) != shared_before:
+                raise EngineError("Kernel or initramfs bytes changed while staging the shared rebuild; export was stopped.")
+            pending = {"version": 1, "options": deepcopy(options), "mount_policy": mount_policy,
+                       "initramfs_backend": plan["initramfs_backend"], "kernels": shared_before,
+                       "required_modules": list(plan["required_modules"]),
+                       "hashes": deepcopy(after["platform"]["portability"]["hashes"])}
+            # Never report preparation as verified while its boot files remain
+            # pending. Only the subsequent OCI rebuild may complete this receipt.
+            return {**plan, "ready": False, "verified": False, "deferred_initramfs": pending,
+                    "backup_directory": backup, "_inspection": after}
         after_kernels = after.get("platform", {}).get("kernels", {})
         if set(after_kernels) != set(evidence["kernels"]):
             raise EngineError("Kernel inventory changed during platform preparation.")

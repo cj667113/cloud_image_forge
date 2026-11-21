@@ -1,6 +1,6 @@
 # OCI image compatibility
 
-Reviewed against Oracle's public documentation and running source/clone hosts on **2026-10-28**.
+The host observations date from **2026-10-28**. The Standard E4/E5/E6 Flex compatibility group was checked against Oracle's shape and networking references on **2026-11-21**.
 
 OCI image compatibility has three parts: the software and boot layout inside the disk, the image's cloud capability schema, and the hardware/network/storage selected when an instance is launched. A QCOW2 conversion only changes the disk container. Declaring a capability does not install a driver or prove that an instance boots.
 
@@ -34,11 +34,14 @@ Successful OCI builds provide an **OCI configuration** download at `/api/artifac
 | `instance-launch-options.json` | Optional `--launch-options` fragment for a later instance launch |
 | `instance-launch-fragment.json` | Partial instance request containing launch options and top-level PV encryption selection; merge into a complete launch request |
 | `shape-001.json`, ... | Selected image-shape compatibility entries, when provided |
+| `shape-compatibility.json` | Complete effective public shape list and requested bounds |
+| `shape-resolution.json` | Explicit/automatic decisions retained from the final image, when available |
+| `apply-oci.py` | Import an uploaded object or use an existing image, apply every shape entry, and verify the API result |
 | `forge-oci-profile.json` | The selected Forge OCI configuration |
 | `artifact.json` | Exported image identity and checksum details |
 | `README.txt` | Commands, placeholders, and cloud-validation steps |
 
-This ZIP contains configuration only. Download/upload the QCOW2 separately; the ZIP is not an OCI `.oci` image archive. No OCI command is executed by generating or downloading it. Replace every `REPLACE_*` placeholder, validate against the region's live schema, and follow the included instructions. A presigned object URI supplied in the form is included in the import JSON/profile and must be kept private.
+This ZIP contains configuration only. Download/upload the QCOW2 or `.oci` artifact separately; the ZIP is not an OCI image archive. No OCI command is executed by generating or downloading it. Replace every `REPLACE_*` placeholder, validate against the region's live schema, and follow the included instructions. A presigned object URI supplied in the form is included in the import JSON/profile and must be kept private. For an OCI archive, `image-import.json` omits `sourceImageType`: the public CLI/SDK accept `QCOW2`/`VMDK` for standalone imports, and this attribute is not used for OCI-format exports. [Oracle SDK source](https://github.com/oracle/oci-python-sdk/blob/master/src/oci/core/models/image_source_details.py)
 
 ## Published global capability keys
 
@@ -77,7 +80,7 @@ Read-only SSH inspection of user-provided hosts established the following config
 | Layout | 46.6 GiB disk; 100 MiB ESP, 2 GiB XFS `/boot`, LVM with XFS root and `/var/oled` | Same layout |
 | Portable initramfs | OCI vendor configuration sets `hostonly="no"` | Same; includes firmware iSCSI discovery, network userspace, `mlx5_core`, `iscsi_ibft`, and `iscsi_tcp` |
 
-`ACCELERATEDPV` uses the Acceleron SmartNIC data plane to offload network processing from the host CPU. Oracle lists it as the only networking type for E6 Ax VMs. Inside the inspected Linux guest it still uses VirtIO network drivers, so loading an unrelated physical-NIC driver is not the adaptation. The cloud launch must select AcceleratedPV on a supporting shape with a compatible image. Oracle currently lists Oracle Linux 8/9/10 platform images for this networking type; the host audit does not extend that support statement to arbitrary custom images. [Networking types and supported images](https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/edit-launch-options.htm)
+`ACCELERATEDPV` uses the Acceleron SmartNIC data plane to offload network processing from the host CPU. It is the default networking type on E6 Ax VMs. Oracle also lists paravirtualized networking for that shape. Inside the inspected Linux guest it still uses VirtIO network drivers, so loading an unrelated physical-NIC driver is not the adaptation. The cloud launch must select AcceleratedPV on a supporting shape with a compatible image. Oracle currently lists Oracle Linux 8/9/10 platform images for this networking type; the host audit does not extend that support statement to arbitrary custom images. [Networking types and supported images](https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/edit-launch-options.htm)
 
 To prepare an E6 Ax candidate, select **Accelerated PV** for the preferred network attachment and launch mode, use PV boot storage, retain working UEFI, and set the import launch mode to Accelerated PV. Add `VM.Standard.E6.Ax.Flex` to the shape entries. **Destination → Hardware compatibility** offers Accelerated PV networking with either preservation or reconfiguration. The planner checks VirtIO drivers across every selected kernel; reconfiguration rebuilds initramfs when needed, while preservation verifies the existing archive. It does not enable hardware offload on an ordinary PV shape.
 
@@ -115,7 +118,7 @@ A separate read-only comparison examined a `VM.Standard.E5.Flex` launched direct
 | Root and firmware | UEFI, local XFS/LVM root; no iBFT or iSCSI sessions | Same |
 | Network identity | Source NIC MAC and generated DHCP profile | New MAC; generated DHCP profile matches the destination NIC |
 
-Oracle documents **AcceleratedPV** as the only E6 Ax networking type and **Paravirtualized/SR-IOV** for E5 Flex. The E5 guest's observed VirtIO NIC is consistent with the PV path. Acceleron describes the infrastructure providing the Ax data plane; it does not imply a separate Linux driver named Acceleron. Both observed devices bind to the existing VirtIO driver stack. The different subsystem IDs alone do not call for replacing that driver or rebuilding the initramfs. [Shape networking types](https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/edit-launch-options.htm)
+Oracle lists **AcceleratedPV** and **Paravirtualized** for E6 Ax, and **Paravirtualized** and **SR-IOV** for E5 Flex. The E5 guest's observed VirtIO NIC is consistent with the PV path. Acceleron describes the infrastructure providing the Ax data plane; it does not imply a separate Linux driver named Acceleron. Both observed devices bind to the existing VirtIO driver stack. The different subsystem IDs alone do not call for replacing that driver or rebuilding the initramfs. [Shape networking types](https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/edit-launch-options.htm)
 
 Cloud-init completed on both machines, and their cached instance identities matched their respective IMDS identities. The clone's cloud-init-generated `ifcfg-enp0s5` uses DHCP, is enabled at boot, and matches the clone's new MAC. Cloud configuration and dracut configuration hashes matched the source. The existing narrow Oracle bootstrap validator reported ready for both guests; no additional network-rewrite adapter was needed for this evidence.
 
@@ -125,7 +128,7 @@ This move retains PV storage at both ends. Its portability is supported by the e
 
 In Forge, use **Preserve & validate → Virtual machine → Virtual machine**, PV boot, and the destination's network attachment. For the E5 target select **Paravirtualized**; for an E6 Ax target select **Accelerated PV**. Keep OCI guest preparation at **Validate only** to retain existing hardware configuration. A source image's origin and PCI subsystem ID do not select the destination attachment automatically.
 
-An image intended for both destinations can advertise both network values when its guest and regional capability schema support them. Forge checks that each known shape has a supported allowed network choice. An AcceleratedPV-only image cannot advertise E5/E6 non-Ax support, and a PV-only image cannot advertise Ax support. When a portable image's preferred settings do not match an advertised shape, its generated default launch fragment needs destination-specific review. `LaunchOptions.networkType` can override network defaults; `launchMode` is not a top-level `LaunchInstanceDetails` field. [Launch options](https://docs.oracle.com/en-us/iaas/tools/python/latest/api/core/models/oci.core.models.LaunchOptions.html), [instance launch fields](https://docs.oracle.com/en-us/iaas/tools/python/latest/api/core/models/oci.core.models.LaunchInstanceDetails.html)
+An image intended for both destinations can advertise both network values when its guest and regional capability schema support them. Forge checks that each known shape has a supported allowed network choice. A shared PV image can explicitly list a reviewed Ax destination with compatible launch settings. An AcceleratedPV-only image needs an AcceleratedPV-capable shape. When a portable image's preferred settings do not match an advertised shape, its generated default launch fragment needs destination-specific review. `LaunchOptions.networkType` can override network defaults; `launchMode` is not a top-level `LaunchInstanceDetails` field. [Launch options](https://docs.oracle.com/en-us/iaas/tools/python/latest/api/core/models/oci.core.models.LaunchOptions.html), [instance launch fields](https://docs.oracle.com/en-us/iaas/tools/python/latest/api/core/models/oci.core.models.LaunchInstanceDetails.html)
 
 ## Supported values and preferred values
 
@@ -223,6 +226,18 @@ Memory encryption and Secure Boot are instance `platformConfig` properties, resp
 ### Shape compatibility and service-owned image fields
 
 An image's supported-shape list is a separate control-plane resource. `oci compute image-shape-compatibility-entry add` accepts CLI JSON fields `imageId`, `shapeName`, and optional `memoryConstraints`/`ocpuConstraints`. The memory object uses integer `minInGBs`/`maxInGBs`; the OCPU object uses integer `min`/`max`. These describe tested bounds for an image and shape; they do not resize the guest disk, translate machine code, or manufacture missing CPU/device support. [Shape compatibility command](https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/compute/image-shape-compatibility-entry/add.html), [memory constraints](https://docs.oracle.com/en-us/iaas/tools/dotnet/latest/api/Oci.CoreService.Models.ImageMemoryConstraints.html), [OCPU constraints](https://docs.oracle.com/en-us/iaas/tools/dotnet/latest/api/Oci.CoreService.Models.ImageOcpuConstraints.html)
+
+Forge writes effective `VM.Standard.E4.Flex`, `VM.Standard.E5.Flex`, and `VM.Standard.E6.Flex` entries into `.oci` metadata at `additionalMetadata.shapeCompatibilities`, with their exact limits. These public-to-internal name mappings were observed in the supplied Oracle version-2 export. The same metadata structure and OCPU/GiB constraint keys appear in the [published FreeBSD OCI exporter](https://lists.freebsd.org/archives/dev-commits-src-all/2025-March/052583.html). This is evidence for the bounded export mapping, not a published universal Oracle metadata contract. No source image IDs, unrelated source shapes, or inferred bare-metal internal names are copied. The archive receipt lists `embedded_shapes` and `companion_only_shapes`; every effective entry remains in the companion for public-API application and verification.
+
+After uploading the image and filling the object location and compartment in `image-import.json`, the companion provides one command:
+
+```sh
+python3 apply-oci.py --import-image
+```
+
+It requires Python 3 and a configured OCI CLI on Linux/macOS. Use a CLI version supporting the selected launch mode; older versions such as 3.66.1 do not accept `ACCELERATEDPV`. Optional `--profile NAME` and `--region REGION` choose the OCI context. The command saves the returned image OCID before waiting for `AVAILABLE`, adds or updates all requested public shape entries, and verifies their names and specified bounds with the [paginated shape list API](https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/compute/image-shape-compatibility-entry/list.html). For an image already imported through the Console or CLI, run `python3 apply-oci.py --image-id IMAGE_OCID` instead.
+
+Retry the same command after a partial failure. Its private `.forge-oci-apply-state.json` prevents another import, and matching shape entries are skipped. An uncertain import response stops automatic resubmission: locate the created image and resume with its OCID. Use a separate bundle extraction for a different image, profile, or edited configuration. Unrelated shapes and existing constraint fields omitted from the requested rows are preserved. The utility does not upload the disk, create an instance, or apply capability schemas; review the existing schema steps below when additional capabilities are needed. Generating or downloading the bundle itself makes no OCI API calls.
 
 The `Image` response also contains service-owned fields such as its OCID, lifecycle state, creation time, billing size, boot-volume size, and image-creation eligibility. These are not editable import options simply because they appear in exported metadata or API responses. In particular, `sizeInMBs` describes the boot volume's size and differs from the uploaded QCOW2 file length. [Image resource model](https://docs.oracle.com/en-us/iaas/tools/python/latest/api/core/models/oci.core.models.Image.html)
 

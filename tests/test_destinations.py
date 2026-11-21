@@ -78,6 +78,42 @@ def test_preserve_mode_never_schedules_writes_or_packages():
     assert not any(options[key] for key in ("install_packages", "configure_network", "configure_serial_console"))
 
 
+@pytest.mark.parametrize("cloud_ready,oci_prepare", [(True, False), (False, True)])
+def test_automatic_does_only_the_preparation_needed_for_the_destination(cloud_ready, oci_prepare):
+    from test_platform import image as hardware_image, KERNEL
+    from test_oci_guest import inspected
+    source = hardware_image()
+    guest = inspected()["oci_evidence"]
+    kernel = next(iter(guest["kernels"].values()))
+    kernel.update(initrd=source["platform"]["kernels"][KERNEL]["initrd"], initrd_modules=[])
+    guest.update(kernels={KERNEL: kernel}, cloud_init_ready=cloud_ready)
+    source["oci_evidence"] = guest
+    before = deepcopy(source)
+    result = resolve_destination(source, {"profile_id": "oci:VM.Standard.E5.Flex"})
+    assert result["platform_migration"]["strategy"] == "reconfigure"
+    assert result["oci_defaults"]["guest"]["prepare"] is oci_prepare
+    explicit = resolve_destination(source, {"profile_id": "oci:VM.Standard.E5.Flex", "strategy": "reconfigure"})
+    assert explicit["oci_defaults"]["guest"]["prepare"]
+    assert source == before
+
+
+def test_automatic_preserves_a_guest_with_existing_platform_and_provider_evidence():
+    from test_portability import image as portable_image, KERNEL
+    from test_oci_guest import inspected
+    source = portable_image()
+    guest = inspected()["oci_evidence"]
+    kernel = next(iter(guest["kernels"].values()))
+    kernel["initrd"] = source["platform"]["kernels"][KERNEL]["initrd"]
+    guest["kernels"] = {KERNEL: kernel}
+    source["oci_evidence"] = guest
+    for profile in ("oci:VM.Standard.E5.Flex", "generic:x86_64:vm"):
+        result = resolve_destination(source, {"profile_id": profile, "strategy": "auto"})
+        assert result["platform_migration"]["strategy"] == "preserve"
+        assert result["required_packages"] == []
+        if result["oci_defaults"]:
+            assert not result["oci_defaults"]["guest"]["prepare"]
+
+
 def test_generic_resolution_does_not_generate_oci_metadata_and_x86_keeps_bios():
     source = image("amd64")
     source["boot"] = {"recommended_firmware": "BIOS", "supported_firmware": ["BIOS"]}

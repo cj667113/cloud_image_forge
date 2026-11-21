@@ -296,8 +296,9 @@ def inspect_guest(g, root: str, partitions: list, kernels: list, boot: dict | No
         if initrd:
             try:
                 members = g.initrd_list(initrd)
-                initrd_modules = _module_names(members)
                 names = {name.removeprefix("./").lstrip("/") for name in members}
+                if "early_cpio" not in names:
+                    initrd_modules = _module_names(members)
                 if names.intersection({"usr/lib/dracut/modules.txt", "lib/dracut/modules.txt"}):
                     initramfs_backend = "dracut"
             except RuntimeError:
@@ -634,7 +635,8 @@ def _initramfs_script(inspection, plan):
         if plan["initramfs_backend"] == "dracut":
             path = kernel.get("initrd") or f"/boot/initramfs-{version}.img"
             modules = sorted(set(plan["required_modules"]) & set(kernel.get("modules", [])))
-            command = f"dracut --force --no-hostonly --add-drivers {shlex.quote(' '.join(modules))} {shlex.quote(path)} {version_q}"
+            generic = " --no-hostonly-cmdline" if plan.get("combined_platform") else ""
+            command = f"dracut --force --no-hostonly{generic} --add-drivers {shlex.quote(' '.join(modules))} {shlex.quote(path)} {version_q}"
             if plan["iscsi_boot"]:
                 command += " --add 'iscsi network-manager' --omit 'systemd-networkd network-legacy'"
             commands += [command, f"listing=$(lsinitrd {shlex.quote(path)})"]
@@ -652,15 +654,77 @@ def _initramfs_script(inspection, plan):
     return "\n".join(commands)
 
 
+def _check_deferred_platform(inspection, pending, options, mount_policy):
+    from .engine import EngineError
+    from .platform import _dict, _shared_kernel_state
+    if (pending.get("version") != 1 or pending.get("options") != _dict(options)
+            or pending.get("mount_policy") != mount_policy or not pending.get("hashes")
+            or pending["hashes"] != inspection.get("platform", {}).get("portability", {}).get("hashes")
+            or not pending.get("kernels")
+            or pending["kernels"] != _shared_kernel_state(inspection, pending.get("initramfs_backend"))):
+        raise EngineError("Deferred hardware preparation changed before the combined rebuild; repeat the build.")
+
+
+def verify_shared_preparation(inspection, config, options, receipt, *, mount_policy="auto"):
+    """Complete/recheck one shared rebuild using only exact observed file proof."""
+    from copy import deepcopy
+    from .oci import OciConfig, compatibility_plan
+    from .platform import verify_platform
+    blockers = []
+    actual = inspection.get("platform", {}).get("kernels", {})
+    provider = inspection.get("oci_evidence", {}).get("kernels", {})
+    proven = receipt.get("verified_initrds") or {}
+    images = receipt.get("verified_kernel_images") or {}
+    hashes = inspection.get("platform", {}).get("portability", {}).get("hashes", {})
+    if not proven or not images or not (set(actual) == set(provider) == set(proven) == set(images)):
+        blockers.append("Combined rebuild kernel inventory or native verification receipt is missing or changed.")
+    evidence = deepcopy(inspection)
+    for version, record in proven.items():
+        kernel = actual.get(version, {})
+        if (not re.fullmatch(r"[0-9a-f]{64}", record.get("sha256") or "")
+                or record.get("sha256") != kernel.get("initrd_sha256")
+                or not record.get("path") or record["path"] != kernel.get("initrd")
+                or record["path"] != provider.get(version, {}).get("initrd")
+                or not re.fullmatch(r"sha256:[0-9a-f]{64}", images.get(version, ""))
+                or hashes.get("/boot/vmlinuz-" + version) != images.get(version)):
+            blockers.append(f"Kernel {version}: combined rebuild kernel/initramfs path or digest changed after native verification.")
+        elif version in evidence.get("oci_evidence", {}).get("kernels", {}):
+            # Native listing proof is usable only for these exact archived bytes.
+            guest = evidence["oci_evidence"]["kernels"][version]
+            guest["initrd_modules"] = sorted(set(guest.get("initrd_modules") or []) | set(record.get("modules", [])))
+    if not blockers:
+        model = config if isinstance(config, OciConfig) else OciConfig.model_validate(config)
+        model = model.model_copy(deep=True)
+        model.guest.prepare = False
+        provider_plan = compatibility_plan(evidence, model, False, platform_migration=options,
+                                           project_platform=False, mount_policy=mount_policy)
+        blockers.extend(provider_plan["blockers"])
+        hardware_plan = verify_platform(evidence, options, oci_config=model, receipt=receipt, mount_policy=mount_policy)
+        blockers.extend(hardware_plan["blockers"])
+    return {"ready": not blockers, "blockers": list(dict.fromkeys(blockers))}
+
+
 def prepare_guest(work: Path, inspection: dict, config: dict, allow_network: bool, log,
-                  *, extra_required_modules=(), platform_migration=None, mount_policy="auto") -> dict:
+                  *, extra_required_modules=(), platform_migration=None, mount_policy="auto", deferred_platform=None) -> dict:
     from .engine import EngineError, ImageEngine, _grub_assignment, _guest, _mount, _roots, _run, _run_guest_script
     from .oci import OciConfig, compatibility_plan
 
     model = OciConfig.model_validate(config)
-    plan = compatibility_plan(inspection, model, allow_network, platform_migration=platform_migration, mount_policy=mount_policy)
+    if deferred_platform:
+        _check_deferred_platform(inspection, deferred_platform, platform_migration, mount_policy)
+        if not model.guest.prepare:
+            raise EngineError("Deferred hardware preparation requires actual OCI guest preparation.")
+    plan = compatibility_plan(inspection, model, allow_network, platform_migration=platform_migration,
+                              project_platform=False, mount_policy=mount_policy)
     if plan["blockers"]:
         raise EngineError("OCI preparation blocked: " + " ".join(plan["blockers"]))
+    if deferred_platform:
+        if (plan["packages"] or plan["initramfs_backend"] != deferred_platform["initramfs_backend"]
+                or not plan.get("platform_migration", {}).get("ready")):
+            raise EngineError("Combined rebuild prerequisites changed; use separate preparation passes.")
+        extra_required_modules = sorted(set(extra_required_modules) | set(deferred_platform["required_modules"])
+                                        | set(plan["platform_migration"]["required_modules"]))
+        plan["combined_platform"] = True
     if not config.get("guest", {}).get("prepare", True):
         plan["_inspection"] = inspection
         return plan
@@ -668,10 +732,13 @@ def prepare_guest(work: Path, inspection: dict, config: dict, allow_network: boo
         log("OCI: " + change)
     original_network_backend = plan.get("network_backend")
     if plan["packages"]:
+        log("Installing OCI preparation packages: " + ", ".join(plan["packages"]))
         _run(["virt-customize", "--format", "qcow2", "-a", str(work), "--network", "--install", ",".join(plan["packages"])], log)
-        inspection = ImageEngine().inspect(work)
+        log("Checking OCI prerequisites after package installation")
+        inspection = ImageEngine().inspect(work, include_editor=False)
         inspection["oci_evidence"]["network_backend"] = original_network_backend
-        plan = compatibility_plan(inspection, model, allow_network=False, platform_migration=platform_migration, mount_policy=mount_policy)
+        plan = compatibility_plan(inspection, model, allow_network=False, platform_migration=platform_migration,
+                                  project_platform=False, mount_policy=mount_policy)
         if plan["blockers"]:
             raise EngineError("OCI prerequisites still missing after package installation: " + " ".join(plan["blockers"]))
     if extra_required_modules:
@@ -742,21 +809,30 @@ def prepare_guest(work: Path, inspection: dict, config: dict, allow_network: boo
             path = "/etc/default/grub"
             text = _read(g, path)
             match = re.search(r"^GRUB_CMDLINE_LINUX=(.*)$", text, re.M)
-            parsed = shlex.split(match[1]) if match else []
-            args = parsed[0] if parsed else ""
-            if "$" in args or "`" in args:
-                raise EngineError("GRUB_CMDLINE_LINUX uses shell expansion; configure serial arguments manually before OCI preparation.")
-            serial_args = f"console=tty0 console={serial},115200n8"
-            args = args.strip() + " " + serial_args
-            _write(g, path, _grub_assignment(text, "GRUB_CMDLINE_LINUX", args.strip()))
+            from .platform import _boot_args
+            try:
+                words = _boot_args(match[1], assignment=True) if match else []
+            except ValueError as exc:
+                raise EngineError(str(exc)) from exc
+            consoles = ["console=tty0", f"console={serial},115200n8"]
+            devices = {"console=tty0", "console=" + serial}
+            updated = [word for word in words if word.split(",", 1)[0] not in devices] + consoles
+            if updated != words:
+                _write(g, path, _grub_assignment(text, "GRUB_CMDLINE_LINUX", shlex.join(updated)))
             if evidence["tools"].get("grubby"):
-                commands += ["grubby --update-kernel=ALL --args=" + shlex.quote(serial_args)]
-            commands += ["update-grub" if evidence["tools"].get("update-grub") else "grub2-mkconfig -o /boot/grub2/grub.cfg", f"systemctl --root=/ enable serial-getty@{serial}.service"]
+                commands += ["grubby --update-kernel=ALL --args=" + shlex.quote(" ".join(consoles))]
+            if not deferred_platform:
+                commands.append("update-grub" if evidence["tools"].get("update-grub") else "grub2-mkconfig -o /boot/grub2/grub.cfg")
+            commands.append(f"systemctl --root=/ enable serial-getty@{serial}.service")
         _write(g, PROFILE, json.dumps({"capabilities": config["capabilities"], "required_modules": plan["required_modules"], "kernel_versions": list(evidence["kernels"])}, indent=2) + "\n")
     commands.append(_initramfs_script(inspection, plan))
+    if deferred_platform:
+        commands.append("update-grub" if evidence["tools"].get("update-grub") else "grub2-mkconfig -o /boot/grub2/grub.cfg")
+    log(f"Rebuilding and verifying OCI boot files for {len(evidence['kernels'])} kernel(s)")
     _run_guest_script(work, "set -eu\n" + "\n".join(commands), log)
+    log("Inspecting the prepared OCI configuration and boot files")
     # Check the actual written files and enabled services, not the provenance marker.
-    after = ImageEngine().inspect(work)
+    after = ImageEngine().inspect(work, include_editor=False)
     after_kernels = after.get("oci_evidence", {}).get("kernels", {})
     if set(after_kernels) != set(evidence["kernels"]):
         raise EngineError("Kernel inventory changed during OCI preparation; inspect the build before export.")
@@ -793,6 +869,12 @@ def prepare_guest(work: Path, inspection: dict, config: dict, allow_network: boo
             for version, kernel in after.get("platform", {}).get("kernels", {}).items()
         }
     plan["iscsi_network_handover"] = bool(after.get("oci_evidence", {}).get("iscsi_network_handover"))
+    if deferred_platform:
+        plan["verified_kernel_images"] = {version: kernel["kernel_sha256"] for version, kernel in deferred_platform["kernels"].items()}
+        completed = verify_shared_preparation(after, model, platform_migration, plan, mount_policy=mount_policy)
+        if not completed["ready"]:
+            raise EngineError("Combined hardware/OCI verification failed: " + " ".join(completed["blockers"]))
+        plan["combined_verified"] = True
     log("OCI guest preparation completed; actual configuration and rebuilt initramfs driver inclusion verified")
     plan["_inspection"] = after
     return plan

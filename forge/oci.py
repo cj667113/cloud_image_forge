@@ -6,6 +6,7 @@ API values. It is not a tenancy schema or proof an image boots on a given shape.
 from __future__ import annotations
 
 from copy import deepcopy
+import io
 import json
 from pathlib import Path
 import re
@@ -26,14 +27,17 @@ SOURCES = [
     {"title": "OCI networking types and supported shapes", "url": "https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/edit-launch-options.htm"},
     {"title": "OCI launch option API values", "url": "https://docs.oracle.com/en-us/iaas/tools/python/latest/api/core/models/oci.core.models.LaunchOptions.html"},
     {"title": "OCI shape CPU architectures", "url": "https://docs.oracle.com/en-us/iaas/Content/Compute/References/computeshapes.htm"},
+    {"title": "OCI image shape compatibility add", "url": "https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/compute/image-shape-compatibility-entry/add.html"},
+    {"title": "OCI image shape compatibility list", "url": "https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/compute/image-shape-compatibility-entry/list.html"},
 ]
-CHECKED_ON = "2026-10-28"
+CHECKED_ON = "2026-11-21"
 STORAGE_TYPES = ["ISCSI", "SCSI", "IDE", "PARAVIRTUALIZED"]
 ACCELERATED_VM_SHAPES = {"VM.Standard.E6.Ax.Flex", "VM.DenseIO.E6.Ax.Flex",
                          "VM.Standard4.Ax.Flex", "VM.Standard.A4.Ax.Flex"}
 # Exact documented shapes only: similar names do not establish attachment support.
 SHAPE_NETWORK_TYPES = {
-    **{shape: frozenset({"ACCELERATEDPV"}) for shape in ACCELERATED_VM_SHAPES},
+    **{shape: frozenset({"PARAVIRTUALIZED", "ACCELERATEDPV"}) for shape in ACCELERATED_VM_SHAPES},
+    "VM.Standard.E4.Flex": frozenset({"PARAVIRTUALIZED", "VFIO"}),
     "VM.Standard.E5.Flex": frozenset({"PARAVIRTUALIZED", "VFIO"}),
     "VM.Standard.E6.Flex": frozenset({"PARAVIRTUALIZED", "VFIO"}),
 }
@@ -186,6 +190,7 @@ class ImportOptions(StrictModel):
     freeform_tags: dict[str, str] = Field(default_factory=dict, max_length=100)
     defined_tags: dict[str, dict[str, Any]] = Field(default_factory=dict, max_length=100)
     shape_compatibility: list[ShapeCompatibility] = Field(default_factory=list, max_length=100)
+    shape_compatibility_mode: Literal["auto", "manual"] = "auto"
 
     @model_validator(mode="after")
     def valid_location(self):
@@ -376,7 +381,11 @@ def compatibility_plan(inspection: dict, config: OciConfig, allow_network=False,
         plan["warnings"].append("Select the target tenancy's global capability schema version before applying the exported OCI configuration.")
     if config.import_options.launch_mode != mode:
         plan["warnings"].append("Import launch mode differs from the preferred image capability. Apply the capability schema after import and verify OCI's resulting launch settings.")
-    for shape in config.import_options.shape_compatibility:
+    from .oci_shapes import resolve_shape_compatibility
+    shape_resolution = resolve_shape_compatibility(inspection, config, platform_migration)
+    plan["shape_compatibility_resolution"] = shape_resolution
+    plan["warnings"].extend(shape_resolution["warnings"])
+    for shape in (ShapeCompatibility.model_validate(row) for row in shape_resolution["effective_shapes"]):
         arch = normalize_arch(inspection.get("os", {}).get("arch"))
         required_arch = "aarch64" if shape.shape in ARM_SHAPES else "x86_64" if shape.shape in X86_SHAPES else None
         if required_arch and arch != "unknown" and arch != required_arch:
@@ -398,7 +407,7 @@ def compatibility_plan(inspection: dict, config: OciConfig, allow_network=False,
                 plan["blockers"].append("BM.Standard.E5.192 requires iSCSI boot and hardware/VFIO networking in the allowed attachment types; its reviewed NIC driver is mlx5_core.")
             if platform_migration and platform_migration.get("enabled") and platform_migration.get("nic_driver") not in {None, "auto", "mlx5_core"}:
                 plan["blockers"].append("BM.Standard.E5.192 uses mlx5_core on the reviewed hardware; the machine migration NIC driver conflicts with that target.")
-    if config.import_options.shape_compatibility:
+    if shape_resolution["effective_shapes"]:
         plan["warnings"].append("Shape compatibility entries only advertise support. Verify the selected shapes' architecture, boot modes, memory/OCPU limits and confidential-computing support in the destination region.")
     for key in config.capabilities.keys() - GLOBAL_SCHEMA.keys():
         plan["warnings"].append(f"{key}: supplied tenancy capability will be exported, but no guest adaptation or readiness check exists for this additional key.")
@@ -418,9 +427,13 @@ def bundle_files(config: OciConfig, artifact: dict) -> dict[str, str]:
     comp = options.compartment_id or "REPLACE_COMPARTMENT_OCID"
     version = config.global_schema_version or "REPLACE_GLOBAL_SCHEMA_VERSION"
     image_id = "REPLACE_IMPORTED_IMAGE_OCID"
-    imports = {"compartmentId": comp, "sourceImageType": "OCI" if artifact.get("format") == "oci" else "QCOW2", "launchMode": options.launch_mode,
+    imports = {"compartmentId": comp, "launchMode": options.launch_mode,
                "displayName": options.display_name or "Cloud Image Forge image",
                "freeformTags": options.freeform_tags, "definedTags": options.defined_tags}
+    # The public CLI/SDK only accept QCOW2/VMDK here. For an OCI archive,
+    # sourceImageType is omitted so the service reads its packaged metadata.
+    if artifact.get("format") != "oci":
+        imports["sourceImageType"] = "QCOW2"
     if options.operating_system:
         imports["operatingSystem"] = options.operating_system
     if options.operating_system_version:
@@ -448,23 +461,38 @@ def bundle_files(config: OciConfig, artifact: dict) -> dict[str, str]:
              "instance-launch-fragment.json": instance_fragment,
              "forge-oci-profile.json": config.model_dump(),
              "artifact.json": {k: artifact[k] for k in ("name", "sha256", "virtual_size", "format", "architecture") if k in artifact}}
+    from .oci_archive import shape_entries
+    entries = shape_entries(config, artifact.get("shape_compatibility_resolution"))
+    files["shape-compatibility.json"] = {"version": 1, "entries": entries}
+    if artifact.get("shape_compatibility_resolution"):
+        files["shape-resolution.json"] = artifact["shape_compatibility_resolution"]
     shape_commands = []
-    for i, shape in enumerate(options.shape_compatibility, 1):
-        entry = {"imageId": image_id, "shapeName": shape.shape}
-        if shape.min_ocpus is not None or shape.max_ocpus is not None:
-            entry["ocpuConstraints"] = {k: v for k, v in (("min", shape.min_ocpus), ("max", shape.max_ocpus)) if v is not None}
-        if shape.min_memory_gbs is not None or shape.max_memory_gbs is not None:
-            entry["memoryConstraints"] = {k: v for k, v in (("minInGBs", shape.min_memory_gbs), ("maxInGBs", shape.max_memory_gbs)) if v is not None}
+    for i, shape in enumerate(entries, 1):
+        entry = {"imageId": image_id, **{key: value for key, value in shape.items() if value is not None}}
         name = f"shape-{i:03}.json"
         files[name] = entry
         shape_commands.append(f"oci compute image-shape-compatibility-entry add --from-json file://{name}")
     rendered = {name: json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n" for name, value in files.items()}
+    rendered["apply-oci.py"] = Path(__file__).with_name("oci_apply.py").read_text(encoding="utf-8")
     rendered["README.txt"] = (
         "OCI configuration for a Cloud Image Forge artifact\n\n"
         "This ZIP contains configuration only. It is NOT an OCI .oci image archive.\n"
         f"Upload the {'OCI image archive (.oci)' if artifact.get('format') == 'oci' else 'standalone QCOW2 disk'} to OCI Object Storage. This configuration ZIP is separate; generic S3 upload does not register an OCI image.\n"
         "No cloud command has been run. Review every file and replace all REPLACE_* values before using it.\n"
         "Presigned object URIs, if supplied, are included in image-import.json and the profile; keep this ZIP private.\n\n"
+        "Import and apply every compatible shape in one command (Python 3 + configured OCI CLI on Linux/macOS):\n"
+        "   python3 apply-oci.py --import-image\n"
+        "For an image already imported, including through the Console:\n"
+        "   python3 apply-oci.py --image-id IMAGE_OCID\n"
+        "Optional --profile NAME and --region REGION select the destination OCI context.\n"
+        "Use an OCI CLI version that supports the selected launch mode; older releases may reject ACCELERATEDPV.\n"
+        "The command waits for AVAILABLE, applies all shape-compatibility.json names/limits, and verifies the complete requested list.\n"
+        "It preserves unrelated shapes and unspecified existing bounds; it never uploads a disk or launches an instance.\n"
+        "Rerun the same command after a partial failure: saved state prevents a second import and matching shapes are skipped.\n"
+        "If an import response was lost, find the created image in OCI and resume with --image-id; no blind import retry occurs.\n"
+        "Keep .forge-oci-apply-state.json with this extracted bundle. Use a separate extraction for another import/profile.\n"
+        "The script applies shape entries only; review/apply any additional capability schema below.\n\n"
+        "OCI archives omit sourceImageType in the import request; the public CLI accepts only QCOW2/VMDK values for standalone images.\n\n"
         "1. Obtain the target region/tenancy schema (do not guess its version):\n"
         "   oci compute global-image-capability-schema list --all\n"
         "   oci compute global-image-capability-schema-version get --global-image-capability-schema-id SCHEMA_OCID --global-image-capability-schema-version-name VERSION\n"
@@ -472,7 +500,8 @@ def bundle_files(config: OciConfig, artifact: dict) -> dict[str, str]:
         "   ACCELERATEDPV must be accepted by that schema and supported by both the image and the destination Acceleron shape.\n"
         "2. Check the artifact SHA-256, upload it, then import:\n"
         f"   oci compute image import {method} --from-json file://image-import.json\n"
-        "   Wait for image lifecycle state AVAILABLE; substitute its OCID in schema/shape JSON files.\n"
+        "   Or use apply-oci.py above to import and apply all shapes automatically.\n"
+        "   Wait for image lifecycle state AVAILABLE; substitute its OCID in schema/shape JSON files when using manual commands.\n"
         "3. Create the image capability schema (do not create a second one if one already exists):\n"
         "   oci compute image-capability-schema create --from-json file://image-capability-schema.json\n"
         "   For an existing schema, use its ID and update --schema-data file://schema-data.json.\n"
@@ -501,3 +530,20 @@ def write_bundle(path: Path, config: OciConfig, artifact: dict):
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, content in bundle_files(config, artifact).items():
             archive.writestr(name, content)
+
+
+def renamed_bundle(path: Path, filename: str) -> bytes:
+    """Serve the build-time configuration with the export's current filename."""
+    output = io.BytesIO()
+    with zipfile.ZipFile(path) as original, zipfile.ZipFile(output, "w") as renamed:
+        options = json.loads(original.read("forge-oci-profile.json")).get("import_options", {})
+        for entry in original.infolist():
+            data = original.read(entry)
+            if entry.filename == "artifact.json" or (
+                entry.filename == "image-import.json" and not options.get("object_name") and not options.get("object_uri")
+            ):
+                metadata = json.loads(data)
+                metadata["name"] = filename
+                data = (json.dumps(metadata, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+            renamed.writestr(entry, data)
+    return output.getvalue()

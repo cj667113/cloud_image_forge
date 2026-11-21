@@ -218,7 +218,7 @@ async function previewStorage(config=undefined,beforeBuild=false,disk=undefined,
   const imageId=state.selected,revision=state.editorRevision,snapshot=studioInspectionKey(),button=$('#storage-plan-button'),requestId=beginStudioPlan(button);notice('#storage-plan-error','');
   try {
     const body=storagePlanBody(config,disk,mountPolicy),signature=JSON.stringify(body);
-    const plan=await api(`/images/${encodeURIComponent(imageId)}/storage/plan`,{method:'POST',body:signature});
+    const plan=await requestPreview('storage',body,beforeBuild);
     if(state.selected!==imageId||state.editorRevision!==revision||studioInspectionKey()!==snapshot){if(beforeBuild)throw new Error('Storage choices changed. Check the current plan again.');return null;}
     studioSession().storage={signature,plan,snapshot};updateStorageStudio();renderStoragePlan(plan);
     if(beforeBuild&&(!plan.ready||plan.blockers?.length)){setTab('storage');throw new Error('Resolve the storage plan blockers before continuing.');}return plan;
@@ -275,7 +275,7 @@ function renderPlatformStudio() {
     <label class="check-field feature-switch"><input type="checkbox" id="platform-enabled"><span>Check or prepare target hardware</span></label>
     <div id="platform-controls" hidden>
       ${!studioImage()?.inspection?.platform?'<div class="notice warning">Refresh inspection to check hardware support. <button type="button" class="button ghost small" data-action="refresh-inspection">Refresh</button></div>':''}
-      <label class="field">Behavior<select id="platform-strategy"><option value="reconfigure" selected>Prepare for destination</option><option value="preserve">Preserve &amp; validate</option></select>${helpHint('Preserve validates existing hardware settings without rewriting them. Separately requested edits still apply. Prepare changes boot drivers and networking as shown in the plan. Mount identifiers follow the separate Mounts policy.','Hardware behavior')}</label>
+      <label class="field">Behavior<select id="platform-strategy"><option value="auto" selected>Automatic · prepare only when needed</option><option value="reconfigure">Prepare for destination</option><option value="preserve">Preserve &amp; validate</option></select>${helpHint('Automatic checks existing readiness and avoids preparation when the destination already works offline. Preserve validates existing hardware settings without rewriting them. Separately requested edits still apply. Prepare changes boot drivers and networking as shown in the plan. Mount identifiers follow the separate Mounts policy.','Hardware behavior')}</label>
       ${renderDestinationProfile()}
       <div class="notice warning" id="platform-provider-warning"></div>
       <details class="editor-disclosure platform-advanced-options" id="platform-advanced" data-disclosure="platform-advanced"><summary>Hardware overrides <span class="disclosure-meta">Advanced</span></summary><div class="details-content"><div class="platform-direction"><label class="field">Previous platform<select id="platform-source"><option value="unknown" selected>Not specified</option><option value="vm">Virtual machine</option><option value="bare_metal">Bare metal</option></select>${helpHint('Leave unspecified when the previous platform is unknown. Preparation follows the destination; inspection does not establish where the image last ran.','Source type')}</label><span class="direction-arrow" aria-hidden="true">${icon('arrow')}</span><label class="field">Target type<select id="platform-target"><option value="bare_metal">Bare metal</option><option value="vm" selected>Virtual machine</option></select></label></div>
@@ -295,16 +295,23 @@ function renderPlatformStudio() {
       <div id="platform-plan-error" class="notice error" role="alert" hidden></div><div id="platform-plan" class="studio-plan"></div>
     </div></section>`;
 }
+function effectivePlatformStrategy() {
+  const selected=$('#platform-strategy')?.value;
+  if(selected!=='auto')return selected;
+  const result=studioSession().destination;
+  return result?.selection===JSON.stringify(destinationSelection())&&result.snapshot===studioInspectionKey()?result.platform_migration?.strategy:null;
+}
 function getPlatformMigrationConfig() {
   if(!$('#platform-enabled')?.checked)return null;
-  const strategy=$('#platform-strategy').value,preserve=strategy==='preserve';
-  const config={enabled:true,strategy,source:$('#platform-source').value,target:$('#platform-target').value,boot_attachment:$('#platform-boot').value,network_attachment:$('#platform-network').value,nic_driver:$('#platform-nic').value||null,install_packages:!preserve&&$('#platform-install-packages').checked,configure_network:!preserve&&$('#platform-configure-network').checked,configure_serial_console:!preserve&&$('#platform-serial-console').checked};
   const destinationIssue=destinationConfigurationIssue();if(destinationIssue)throw editorError(destinationIssue,'#destination-profile');
+  const strategy=effectivePlatformStrategy(),preserve=strategy==='preserve';
+  if(!['preserve','reconfigure'].includes(strategy))throw editorError('Resolve the automatic destination behavior before continuing.','#destination-profile');
+  const config={enabled:true,strategy,source:$('#platform-source').value,target:$('#platform-target').value,boot_attachment:$('#platform-boot').value,network_attachment:$('#platform-network').value,nic_driver:$('#platform-nic').value||null,install_packages:!preserve&&$('#platform-install-packages').checked,configure_network:!preserve&&$('#platform-configure-network').checked,configure_serial_console:!preserve&&$('#platform-serial-console').checked};
   if(platformPreserveConflict())throw editorError('Turn off OCI guest preparation to preserve the existing hardware configuration.','#platform-preserve-validate-button');
   if((config.target==='bare_metal'||config.network_attachment==='vfio')&&!config.nic_driver)throw editorError('Choose Automatic or the NIC driver for the destination hardware.','#platform-nic');
   return config;
 }
-function platformPreserveConflict() { return Boolean($('#platform-enabled')?.checked&&$('#platform-strategy')?.value==='preserve'&&$('input[name="target"]:checked')?.value==='oci'&&$('#oci-enabled')?.checked&&$('#oci-prepare')?.checked); }
+function platformPreserveConflict() { return Boolean($('#platform-enabled')?.checked&&effectivePlatformStrategy()==='preserve'&&$('input[name="target"]:checked')?.value==='oci'&&$('#oci-enabled')?.checked&&$('#oci-prepare')?.checked); }
 function updatePlatformPreserveConflict() { for(const id of ['platform-preserve-conflict','oci-platform-preserve-conflict']) { const node=$(`#${id}`);if(node)node.hidden=!platformPreserveConflict(); } }
 function preservePlatformConfiguration() {
   if($('#oci-prepare'))$('#oci-prepare').checked=false;
@@ -314,7 +321,7 @@ function preservePlatformConfiguration() {
 function syncOciPlatformChoices() {
   if(!$('#platform-enabled')?.checked)return;
   if($('#destination-profile')?.value!=='custom')return;
-  if($('#platform-strategy')?.value==='preserve'){studioSession().pendingOciPlatformSync=false;return;}
+  if(effectivePlatformStrategy()==='preserve'){studioSession().pendingOciPlatformSync=false;return;}
   if($('input[name="target"]:checked')?.value!=='oci'){studioSession().pendingOciPlatformSync=true;return;}
   studioSession().pendingOciPlatformSync=false;
   const boot=$('#platform-boot').value==='iscsi'?'ISCSI':'PARAVIRTUALIZED',network={vfio:'VFIO',paravirtualized:'PARAVIRTUALIZED',accelerated:'ACCELERATEDPV'}[$('#platform-network').value];
@@ -338,7 +345,7 @@ function syncOciPlatformChoices() {
 }
 function updatePlatformStudio() {
   if(!$('#platform-studio'))return;
-  const enabled=$('#platform-enabled').checked,preserve=$('#platform-strategy').value==='preserve',bare=$('#platform-target').value==='bare_metal',oci=$('input[name="target"]:checked')?.value==='oci';
+  const enabled=$('#platform-enabled').checked,preserve=effectivePlatformStrategy()==='preserve',bare=$('#platform-target').value==='bare_metal',oci=$('input[name="target"]:checked')?.value==='oci';
   $('#platform-controls').hidden=!enabled;
   $('#platform-write-options').hidden=preserve;
   updatePlatformPreserveConflict();
@@ -368,7 +375,7 @@ async function previewPlatform(config=undefined,beforeBuild=false,recipe=null) {
   const imageId=state.selected,revision=state.editorRevision,snapshot=studioInspectionKey(),button=$('#platform-plan-button'),requestId=beginStudioPlan(button);notice('#platform-plan-error','');
   try {
     const body=platformPlanBody(config,recipe);if(!body.platform_migration)throw new Error('Enable platform preparation to check its prerequisites.');
-    const plan=await api(`/images/${encodeURIComponent(imageId)}/platform/plan`,{method:'POST',body:JSON.stringify(body)});
+    const plan=await requestPreview('platform',body,beforeBuild);
     if(state.selected!==imageId||state.editorRevision!==revision||studioInspectionKey()!==snapshot){if(beforeBuild)throw new Error('Platform choices changed. Check the current plan again.');return null;}
     studioSession().platform={signature:JSON.stringify(body),plan,snapshot};renderPlatformPlan(plan);
     if(beforeBuild&&(!plan.ready||plan.blockers?.length)){setTab('export');throw new Error('Resolve the platform plan blockers before continuing.');}return plan;
@@ -389,7 +396,7 @@ document.addEventListener('click',event=>{
   if(button.dataset.studioAction==='storage-preview')previewStorage();
   if(button.dataset.studioAction==='storage-fit')fitStorageDisk();
   if(button.dataset.studioAction==='platform-preview')previewPlatform();
-  if(button.dataset.studioAction==='platform-validate-oci'){preservePlatformConfiguration();state.editorRevision++;invalidateStudioPlans('platform');updatePlatformStudio();}
+  if(button.dataset.studioAction==='platform-validate-oci'){const preference=studioSession().destinationOciPrepare;if(preference){preference.prepare=false;preference.manual=true;}preservePlatformConfiguration();state.editorRevision++;invalidateStudioPlans('platform');updatePlatformStudio();}
 });
 document.addEventListener('mouseover',event=>{
   const anchor=event.target.closest('.help-anchor');if(!anchor)return;

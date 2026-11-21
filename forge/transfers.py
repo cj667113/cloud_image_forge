@@ -215,7 +215,10 @@ def unpack_oci(source: Path, name: str, settings: Settings, log) -> tuple[Path, 
     seen = set()
     image_path = source.parent / "disk.qcow2"
     try:
-        with tarfile.open(source, mode="r|*") as archive:
+        # Forge and OCI export plain tar. Large sequential reads help on multi-
+        # GiB disks; retain tarfile's smaller decoder input for compressed imports.
+        options = {"mode": "r|", "bufsize": 1024**2} if header[257:262] == b"ustar" else {"mode": "r|*"}
+        with tarfile.open(source, **options) as archive:
             for member in archive:
                 if not member.isfile() or member.name not in {"output.QCOW2", "image_metadata.json"} or member.name in seen:
                     raise TransferError("An OCI bundle must contain only regular root-level output.QCOW2 and image_metadata.json files")

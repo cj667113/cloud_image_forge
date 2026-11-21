@@ -142,10 +142,10 @@ def test_metadata_format_is_a_separate_explicit_reference_uuid():
             OciConfig(image_caps_format_version=invalid)
 
 
-def test_archive_companion_import_uses_native_oci_type_and_filename():
+def test_archive_companion_import_omits_standalone_type_and_keeps_filename():
     files = bundle_files(OciConfig(), {"name": "image.oci", "format": "oci"})
     handoff = json.loads(files["image-import.json"])
-    assert handoff["sourceImageType"] == "OCI"
+    assert "sourceImageType" not in handoff
     assert handoff["name"] == "image.oci"
     assert "Upload the OCI image archive (.oci)" in files["README.txt"]
     assert "The QCOW2 must be uploaded" not in files["README.txt"]
@@ -282,12 +282,16 @@ def test_advertised_accelerated_mode_also_requires_network_support(ready_guest_p
 
 
 @pytest.mark.parametrize("shape", ["VM.Standard.E6.Ax.Flex", "VM.DenseIO.E6.Ax.Flex", "VM.Standard4.Ax.Flex", "VM.Standard.A4.Ax.Flex"])
-def test_acceleron_shape_rejects_a_pv_only_image(ready_guest_plan, shape):
+def test_acceleron_shape_accepts_documented_pv_network_alternative(ready_guest_plan, shape):
     config = OciConfig(import_options={"shape_compatibility": [{"shape": shape}]})
-    assert any("supports only ACCELERATEDPV" in message for message in compatibility_plan({}, config)["blockers"])
+    assert compatibility_plan({}, config)["ready_to_build"]
+    unsupported = OciConfig(capabilities={"Compute.LaunchMode": setting("CUSTOM"),
+                                         "Network.AttachmentType": setting("VFIO")},
+                            import_options={"shape_compatibility": [{"shape": shape}]})
+    assert any("supports only ACCELERATEDPV or PARAVIRTUALIZED" in message for message in compatibility_plan({}, unsupported)["blockers"])
 
 
-@pytest.mark.parametrize("shape", ["VM.Standard.E5.Flex", "VM.Standard.E6.Flex"])
+@pytest.mark.parametrize("shape", ["VM.Standard.E4.Flex", "VM.Standard.E5.Flex", "VM.Standard.E6.Flex"])
 def test_pv_shapes_reject_accelerated_only_image(ready_guest_plan, shape):
     config = accelerated_config(shape_compatibility=[{"shape": shape}])
     plan = compatibility_plan({}, config)
@@ -295,7 +299,7 @@ def test_pv_shapes_reject_accelerated_only_image(ready_guest_plan, shape):
     assert any(shape in message and "PARAVIRTUALIZED or VFIO" in message for message in plan["blockers"])
 
 
-@pytest.mark.parametrize("shape", ["VM.Standard.E5.Flex", "VM.Standard.E6.Flex"])
+@pytest.mark.parametrize("shape", ["VM.Standard.E4.Flex", "VM.Standard.E5.Flex", "VM.Standard.E6.Flex"])
 @pytest.mark.parametrize("network", ["PARAVIRTUALIZED", "VFIO"])
 def test_pv_shapes_accept_each_documented_network_type(ready_guest_plan, shape, network):
     config = OciConfig(capabilities={"Compute.LaunchMode": setting("CUSTOM"),
@@ -305,9 +309,9 @@ def test_pv_shapes_accept_each_documented_network_type(ready_guest_plan, shape, 
 
 
 @pytest.mark.parametrize("mode,network,destination", [
-    ("PARAVIRTUALIZED", "PARAVIRTUALIZED", "VM.Standard.E6.Ax.Flex"),
+    ("PARAVIRTUALIZED", "PARAVIRTUALIZED", None),
     ("ACCELERATEDPV", "ACCELERATEDPV", "VM.Standard.E5.Flex"),
-    ("CUSTOM", "PARAVIRTUALIZED", "VM.Standard.E6.Ax.Flex"),
+    ("CUSTOM", "PARAVIRTUALIZED", None),
 ])
 def test_multi_shape_network_support_warns_about_default_without_inventing_launch_override(
         ready_guest_plan, mode, network, destination):
@@ -318,7 +322,8 @@ def test_multi_shape_network_support_warns_about_default_without_inventing_launc
     original = config.model_dump()
     plan = compatibility_plan({}, config)
     assert plan["ready_to_build"], plan["blockers"]
-    assert any(destination in warning and "launchOptions.networkType" in warning for warning in plan["warnings"])
+    network_warnings = [warning for warning in plan["warnings"] if "launchOptions.networkType" in warning]
+    assert any(destination in warning for warning in network_warnings) if destination else not network_warnings
     files = bundle_files(config, {})
     launch = json.loads(files["instance-launch-options.json"])
     assert launch["networkType"] == network

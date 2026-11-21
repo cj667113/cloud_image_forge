@@ -65,14 +65,15 @@ Minimum sizes include measured use and conservative headroom, but sparse files c
 
 ## VM to bare metal, and bare metal to VM
 
-**Destination → Hardware compatibility** offers two behaviors. Leave the feature off to keep the existing export workflow; enable it to check or prepare a specific hardware target. Offline images do not establish whether the original machine was virtual or physical, and the target's NIC cannot be inferred from them. Automatic physical networking includes the supported drivers installed for every kernel; select the actual target driver to narrow that bundle when known.
+**Destination → Hardware compatibility** defaults to **Automatic** for a guided profile. Leave the feature off to keep the existing export workflow; enable it to check or prepare a specific hardware target. Offline images do not establish whether the original machine was virtual or physical, and the target's NIC cannot be inferred from them. Automatic physical networking includes the supported drivers installed for every kernel; select the actual target driver to narrow that bundle when known.
 
 | Behavior | Purpose | Guest changes by hardware preparation |
 | --- | --- | --- |
+| **Automatic** | Check the selected profile against the source inspection | Preserves verified settings, otherwise schedules hardware preparation. Enables the separate OCI preparation step only when its own prerequisites still need work. |
 | **Preserve & validate** | Check an image that may already support the destination, including an OCI-native image captured from another machine type | None; retain existing boot files, initramfs, mount references, and networking |
 | **Reconfigure** | Prepare an image whose existing configuration needs adaptation | Back up and update mounts, transport arguments, initramfs and explicitly selected network/console settings |
 
-Enabling hardware preparation starts with **Prepare for destination**. **Automatic** follows the selected provider: OCI receives general OCI VM defaults, including guest preparation and actual OS metadata, while generic exports retain a generic VM profile. No specific shape is invented. Select a documented shape profile for its exact attachments and advertised compatibility. **Preserve & validate** remains available for an already-prepared image. Existing API recipes that omit `strategy` retain `reconfigure` behavior. Source hardware may be **Not specified**; Forge prepares the chosen destination without inventing source history. Both strategies support a VM-to-VM move. Passing a VM check does not also certify bare-metal compatibility.
+The destination profile controls the target hardware. The general VM profile keeps the source architecture and leaves OCI shape selection open. Choosing a specific shape supplies its attachment settings. Automatic behavior resolves to a concrete strategy and OCI preparation setting in the recipe. The worker repeats validation after explicit edits and before export. Existing build recipes that omit `platform_migration.strategy` retain reconfiguration behavior.
 
 When **Prepare for destination** needs missing tools, the UI enables the required package installation and guest network access automatically. The destination preview remains read-only; downloads occur only during the requested build. Already complete images and **Preserve & validate** do not enable unnecessary downloads. API clients retain explicit `allow_network` and package-installation flags, which default to false.
 

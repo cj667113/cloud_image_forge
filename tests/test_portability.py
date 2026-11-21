@@ -614,7 +614,7 @@ def test_preservation_does_not_open_writable_guest_or_execute_commands_and_recor
         before = hashlib.sha256(path.read_bytes()).hexdigest()
         with patch("forge.engine.ImageEngine.inspect", return_value=source) as inspect, patch("forge.engine._guest") as guest, patch("forge.engine._run") as run:
             result = prepare_platform(path, source, options(), False, lambda _: None)
-        inspect.assert_called_once_with(path)
+        inspect.assert_called_once_with(path, include_editor=False)
         guest.assert_not_called()
         run.assert_not_called()
         assert hashlib.sha256(path.read_bytes()).hexdigest() == before
