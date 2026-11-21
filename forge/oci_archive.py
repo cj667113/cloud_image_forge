@@ -23,7 +23,9 @@ import struct
 import tarfile
 import tempfile
 
-from .oci import OciConfig, ShapeCompatibility, capability_schema
+from .architecture import SUPPORTED_ARCHES, normalize_arch
+from .oci import ARM_SHAPES, X86_SHAPES, OciConfig, ShapeCompatibility, capability_schema, shape_architecture
+from .oci_shapes import resolve_shape_compatibility
 
 
 METADATA_NAME = "image_metadata.json"
@@ -41,14 +43,22 @@ LAUNCH_CAPABILITIES = {
     "pvEncryptionInTransitEnabled": "Storage.ParaVirtualization.EncryptionInTransit",
     "consistentVolumeNamingEnabled": "Storage.ConsistentVolumeNaming",
 }
-# The AMD names appear in Oracle-exported version-2 metadata. The ARM names
+# The x86 VM names appear in Oracle-exported version-2 metadata. The ARM names
 # appear in the arm64 shape table of FreeBSD's published OCI exporter:
 # https://lists.freebsd.org/archives/dev-commits-src-all/2025-March/052583.html
 # This is an observed archive convention, not a public API mapping guarantee.
 # In particular, bare-metal internal names differ and are never synthesized.
 OBSERVED_SHAPE_NAMES = {name: name for name in (
     "VM.Standard.A1.Flex", "VM.Standard.A2.Flex",
-    "VM.Standard.E4.Flex", "VM.Standard.E5.Flex", "VM.Standard.E6.Flex")}
+    "VM.Standard.E4.Flex", "VM.Standard.E5.Flex", "VM.Standard.E6.Flex",
+    "VM.Standard3.Flex", "VM.Standard4.Ax.Flex", "VM.Standard.E6.Ax.Flex",
+    "VM.DenseIO.E4.Flex", "VM.DenseIO.E5.Flex", "VM.DenseIO.E6.Ax.Flex", "VM.Optimized3.Flex")}
+# Reject recognizable x86 hardware-family aliases on ARM. This check never
+# supplies a mapping or establishes that an alias is valid for a given shape.
+X86_INTERNAL_FAMILY = re.compile(r"(?:[ex][0-9]+-2[cl]?|b200)\.", re.IGNORECASE)
+ARCHIVE_POLICY_VERSION = 2
+SHAPE_REFERENCE_DIR = Path("/etc/cloud-image-forge/oci-shapes")
+MAX_REFERENCE_BYTES = 2 * MAX_METADATA_BYTES
 
 
 class OciArchiveError(ValueError):
@@ -72,6 +82,9 @@ def _json_bytes(value):
 
 
 def shape_entries(config, shape_resolution=None):
+    if shape_resolution is not None and (not isinstance(shape_resolution, dict)
+                                         or not isinstance(shape_resolution.get("effective_shapes"), list)):
+        raise OciArchiveError("The saved OCI shape list is invalid. Create a new export.")
     rows = (shape_resolution["effective_shapes"] if shape_resolution is not None
             else [row.model_dump() for row in config.import_options.shape_compatibility])
     shapes = [ShapeCompatibility.model_validate(row) for row in rows]
@@ -85,14 +98,93 @@ def shape_entries(config, shape_resolution=None):
     return entries
 
 
-def shape_metadata(config, shape_resolution=None):
+def _reference_alias(name):
+    # The reference directory belongs to the operator. Image uploads, recipes
+    # and metadata references in the browser cannot install mappings here.
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}", name):
+        raise OciArchiveError("Invalid public OCI shape name.")
+    try:
+        fd = os.open(SHAPE_REFERENCE_DIR / (name + ".json"), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise OciArchiveError(f"Cannot read the installed shape reference for {name}.") from exc
+    try:
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= MAX_REFERENCE_BYTES:
+                raise ValueError("Invalid reference file")
+            content = stream.read(MAX_REFERENCE_BYTES + 1)
+            if len(content) != info.st_size:
+                raise ValueError("Shape reference changed")
+        reference = json.loads(content)
+        metadata = reference["image_metadata"]
+        rows = metadata["additionalMetadata"]["shapeCompatibilities"]
+        listing = reference["oci_shape_list"]
+        public = listing["data"]
+        if (type(metadata["version"]) is not int or metadata["version"] != 2
+                or not isinstance(rows, list) or len(rows) != 1
+                or not isinstance(public, list) or len(public) != 1 or public[0]["shape"] != name
+                or listing.get("opc-next-page") or listing.get("opcNextPage")
+                or not re.fullmatch(r"ocid1\.image\.[A-Za-z0-9-]{1,32}\.[A-Za-z0-9-]{1,64}\.[A-Za-z0-9_-]{1,160}",
+                                    public[0]["image-id"])):
+            raise ValueError("Shape reference must identify a single matching shape")
+        alias = rows[0]["internalShapeName"]
+        if (not isinstance(alias, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}", alias)
+                or (alias != name and alias.upper().startswith(("VM.", "BM.")))
+                or (X86_INTERNAL_FAMILY.match(alias) and shape_architecture(name) != "x86_64")
+                or any(other != name and alias.lower() == internal.lower() for other, internal in OBSERVED_SHAPE_NAMES.items())):
+            raise ValueError("Invalid or mismatched internal shape name")
+    except (KeyError, IndexError, TypeError, ValueError, OSError, RecursionError) as exc:
+        raise OciArchiveError(f"The installed shape reference for {name} must pair one OCI v2 archive shape "
+                              "with the matching public shape from the same native image.") from exc
+    return alias
+
+
+def shape_metadata(config, shape_resolution, arch, *, allow_missing_arch=False, platform_migration=None):
     entries = shape_entries(config, shape_resolution)
-    embedded = [{"internalShapeName": OBSERVED_SHAPE_NAMES[row["shapeName"]],
+    names = {entry["shapeName"] for entry in entries}
+    selected = {entry["shapeName"]: entry for entry in shape_entries(config)}
+    arch = normalize_arch(arch)
+    if not selected.keys() <= names:
+        raise OciArchiveError("The saved OCI shape list is missing a selected shape. Create a new export.")
+    if any(entry["shapeName"] in selected and entry != selected[entry["shapeName"]] for entry in entries):
+        raise OciArchiveError("The saved OCI shape limits differ from the selected limits. Create a new export.")
+    if names != selected.keys():
+        if not selected or config.import_options.shape_compatibility_mode == "manual":
+            raise OciArchiveError("The saved OCI shape list includes an unselected shape. Create a new export.")
+        # With no saved ISA, read_export_os supplies it before publication.
+        if arch != "unknown" or not allow_missing_arch:
+            allowed = resolve_shape_compatibility({"os": {"arch": arch}}, config, platform_migration)
+            permitted = {entry["shapeName"]: entry for entry in shape_entries(config, allowed)}
+            if any(permitted.get(entry["shapeName"]) != entry for entry in entries):
+                raise OciArchiveError("The saved OCI shape list includes an unselected shape or different limits. Create a new export.")
+    if entries and arch not in SUPPORTED_ARCHES and not (allow_missing_arch and arch == "unknown"):
+        raise OciArchiveError("The selected OCI shapes require a verified ARM64 or x86_64 guest architecture.")
+    shape_arches = set()
+    for name in sorted(names):
+        required = shape_architecture(name)
+        if required is None:
+            raise OciArchiveError(f"The CPU architecture of {name} is unknown. Use QCOW2 or select a verified shape.")
+        if arch in SUPPORTED_ARCHES and arch != required:
+            raise OciArchiveError(f"{name} requires {required}. The exported image is {arch}.")
+        shape_arches.add(required)
+    if len(shape_arches) > 1:
+        raise OciArchiveError("The selected OCI shapes span both ARM64 and x86_64. Choose one guest architecture.")
+    aliases = {name: OBSERVED_SHAPE_NAMES.get(name) or _reference_alias(name) for name in sorted(names)}
+    unmapped = [name for name, alias in aliases.items() if not alias]
+    if unmapped:
+        raise OciArchiveError("No verified OCI archive mapping for " + ", ".join(unmapped) +
+                              ". Use QCOW2 with the OCI configuration, or install a native shape reference.")
+    if len({alias.lower() for alias in aliases.values()}) != len(aliases):
+        raise OciArchiveError("Two selected OCI shapes resolve to the same archive name. Check the installed shape references.")
+    embedded = [{"internalShapeName": aliases[row["shapeName"]],
                  "ocpuConstraints": row["ocpuConstraints"], "memoryConstraints": row["memoryConstraints"]}
-                for row in entries if row["shapeName"] in OBSERVED_SHAPE_NAMES]
-    return {"entries": embedded, "embedded_shapes": [row["internalShapeName"] for row in embedded],
-            "companion_only_shapes": [row["shapeName"] for row in entries if row["shapeName"] not in OBSERVED_SHAPE_NAMES],
-            "mapping_basis": "Exact names from an Oracle version-2 export and the FreeBSD ARM64 OCI exporter"}
+                for row in entries]
+    return {"entries": embedded, "embedded_shapes": [row["shapeName"] for row in entries],
+            "companion_only_shapes": [],
+            "mapping_basis": "Operator-installed OCI shape references and known archive mappings"
+            if names - OBSERVED_SHAPE_NAMES.keys() else "Known Oracle and FreeBSD archive mappings"}
 
 
 def image_metadata(config, inspection, *, shape_resolution=None):
@@ -101,12 +193,16 @@ def image_metadata(config, inspection, *, shape_resolution=None):
 This also runs before a planned migration. Final inspection and OCI validation
 must establish guest compatibility separately, after the migration completes.
 """
-    from .destinations import _operating_system
-
     config = _config(config)
     if shape_resolution is None:
-        from .oci_shapes import resolve_shape_compatibility
         shape_resolution = resolve_shape_compatibility(inspection, config)
+    shapes = shape_metadata(config, shape_resolution, (inspection.get("os") or {}).get("arch"))
+    return _image_metadata(config, inspection, shapes)
+
+
+def _image_metadata(config, inspection, shapes):
+    from .destinations import _operating_system
+
     labels = _operating_system(inspection)
     operating_system = labels.get("operating_system") or config.import_options.operating_system
     version = labels.get("operating_system_version") or config.import_options.operating_system_version
@@ -127,27 +223,39 @@ must establish guest compatibility separately, after the migration completes.
               "imageCapabilityData": capabilities,
               "imageCapsFormatVersion": config.image_caps_format_version,
               "operatingSystem": operating_system, "operatingSystemVersion": version}
-    shapes = shape_metadata(config, shape_resolution)
     if shapes["entries"]:
         result["additionalMetadata"] = {"shapeCompatibilities": shapes["entries"]}
     _json_bytes(result)
     return result
 
 
-def _warnings(config, shape_resolution=None):
+def _warnings(config, shapes):
     result = []
     if not config.image_caps_format_version:
         result.append("No OCI archive capability-format UUID was supplied: imageCapabilityData and imageCapsFormatVersion are null. The archive retains its launch options; apply additional selected capabilities from the companion OCI configuration after import.")
-    shapes = shape_metadata(config, shape_resolution)
     if shapes["embedded_shapes"]:
-        result.append("Shape compatibility is embedded for the observed Oracle archive mappings: " + ", ".join(shapes["embedded_shapes"]) + ". Run the companion apply-oci.py command to verify or apply every requested shape and limit after import.")
-    if shapes["companion_only_shapes"]:
-        result.append("No verified internal archive mapping exists for: " + ", ".join(shapes["companion_only_shapes"]) + ". These shapes and limits are retained in the companion OCI configuration; apply them with apply-oci.py after import.")
+        result.append("Run the companion apply-oci.py command after import to verify the selected shapes and limits in OCI.")
     return result
 
 
 def _identity(value):
     return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
+
+
+def shape_reference_revision():
+    """Include installed reference changes in the conditional artifact inventory."""
+    if not SHAPE_REFERENCE_DIR.is_dir():
+        return "default"
+    digest = hashlib.sha256()
+    for name in sorted((ARM_SHAPES | X86_SHAPES) - OBSERVED_SHAPE_NAMES.keys()):
+        try:
+            identity = _identity((SHAPE_REFERENCE_DIR / (name + ".json")).lstat())
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            identity = ("unavailable", exc.errno)
+        digest.update(json.dumps([name, identity]).encode())
+    return digest.hexdigest()[:16]
 
 
 def _unchanged(source, path, initial):
@@ -282,9 +390,9 @@ owned temporary/output inode; the input file is opened read-only throughout.
 """
     config = _config(config)
     if shape_resolution is None:
-        from .oci_shapes import resolve_shape_compatibility
         shape_resolution = resolve_shape_compatibility(inspection, config)
-    metadata = image_metadata(config, inspection, shape_resolution=shape_resolution)
+    shapes = shape_metadata(config, shape_resolution, (inspection.get("os") or {}).get("arch"))
+    metadata = _image_metadata(config, inspection, shapes)
     metadata_bytes = _json_bytes(metadata)
     destination, qcow2 = Path(destination), Path(qcow2)
     if destination.exists() or destination.is_symlink():
@@ -336,8 +444,8 @@ owned temporary/output inode; the input file is opened read-only throughout.
                            "disk_sha256": disk.digest.hexdigest(),
                            "metadata_sha256": hashlib.sha256(metadata_bytes).hexdigest(), "metadata": metadata,
                            "capability_mode": "embedded" if config.image_caps_format_version else "deferred",
-                           "shape_compatibility": {key: value for key, value in shape_metadata(config, shape_resolution).items() if key != "entries"},
-                           "warnings": _warnings(config, shape_resolution)}
+                           "shape_compatibility": {key: value for key, value in shapes.items() if key != "entries"},
+                           "warnings": _warnings(config, shapes)}
         return receipt
     except BaseException:
         if published:
@@ -352,6 +460,54 @@ def can_download_archive(artifact):
     return (artifact.get("format") == "qcow2" and artifact.get("target", recipe.get("target")) == "oci"
             and isinstance(recipe.get("oci"), dict)
             and bool(re.fullmatch(r"[0-9a-f]{64}", artifact.get("sha256") or "")))
+
+
+def _stored_shapes(artifact, *, allow_missing_arch=False):
+    config = _config(artifact["recipe"]["oci"])
+    return shape_metadata(config, artifact.get("shape_compatibility_resolution"), artifact.get("architecture"),
+                          allow_missing_arch=allow_missing_arch, platform_migration=artifact["recipe"].get("platform_migration"))["entries"]
+
+
+def _check_declared_shapes(metadata, expected):
+    additional = metadata.get("additionalMetadata", {}) if isinstance(metadata, dict) else None
+    if not isinstance(additional, dict) or additional.get("shapeCompatibilities", []) != expected:
+        raise OciArchiveError("This older .oci file has a different shape list than the export. Create a new export.")
+
+
+def archive_blocker(artifact):
+    """Inventory check against the saved recipe, inspection and package receipt (no disk I/O)."""
+    native = artifact.get("format") == "oci"
+    if not native and not can_download_archive(artifact):
+        return None
+    if not isinstance((artifact.get("recipe") or {}).get("oci"), dict):
+        return "This export has no saved OCI settings to verify its shape list. Create a new export."
+    try:
+        expected = _stored_shapes(artifact, allow_missing_arch=not native)
+        if native:
+            metadata = (artifact.get("oci_archive") or {}).get("metadata")
+            if expected or metadata is not None:
+                _check_declared_shapes(metadata, expected)
+    except OciArchiveError as exc:
+        return str(exc)
+    except ValueError:
+        return "This export has invalid OCI settings. Create a new export."
+    return None
+
+
+def verify_published_archive(artifact):
+    """Check the actual bounded metadata header before serving or uploading a native archive."""
+    blocker = archive_blocker(artifact)
+    if blocker:
+        raise OciArchiveError(blocker)
+    with Path(artifact["path"]).open("rb") as stream:
+        try:
+            first = tarfile.TarInfo.frombuf(stream.read(512), "utf-8", "strict")
+            if first.name != METADATA_NAME or first.type != tarfile.REGTYPE or not 0 < first.size <= MAX_METADATA_BYTES:
+                raise OciArchiveError("Invalid OCI archive metadata member.")
+            metadata = json.loads(stream.read(first.size))
+        except (tarfile.TarError, UnicodeError, ValueError) as exc:
+            raise OciArchiveError("The published OCI archive metadata cannot be verified. Create a new export.") from exc
+    _check_declared_shapes(metadata, _stored_shapes(artifact))
 
 
 def archive_download(cache_dir, artifact, inspect_os):
@@ -371,7 +527,11 @@ def archive_download(cache_dir, artifact, inspect_os):
     if resolution is None:
         # Earlier companions emitted only the public shapes saved in the recipe.
         resolution = {"effective_shapes": [row.model_dump() for row in config.import_options.shape_compatibility]}
-    inputs = json.dumps([artifact["sha256"], _identity(original), labels, resolution, config.model_dump()],
+    arch = normalize_arch(artifact.get("architecture"))
+    expected = shape_metadata(config, resolution, arch, allow_missing_arch=True,
+                              platform_migration=artifact["recipe"].get("platform_migration"))["entries"]
+    inputs = json.dumps([ARCHIVE_POLICY_VERSION, artifact["sha256"], _identity(original), labels,
+                         arch, expected, resolution, config.model_dump()],
                         sort_keys=True, separators=(",", ":")).encode()
     signature = hashlib.sha256(inputs).hexdigest()
     output = cache_dir / "image.oci"
@@ -391,14 +551,18 @@ def archive_download(cache_dir, artifact, inspect_os):
         shutil.rmtree(cache_dir)
     cache_dir.mkdir(parents=True, mode=0o700)
     try:
-        if not all(labels.get(key) or getattr(config.import_options, key) for key in
-                   ("operating_system", "operating_system_version")):
-            # Historical records may predate saved OS labels or outlive their
-            # import. Read only OS identification from the actual exported disk.
-            labels = {**inspect_os(source), **labels}
+        os_keys = ("operating_system", "operating_system_version")
+        if (expected and arch == "unknown") or not all(labels.get(k) or getattr(config.import_options, k) for k in os_keys):
+            inspected = inspect_os(source)
+            if arch == "unknown":
+                arch = normalize_arch(inspected.get("architecture"))
+                shape_metadata(config, resolution, arch, platform_migration=artifact["recipe"].get("platform_migration"))
+            labels = {**{key: inspected[key] for key in os_keys if inspected.get(key)}, **labels}
         config = config.model_copy(update={"import_options": config.import_options.model_copy(update=labels)})
-        write_archive(output, source, config, {}, lambda _: None, shape_resolution=resolution,
-                      expected_disk_sha256=artifact["sha256"])
+        receipt = write_archive(output, source, config, {"os": {"arch": arch}}, lambda _: None, shape_resolution=resolution,
+                                expected_disk_sha256=artifact["sha256"])
+        if receipt["metadata"].get("additionalMetadata", {}).get("shapeCompatibilities", []) != expected:
+            raise OciArchiveError("The installed shape references changed during packaging. Retry the download.")
         if _identity(original) != _identity(source.lstat()):
             raise OciArchiveError("The QCOW2 changed while preparing the download")
         marker.write_text(json.dumps({"inputs": signature, "archive": _identity(output.lstat())}))

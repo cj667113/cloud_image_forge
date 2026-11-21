@@ -40,6 +40,78 @@ def package(tmp_path, config=None, **kwargs):
     return source, destination, result
 
 
+def native_reference(shape, internal):
+    return {"image_metadata": {"version": 2,
+                               "operatingSystem": "Different source",
+                               "additionalMetadata": {"shapeCompatibilities": [
+                                   {"internalShapeName": internal, "memoryConstraints": {"maxInGBs": 999}}]}},
+            "oci_shape_list": {"data": [{"image-id": "ocid1.image.oc1.iad.reference", "shape": shape}]}}
+
+
+def test_operator_reference_embeds_only_single_named_shape_and_uses_export_limits(monkeypatch, tmp_path):
+    name = "BM.Standard.A4.48"
+    monkeypatch.setattr(subject, "SHAPE_REFERENCE_DIR", tmp_path)
+    (tmp_path / f"{name}.json").write_text(json.dumps(native_reference(name, "test-native-arm")))
+    config = OciConfig(import_options={"shape_compatibility": [{"shape": name, "max_memory_gbs": 16}]})
+    _, archive_path, receipt = package(tmp_path, config)
+    with tarfile.open(archive_path) as archive:
+        metadata = json.load(archive.extractfile("image_metadata.json"))
+    assert metadata["additionalMetadata"] == {"shapeCompatibilities": [
+        {"internalShapeName": "test-native-arm", "memoryConstraints": {"maxInGBs": 16}, "ocpuConstraints": None}]}
+    assert metadata["operatingSystem"] == "Ubuntu" and "ocid1.image" not in json.dumps(metadata)
+    assert receipt["shape_compatibility"]["embedded_shapes"] == [name]
+
+
+@pytest.mark.parametrize("change", ["shape", "image-id", "two-public", "two-internal", "version", "next-page",
+                                    "other-public-alias", "incompatible-alias", "path-alias", "oversize", "symlink"])
+def test_shape_reference_requires_unambiguous_native_pair(monkeypatch, tmp_path, change):
+    name = "BM.Standard.A4.48"
+    monkeypatch.setattr(subject, "SHAPE_REFERENCE_DIR", tmp_path)
+    path = tmp_path / f"{name}.json"
+    ref = native_reference(name, "test-native-arm")
+    public = ref["oci_shape_list"]["data"]
+    internal = ref["image_metadata"]["additionalMetadata"]["shapeCompatibilities"]
+    if change == "shape":
+        public[0]["shape"] = "BM.Standard.A1.160"
+    elif change == "image-id":
+        public[0]["image-id"] = "wrong"
+    elif change == "two-public":
+        public.append(dict(public[0]))
+    elif change == "two-internal":
+        internal.append(dict(internal[0]))
+    elif change == "version":
+        ref["image_metadata"]["version"] = 1
+    elif change == "next-page":
+        ref["oci_shape_list"]["opc-next-page"] = "more"
+    elif change == "other-public-alias":
+        internal[0]["internalShapeName"] = "VM.Standard.A2.Flex"
+    elif change == "incompatible-alias":
+        internal[0]["internalShapeName"] = "e99-2c.test-x86"
+    elif change == "path-alias":
+        internal[0]["internalShapeName"] = "../escape"
+    elif change == "oversize":
+        ref["padding"] = "x" * subject.MAX_REFERENCE_BYTES
+    if change == "symlink":
+        other = tmp_path / "uploaded.json"
+        other.write_text(json.dumps(ref))
+        path.symlink_to(other)
+    else:
+        path.write_text(json.dumps(ref))
+    with pytest.raises(subject.OciArchiveError, match="shape reference"):
+        package(tmp_path, OciConfig(import_options={"shape_compatibility": [{"shape": name}]}))
+    assert not (tmp_path / "image.oci").exists()
+
+
+def test_duplicate_aliases_from_installed_references_are_rejected(monkeypatch, tmp_path):
+    monkeypatch.setattr(subject, "SHAPE_REFERENCE_DIR", tmp_path)
+    names = ["BM.Standard.A1.160", "BM.Standard.A4.48"]
+    for name in names:
+        (tmp_path / f"{name}.json").write_text(json.dumps(native_reference(name, "one-test-alias")))
+    config = OciConfig(import_options={"shape_compatibility": [{"shape": name} for name in names]})
+    with pytest.raises(subject.OciArchiveError, match="same archive name"):
+        package(tmp_path, config)
+
+
 def test_actual_os_and_selected_launch_values_without_source_firmware_gate():
     config = OciConfig(capabilities={
         "Compute.Firmware": {"default_value": "UEFI_64", "values": ["UEFI_64"]},
@@ -97,7 +169,7 @@ def test_multiple_observed_vm_shapes_are_embedded_with_exact_limits():
     assert config.model_dump() == before
 
 
-def test_arm_group_keeps_all_shapes_in_companion_and_embeds_published_mappings(tmp_path):
+def test_partially_mapped_arm_group_keeps_all_shapes_in_companion_and_refuses_incomplete_archive(tmp_path):
     from forge.destinations import resolve_destination
     from forge.oci import bundle_files
 
@@ -105,13 +177,9 @@ def test_arm_group_keeps_all_shapes_in_companion_and_embeds_published_mappings(t
     config = OciConfig.model_validate(selected["oci_defaults"])
     config.import_options.shape_compatibility[1].max_ocpus = 4
     path = tmp_path / "arm.oci"
-    receipt = subject.write_archive(path, qcow(tmp_path / "source.qcow2"), config, INSPECTION, lambda _: None)
-    with tarfile.open(path) as archive:
-        metadata = json.load(archive.extractfile("image_metadata.json"))
-    embedded = metadata["additionalMetadata"]["shapeCompatibilities"]
-    assert [entry["internalShapeName"] for entry in embedded] == ["VM.Standard.A1.Flex", "VM.Standard.A2.Flex"]
-    assert embedded[1]["ocpuConstraints"] == {"max": 4}
-    assert receipt["shape_compatibility"]["companion_only_shapes"] == ["VM.Standard.A4.Flex"]
+    with pytest.raises(subject.OciArchiveError, match="VM.Standard.A4.Flex"):
+        subject.write_archive(path, qcow(tmp_path / "source.qcow2"), config, INSPECTION, lambda _: None)
+    assert not path.exists()
     files = bundle_files(config, {"format": "oci"})
     entries = json.loads(files["shape-compatibility.json"])["entries"]
     assert [entry["shapeName"] for entry in entries] == ["VM.Standard.A1.Flex", "VM.Standard.A2.Flex", "VM.Standard.A4.Flex"]
@@ -121,24 +189,60 @@ def test_arm_group_keeps_all_shapes_in_companion_and_embeds_published_mappings(t
 def test_unmapped_shapes_are_not_guessed_or_copied_from_source_metadata():
     config = OciConfig(import_options={"shape_compatibility_mode": "manual", "shape_compatibility": [
         {"shape": "VM.Standard.E4.Flex", "max_ocpus": 8}, {"shape": "BM.Standard.E5.192"}]})
-    inspection = {**deepcopy(INSPECTION), "additionalMetadata": {"shapeCompatibilities": [{"internalShapeName": "unsafe-source-default"}]}}
-    metadata = subject.image_metadata(config, inspection)
-    assert metadata["additionalMetadata"] == {"shapeCompatibilities": [
-        {"internalShapeName": "VM.Standard.E4.Flex", "ocpuConstraints": {"max": 8}, "memoryConstraints": None}]}
-    info = subject.shape_metadata(config)
-    assert info["companion_only_shapes"] == ["BM.Standard.E5.192"]
-    assert any("BM.Standard.E5.192" in text and "apply-oci.py" in text for text in subject._warnings(config))
+    inspection = deepcopy(INSPECTION)
+    inspection["os"]["arch"] = "x86_64"
+    inspection["additionalMetadata"] = {"shapeCompatibilities": [{"internalShapeName": "unsafe-source-default"}]}
+    with pytest.raises(subject.OciArchiveError, match="No verified OCI archive mapping for BM.Standard.E5.192"):
+        subject.image_metadata(config, inspection)
+
+
+@pytest.mark.parametrize("shape", ["BM.Standard.A1.160", "BM.Standard.A4.48"])
+def test_unmapped_arm_bare_metal_never_creates_unrestricted_archive(tmp_path, shape):
+    config = OciConfig(import_options={"shape_compatibility": [{"shape": shape}]})
+    with pytest.raises(subject.OciArchiveError, match=shape):
+        package(tmp_path, config)
+    assert not (tmp_path / "image.oci").exists()
+
+
+@pytest.mark.parametrize("arch,shape,reason", [
+    ("arm64", "VM.Standard.E4.Flex", "requires x86_64"),
+    ("amd64", "VM.Standard.A2.Flex", "requires aarch64"),
+    ("aarch64", "VM.Future.Flex", "architecture of VM.Future.Flex is unknown"),
+    ("unknown", "VM.Standard.A1.Flex", "verified ARM64 or x86_64")])
+def test_effective_archive_shapes_must_match_inspected_architecture(arch, shape, reason):
+    config = OciConfig(import_options={"shape_compatibility_mode": "manual", "shape_compatibility": [{"shape": shape}]})
+    inspection = deepcopy(INSPECTION)
+    inspection["os"]["arch"] = arch
+    with pytest.raises(subject.OciArchiveError, match=reason):
+        subject.image_metadata(config, inspection, shape_resolution={"effective_shapes": [{"shape": shape}]})
+
+
+def test_empty_shape_selection_cannot_advertise_a_stale_effective_row():
+    with pytest.raises(subject.OciArchiveError, match="unselected shape"):
+        subject.image_metadata(OciConfig(), INSPECTION,
+                               shape_resolution={"effective_shapes": [{"shape": "VM.Standard.A1.Flex"}]})
+
+
+@pytest.mark.parametrize("effective", [[], [{"shape": "VM.Standard.A1.Flex"}, {"shape": "VM.Standard.A2.Flex"}]])
+def test_manual_shape_selection_cannot_be_dropped_or_expanded(effective):
+    config = OciConfig(import_options={"shape_compatibility_mode": "manual",
+                                       "shape_compatibility": [{"shape": "VM.Standard.A1.Flex"}]})
+    with pytest.raises(subject.OciArchiveError, match="saved OCI shape list"):
+        subject.image_metadata(config, INSPECTION, shape_resolution={"effective_shapes": effective})
 
 
 def test_final_resolution_is_identical_in_archive_and_companion(tmp_path):
     from forge.oci import bundle_files
-    config = OciConfig(import_options={"shape_compatibility": [{"shape": "VM.Standard.E5.Flex"}]})
-    resolution = {"effective_shapes": [{"shape": "VM.Standard.E4.Flex", "min_ocpus": 2, "max_ocpus": 6},
-                                        {"shape": "VM.Standard.E5.Flex", "max_memory_gbs": 128}]}
+    from forge.oci_shapes import resolve_shape_compatibility
+    config = OciConfig(import_options={"shape_compatibility": [
+        {"shape": "VM.Standard.E5.Flex", "min_ocpus": 2, "max_ocpus": 6, "max_memory_gbs": 128}]})
     source = qcow(tmp_path / "source.qcow2")
     digest = hashlib.sha256(source.read_bytes()).hexdigest()
     output = tmp_path / "image.oci"
-    receipt = subject.write_archive(output, source, config, INSPECTION, lambda _: None, shape_resolution=resolution)
+    inspection = deepcopy(INSPECTION)
+    inspection["os"]["arch"] = "x86_64"
+    resolution = resolve_shape_compatibility(inspection, config)
+    receipt = subject.write_archive(output, source, config, inspection, lambda _: None, shape_resolution=resolution)
     files = bundle_files(config, {"format": "oci", "shape_compatibility_resolution": resolution})
     public = json.loads(files["shape-compatibility.json"])["entries"]
     with tarfile.open(output) as archive:
@@ -170,14 +274,15 @@ def test_validated_config_missing_launch_capability_fails_clearly():
 
 
 @pytest.mark.parametrize("embedded", [False, True])
-def test_shapes_stay_in_companion_config_even_with_embedded_capabilities(tmp_path, embedded):
+def test_shape_enforcement_is_independent_of_embedded_capabilities(tmp_path, embedded):
     config = OciConfig(image_caps_format_version=FORMAT_UUID if embedded else None,
-                       import_options={"shape_compatibility": [{"shape": "BM.Standard.A1.160"}]})
+                       import_options={"shape_compatibility": [{"shape": "VM.Standard.A2.Flex"}]})
     _, _, result = package(tmp_path, config)
     assert any("shape" in text for text in result["warnings"])
     assert any("null" in text for text in result["warnings"]) is not embedded
     assert result["capability_mode"] == ("embedded" if embedded else "deferred")
-    assert "BM.Standard" not in json.dumps(result["metadata"])
+    assert result["metadata"]["additionalMetadata"]["shapeCompatibilities"] == [
+        {"internalShapeName": "VM.Standard.A2.Flex", "ocpuConstraints": None, "memoryConstraints": None}]
 
 
 @pytest.mark.parametrize("version", [2, 3])

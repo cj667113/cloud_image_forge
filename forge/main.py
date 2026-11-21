@@ -27,7 +27,8 @@ from .jobs import Jobs
 from .models import (ObjectLocation, Recipe, OciPlanRequest, OciSchemaRequest, UefiPlanRequest,
                      StoragePlanRequest, PlatformPlanRequest, DestinationSelection, MountPlanRequest)
 from .oci import catalog as oci_catalog, compatibility_plan
-from .oci_archive import ArchiveSpaceError, archive_download, can_download_archive
+from .oci_archive import (ArchiveSpaceError, OciArchiveError, archive_blocker, archive_download,
+                          can_download_archive, shape_metadata, shape_reference_revision, verify_published_archive)
 from .store import Store, artifact_name
 from . import transfers
 
@@ -64,7 +65,10 @@ class BodyLimitMiddleware:
 def public(record: dict, *, artifact=False) -> dict:
     result = {key: value for key, value in record.items() if key not in {"path", "source_path", "oci_bundle_path"}}
     if artifact:
-        result["oci_archive_available"] = can_download_archive(record)
+        blocker = archive_blocker(record)
+        result["oci_archive_available"] = can_download_archive(record) and not blocker
+        if blocker:
+            result["oci_archive_blocker"] = blocker
     return result
 
 
@@ -202,11 +206,11 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
 
     def inventory_response(kind: str, request: Request):
         validators = request.headers.get("if-none-match", "")
-        # Tags contain only our public schema identifier, kind and opaque DB
-        # revision. Accept weak validators/lists, without interpreting arbitrary
-        # client values as SQL or returning them in response headers.
+        # The artifact representation also depends on the installed OCI shape
+        # references. The store still owns the opaque per-inventory revision.
         matches = set()
-        prefix = f"forge-{kind}-v{'2' if kind == 'artifact' else '1'}-"
+        version = f"3-{shape_reference_revision()}" if kind == "artifact" else "1"
+        prefix = f"forge-{kind}-v{version}-"
         if len(validators) <= 8192:
             for item in validators.split(","):
                 matched = re.fullmatch(r'(?:W/)?"' + prefix + r'([0-9a-f]{32})"', item.strip())
@@ -459,6 +463,12 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
                                           mount_policy=recipe.mount_policy)
                 if plan["blockers"]:
                     raise HTTPException(422, "OCI compatibility: " + " ".join(plan["blockers"]))
+                if recipe.output_format == "oci":
+                    try:
+                        shape_metadata(recipe.oci, plan.get("shape_compatibility_resolution"),
+                                       (image["inspection"].get("os") or {}).get("arch"))
+                    except OciArchiveError as exc:
+                        raise HTTPException(422, str(exc)) from exc
             job = app.state.jobs.build(image, recipe.model_dump())
         return {"job_id": job["id"]}
 
@@ -493,10 +503,18 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
                     del downloads[artifact_id]
                     archive_locks.pop(artifact_id, None)
 
-    @app.get("/api/artifacts/{artifact_id}/download")
-    def download_artifact(artifact: dict = Depends(download_record)):
+    def check_original(artifact):
         if not Path(artifact["path"]).is_file():
             raise HTTPException(410, "The artifact file is no longer present")
+        if artifact.get("format") == "oci":
+            try:
+                verify_published_archive(artifact)
+            except OciArchiveError as exc:
+                raise HTTPException(409, str(exc)) from exc
+
+    @app.get("/api/artifacts/{artifact_id}/download")
+    def download_artifact(artifact: dict = Depends(download_record)):
+        check_original(artifact)
         return FileResponse(artifact["path"], media_type="application/octet-stream", filename=artifact_name(artifact))
 
     @app.get("/api/artifacts/{artifact_id}/oci-archive")
@@ -537,9 +555,10 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
         filename = f"oci-configuration-{artifact_id[:8]}.zip"
         original = artifact.get("filename") or Path(artifact["path"]).name
         name = artifact_name(artifact)
-        if name != original:
-            from .oci import renamed_bundle
-            return Response(renamed_bundle(Path(path), name), media_type="application/zip",
+        if name != original or artifact.get("oci_config"):
+            from .oci import download_bundle
+            content = download_bundle(Path(path), name if name != original else None, architecture=artifact.get("architecture"))
+            return Response(content, media_type="application/zip",
                             headers={"Content-Disposition": f'attachment; filename="{filename}"'})
         return FileResponse(path, media_type="application/zip", filename=filename)
 
@@ -549,8 +568,7 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
         transfers.validate_location(location.model_dump(), settings, s3_only=True)
         with app.state.jobs.inspection_lock:
             artifact = get_record("artifact", artifact_id)
-            if not Path(artifact["path"]).is_file():
-                raise HTTPException(410, "The artifact file is no longer present")
+            check_original(artifact)
             job = app.state.jobs.upload(artifact, location.model_dump())
         return {"job_id": job["id"]}
 

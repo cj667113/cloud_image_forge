@@ -289,10 +289,11 @@ def read_export_os(path: Path):
         raise EngineError("The published disk is not a standalone QCOW2")
     with _guest(path, "qcow2", readonly=True) as guest:
         root = _roots(guest)
-        return _operating_system({
+        labels = _operating_system({
             "os": {"name": guest.inspect_get_product_name(root), "distro": guest.inspect_get_distro(root)},
             "oci_evidence": {"os_version": {"major": guest.inspect_get_major_version(root),
                                             "minor": guest.inspect_get_minor_version(root)}}})
+        return {**labels, "architecture": normalize_arch(guest.inspect_get_arch(root))}
 
 
 def _roots(handle) -> str:

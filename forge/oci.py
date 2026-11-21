@@ -48,6 +48,14 @@ X86_SHAPES = {*AMD_STANDARD_PV, "VM.Standard3.Flex", "VM.Standard4.Ax.Flex",
               "BM.Standard.E4.128", "BM.Standard.E5.192", "BM.Standard.E6.256", "BM.Standard.E6.Ax.192"}
 
 
+def shape_architecture(name):
+    if name in ARM_SHAPES:
+        return "aarch64"
+    if name in X86_SHAPES:
+        return "x86_64"
+    return None
+
+
 def descriptor(kind, default, values=None):
     result = {"descriptorType": kind, "defaultValue": default, "source": "IMAGE"}
     if values is not None:
@@ -385,7 +393,7 @@ def compatibility_plan(inspection: dict, config: OciConfig, allow_network=False,
     plan["warnings"].extend(shape_resolution["warnings"])
     for shape in (ShapeCompatibility.model_validate(row) for row in shape_resolution["effective_shapes"]):
         arch = normalize_arch(inspection.get("os", {}).get("arch"))
-        required_arch = "aarch64" if shape.shape in ARM_SHAPES else "x86_64" if shape.shape in X86_SHAPES else None
+        required_arch = shape_architecture(shape.shape)
         if required_arch and arch != "unknown" and arch != required_arch:
             plan["blockers"].append(f"{shape.shape} requires {required_arch}; this {arch} image cannot be converted to another CPU architecture by changing image capabilities.")
         supported_networks = SHAPE_NETWORK_TYPES.get(shape.shape)
@@ -417,6 +425,18 @@ def compatibility_plan(inspection: dict, config: OciConfig, allow_network=False,
     plan["sources"] = SOURCES
     plan["ready_to_build"] = not plan["blockers"]
     return plan
+
+
+EXACT_SHAPES_HELP = (
+    "To keep only the selected shapes on the imported image, run:\n"
+    "   python3 apply-oci.py --image-id IMAGE_OCID --exact-shapes\n"
+    "This verifies the selected entries, removes other OCI shape associations and reads back the final list.\n"
+)
+
+
+def _shape_manifest(entries, architecture):
+    return {"version": 1, "entries": entries, "architecture": normalize_arch(architecture),
+            "shapeArchitectures": {entry["shapeName"]: shape_architecture(entry["shapeName"]) for entry in entries}}
 
 
 def bundle_files(config: OciConfig, artifact: dict) -> dict[str, str]:
@@ -461,7 +481,7 @@ def bundle_files(config: OciConfig, artifact: dict) -> dict[str, str]:
              "artifact.json": {k: artifact[k] for k in ("name", "sha256", "virtual_size", "format", "architecture") if k in artifact}}
     from .oci_archive import shape_entries
     entries = shape_entries(config, artifact.get("shape_compatibility_resolution"))
-    files["shape-compatibility.json"] = {"version": 1, "entries": entries}
+    files["shape-compatibility.json"] = _shape_manifest(entries, artifact.get("architecture"))
     if artifact.get("shape_compatibility_resolution"):
         files["shape-resolution.json"] = artifact["shape_compatibility_resolution"]
     shape_commands = []
@@ -485,7 +505,8 @@ def bundle_files(config: OciConfig, artifact: dict) -> dict[str, str]:
         "Optional --profile NAME and --region REGION select the destination OCI context.\n"
         "Use an OCI CLI version that supports the selected launch mode; older releases may reject ACCELERATEDPV.\n"
         "The command waits for AVAILABLE, applies all shape-compatibility.json names/limits, and verifies the complete requested list.\n"
-        "It preserves unrelated shapes and unspecified existing bounds; it never uploads a disk or launches an instance.\n"
+        "By default, other shapes and existing unspecified bounds are preserved.\n"
+        + EXACT_SHAPES_HELP +
         "Rerun the same command after a partial failure: saved state prevents a second import and matching shapes are skipped.\n"
         "If an import response was lost, find the created image in OCI and resume with --image-id; no blind import retry occurs.\n"
         "Keep .forge-oci-apply-state.json with this extracted bundle. Use a separate extraction for another import/profile.\n"
@@ -530,18 +551,27 @@ def write_bundle(path: Path, config: OciConfig, artifact: dict):
             archive.writestr(name, content)
 
 
-def renamed_bundle(path: Path, filename: str) -> bytes:
-    """Serve the build-time configuration with the export's current filename."""
+def download_bundle(path: Path, filename: str | None = None, *, architecture=None) -> bytes:
+    """Preserve the build-time configuration, updating the helper and any renamed disk."""
     output = io.BytesIO()
-    with zipfile.ZipFile(path) as original, zipfile.ZipFile(output, "w") as renamed:
-        options = json.loads(original.read("forge-oci-profile.json")).get("import_options", {})
+    with zipfile.ZipFile(path) as original, zipfile.ZipFile(output, "w") as updated:
+        options = json.loads(original.read("forge-oci-profile.json")).get("import_options", {}) if filename else {}
+        rename_import = filename and not (options.get("object_name") or options.get("object_uri"))
+        has_manifest = "shape-compatibility.json" in original.namelist()
         for entry in original.infolist():
             data = original.read(entry)
-            if entry.filename == "artifact.json" or (
-                entry.filename == "image-import.json" and not options.get("object_name") and not options.get("object_uri")
-            ):
+            if (filename and entry.filename == "artifact.json") or (rename_import and entry.filename == "image-import.json"):
                 metadata = json.loads(data)
                 metadata["name"] = filename
                 data = (json.dumps(metadata, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
-            renamed.writestr(entry, data)
+            elif entry.filename == "shape-compatibility.json":
+                manifest = json.loads(data)
+                if manifest.get("version") == 1:
+                    manifest.update(_shape_manifest(manifest["entries"], architecture or manifest.get("architecture")))
+                    data = (json.dumps(manifest, indent=2, ensure_ascii=False) + "\n").encode()
+            elif has_manifest and entry.filename == "apply-oci.py":
+                data = Path(__file__).with_name("oci_apply.py").read_bytes()
+            elif has_manifest and entry.filename == "README.txt" and b"--exact-shapes" not in data:
+                data += b"\n" + EXACT_SHAPES_HELP.encode()
+            updated.writestr(entry, data)
     return output.getvalue()

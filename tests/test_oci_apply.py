@@ -3,10 +3,12 @@ import json
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
+import io
+import zipfile
 
 import pytest
 
-from forge.oci import OciConfig, bundle_files
+from forge.oci import OciConfig, bundle_files, download_bundle, shape_architecture
 from forge.oci_apply import ApplyError, apply
 
 
@@ -17,11 +19,13 @@ SHAPES = [
 ]
 
 
-def bundle(tmp_path, entries=None, uri=False):
+def bundle(tmp_path, entries=None, uri=False, arch="x86_64"):
     imports = {"compartmentId": "ocid1.compartment.oc1.test.owner", "launchMode": "PARAVIRTUALIZED"}
     imports.update({"uri": "https://object.example/private-value"} if uri else {"namespace": "ns", "bucketName": "images", "name": "disk.oci"})
     (tmp_path / "image-import.json").write_text(json.dumps(imports))
-    (tmp_path / "shape-compatibility.json").write_text(json.dumps({"version": 1, "entries": entries if entries is not None else SHAPES}))
+    entries = entries if entries is not None else SHAPES
+    (tmp_path / "shape-compatibility.json").write_text(json.dumps({"version": 1, "entries": entries, "architecture": arch,
+        "shapeArchitectures": {row["shapeName"]: shape_architecture(row["shapeName"]) for row in entries}}))
     return tmp_path
 
 
@@ -31,6 +35,8 @@ class FakeCli:
         self.calls = []
         self.fail_shape = None
         self.drop_shape = None
+        self.fail_remove = None
+        self.ignore_remove = False
         self.import_timeout = False
         self.drop_inherited_limit = False
         self.lifecycle = ["AVAILABLE"]
@@ -71,6 +77,14 @@ class FakeCli:
             if self.drop_shape != payload["shapeName"]:
                 self.rows = [old for old in self.rows if old["shape"] != row["shape"]] + [row]
             data = row
+        elif args[:3] == ["compute", "image-shape-compatibility-entry", "remove"]:
+            assert "--force" in args and args[args.index("--image-id") + 1] == IMAGE
+            name = args[args.index("--shape-name") + 1]
+            if self.fail_remove == name:
+                return SimpleNamespace(returncode=1, stdout="", stderr="")
+            if not self.ignore_remove:
+                self.rows = [row for row in self.rows if row["shape"] != name]
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
         else:
             pytest.fail("Unexpected cloud operation: " + repr(args[:4]))
         return SimpleNamespace(returncode=0, stdout=json.dumps({"data": data}), stderr="")
@@ -135,6 +149,58 @@ def test_service_dropping_requested_shape_fails_verification(tmp_path):
     cli = FakeCli(); cli.drop_shape = SHAPES[1]["shapeName"]
     with pytest.raises(ApplyError, match="did not retain every"):
         apply(bundle(tmp_path), image_id=IMAGE, run=cli)
+
+
+def test_exact_shapes_reconciles_existing_arm_import_and_resumes(tmp_path):
+    selected = "BM.Standard.A4.48"
+    extras = ["VM.Standard.E4.Flex", "VM.Standard.E5.Flex"]
+    cli = FakeCli([{"shape": name, "ocpu-constraints": {"min": 0.125}} for name in extras])
+    apply(bundle(tmp_path, [{"shapeName": selected}], arch="aarch64"), image_id=IMAGE, run=cli)
+    assert cli.count("remove") == 0
+    cli.fail_remove = extras[1]
+    with pytest.raises(ApplyError, match="remove.*failed"):
+        apply(tmp_path, image_id=IMAGE, exact_shapes=True, run=cli)
+    assert {row["shape"] for row in cli.rows} == {selected, extras[1]}
+    cli.fail_remove = None
+    result = apply(tmp_path, image_id=IMAGE, exact_shapes=True, run=cli)
+    assert result["verified_shapes"] == [selected] and result["additional_shapes"] == []
+    assert result["removed_shapes"] == [extras[1]]
+    assert [row["shape"] for row in cli.rows] == [selected]
+    assert cli.count("import") == 0 and cli.count("add") == 1
+
+
+def test_exact_shapes_requires_verified_selection_before_removal(tmp_path):
+    cli = FakeCli([{"shape": "VM.Other"}])
+    with pytest.raises(ApplyError, match="at least one"):
+        apply(bundle(tmp_path, []), import_image=True, exact_shapes=True, run=cli)
+    assert not cli.calls
+    with pytest.raises(ApplyError, match="guest architecture"):
+        apply(bundle(tmp_path, arch="aarch64"), image_id=IMAGE, exact_shapes=True, run=cli)
+    assert not cli.calls
+    cli.drop_shape = SHAPES[0]["shapeName"]
+    with pytest.raises(ApplyError, match="did not retain"):
+        apply(bundle(tmp_path), image_id=IMAGE, exact_shapes=True, run=cli)
+    assert cli.count("remove") == 0
+    cli.drop_shape = None
+    cli.ignore_remove = True
+    with pytest.raises(ApplyError, match="still lists additional"):
+        apply(tmp_path, image_id=IMAGE, exact_shapes=True, run=cli)
+
+
+def test_download_updates_older_bundles_without_changing_shape_selection(tmp_path):
+    path = tmp_path / "bundle.zip"
+    selected = b'{"version":1,"entries":[{"shapeName":"BM.Standard.A1.160"}]}'
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("shape-compatibility.json", selected)
+        archive.writestr("apply-oci.py", "old helper")
+        archive.writestr("README.txt", "Existing custom instructions.\n")
+    with zipfile.ZipFile(io.BytesIO(download_bundle(path, architecture="arm64"))) as archive:
+        manifest = json.loads(archive.read("shape-compatibility.json"))
+        assert manifest["entries"] == json.loads(selected)["entries"]
+        assert manifest["architecture"] == "aarch64" and manifest["shapeArchitectures"] == {"BM.Standard.A1.160": "aarch64"}
+        assert b"--exact-shapes" in archive.read("apply-oci.py")
+        assert b"--exact-shapes" in archive.read("README.txt")
+        assert b"Existing custom instructions." in archive.read("README.txt")
 
 
 def test_service_dropping_preserved_limit_also_fails_readback(tmp_path):

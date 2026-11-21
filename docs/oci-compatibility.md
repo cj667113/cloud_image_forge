@@ -231,9 +231,34 @@ Memory encryption and Secure Boot are instance `platformConfig` properties, resp
 
 An image's supported-shape list is a separate control-plane resource. `oci compute image-shape-compatibility-entry add` accepts CLI JSON fields `imageId`, `shapeName`, and optional `memoryConstraints`/`ocpuConstraints`. The memory object uses integer `minInGBs`/`maxInGBs`; the OCPU object uses integer `min`/`max`. These describe tested bounds for an image and shape; they do not resize the guest disk, translate machine code, or manufacture missing CPU/device support. [Shape compatibility command](https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/compute/image-shape-compatibility-entry/add.html), [memory constraints](https://docs.oracle.com/en-us/iaas/tools/dotnet/latest/api/Oci.CoreService.Models.ImageMemoryConstraints.html), [OCPU constraints](https://docs.oracle.com/en-us/iaas/tools/dotnet/latest/api/Oci.CoreService.Models.ImageOcpuConstraints.html)
 
-Forge embeds selected shape entries and their configured limits in `.oci` metadata at `additionalMetadata.shapeCompatibilities`. The supplied Oracle version-2 export confirms the internal names for Standard E4/E5/E6 Flex. FreeBSD's ARM64 OCI exporter confirms the names for Standard A1/A2 Flex. The archive receipt lists `embedded_shapes` and `companion_only_shapes`. Every selected shape, including Standard A4 Flex, appears in the companion for application and verification through the public OCI API. [FreeBSD OCI exporter](https://lists.freebsd.org/archives/dev-commits-src-all/2025-March/052583.html)
+The Exports card and completed build identify the inspected architecture and every selected public shape. An OCI archive with a selection must contain the same effective list and limits in `additionalMetadata.shapeCompatibilities`. Forge checks the guest CPU architecture and each internal archive identifier before publishing the file. It checks older downloads too. With no selection, OCI assigns the imported image’s compatibility list.
 
-After uploading the image and filling the object location and compartment in `image-import.json`, the companion provides one command:
+Public shape names and internal archive identifiers can differ, especially for bare metal. The Oracle version-2 reference confirms several x86 VM names, and FreeBSD’s ARM64 exporter confirms `VM.Standard.A1.Flex` and `VM.Standard.A2.Flex`. An absent mapping for a selected shape blocks the local archive. The standalone QCOW2 and OCI configuration support applying the public shape through the OCI API. [FreeBSD ARM exporter](https://lists.freebsd.org/archives/dev-commits-src-all/2025-March/052583.html)
+
+#### Registering a native archive identifier
+
+A Forge operator can register a shape such as `BM.Standard.A4.48` using an Oracle-generated reference. In OCI, start with a custom image whose compatibility list contains only the intended public shape. Export it in OCI format and save its `image_metadata.json`. Save the complete shape list for that same image and region. Pair the two files from that export.
+
+```sh
+oci compute image-shape-compatibility-entry list --image-id "$IMAGE_OCID" --all --output json > shape-list.json
+jq -n --slurpfile metadata image_metadata.json --slurpfile shapes shape-list.json \
+  '{image_metadata: $metadata[0], oci_shape_list: $shapes[0]}' > BM.Standard.A4.48.json
+```
+
+Mount the reference directory read-only at `/etc/cloud-image-forge/oci-shapes` inside the Forge container. The filename is the exact public shape plus `.json`. Keep the references local to the operator. Forge takes the one internal shape identifier from the paired reference and uses the current export’s architecture, limits and launch settings. A completed QCOW2 can then offer **Download .oci** without rebuilding its disk.
+
+For Docker Compose, add the following bind mount under the Forge service’s `volumes` in a local override and recreate that service. Store one reference file per shape.
+
+```yaml
+services:
+  forge:
+    volumes:
+      - /srv/forge/oci-shape-references:/etc/cloud-image-forge/oci-shapes:ro
+```
+
+#### Applying the selected public shapes in OCI
+
+Upload the image, fill in the object location and compartment in `image-import.json`, and run the companion command.
 
 ```sh
 python3 apply-oci.py --import-image
@@ -241,7 +266,15 @@ python3 apply-oci.py --import-image
 
 It requires Python 3 and a configured OCI CLI on Linux/macOS. Use a CLI version supporting the selected launch mode; older versions such as 3.66.1 do not accept `ACCELERATEDPV`. Optional `--profile NAME` and `--region REGION` choose the OCI context. The command saves the returned image OCID before waiting for `AVAILABLE`, adds or updates all requested public shape entries, and verifies their names and specified bounds with the [paginated shape list API](https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/compute/image-shape-compatibility-entry/list.html). For an image already imported through the Console or CLI, run `python3 apply-oci.py --image-id IMAGE_OCID` instead.
 
-Retry the same command after a partial failure. Its private `.forge-oci-apply-state.json` prevents another import, and matching shape entries are skipped. An uncertain import response stops automatic resubmission: locate the created image and resume with its OCID. Use a separate bundle extraction for a different image, profile, or edited configuration. Unrelated shapes and existing constraint fields omitted from the requested rows are preserved. The utility does not upload the disk, create an instance, or apply capability schemas; review the existing schema steps below when additional capabilities are needed. Generating or downloading the bundle itself makes no OCI API calls.
+Retry the same command after a partial failure. Its private `.forge-oci-apply-state.json` prevents another import, and matching shape entries are skipped. An uncertain import response stops automatic resubmission: locate the created image and resume with its OCID. Use a separate bundle extraction for a different image, profile, or edited configuration. By default, the command preserves additional shapes and existing constraint fields omitted from the requested rows. The utility does not upload the disk, create an instance, or apply capability schemas; review the existing schema steps below when additional capabilities are needed. Generating or downloading the bundle itself makes no OCI API calls.
+
+OCI manages the compatibility list on the imported image. To keep exactly the selected shapes, download the current **OCI configuration** ZIP from Exports, extract it, and run the following command with the imported image’s OCID. It verifies all selected names and limits before removing any other associations. It then checks the final paginated list. An empty selection or an unverified guest/shape architecture blocks this operation before it contacts OCI.
+
+```sh
+python3 apply-oci.py --image-id IMAGE_OCID --exact-shapes
+```
+
+This also works on an image already imported through the Console. For a shape whose archive identifier is unavailable locally, OCI can generate a native archive after you reconcile the image. In **Custom images**, select the image, choose **Export**, and select **Oracle Cloud Infrastructure (.oci)**. [Editing custom images](https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/custom-images-edit.htm) · [Exporting custom images](https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/custom-images-export.htm)
 
 The `Image` response also contains service-owned fields such as its OCID, lifecycle state, creation time, billing size, boot-volume size, and image-creation eligibility. These are not editable import options simply because they appear in exported metadata or API responses. In particular, `sizeInMBs` describes the boot volume's size and differs from the uploaded QCOW2 file length. [Image resource model](https://docs.oracle.com/en-us/iaas/tools/python/latest/api/core/models/oci.core.models.Image.html)
 

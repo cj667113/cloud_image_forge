@@ -112,11 +112,19 @@ def _matches(actual, desired):
 
 
 def apply(bundle, *, image_id=None, import_image=False, profile=None, region=None,
-          timeout=3600, run=subprocess.run, sleep=time.sleep):
-    """Run only documented image import/get and shape list/add operations."""
+          exact_shapes=False, timeout=3600, run=subprocess.run, sleep=time.sleep):
+    """Apply the selected shapes and optionally remove other associations."""
     bundle = Path(bundle).resolve()
     manifest = _load(bundle / "shape-compatibility.json")
     entries = _entries(manifest)
+    wanted = {entry["shapeName"] for entry in entries}
+    if exact_shapes and not wanted:
+        raise ApplyError("--exact-shapes requires at least one selected shape")
+    if exact_shapes:
+        arch = manifest.get("architecture")
+        required = manifest.get("shapeArchitectures") or {}
+        if arch not in {"aarch64", "x86_64"} or not isinstance(required, dict) or any(required.get(name) != arch for name in wanted):
+            raise ApplyError("--exact-shapes requires a verified guest architecture matching every selected shape")
     imports = _load(bundle / "image-import.json")
     if not isinstance(imports, dict):
         raise ApplyError("Invalid image import configuration")
@@ -146,8 +154,8 @@ def apply(bundle, *, image_id=None, import_image=False, profile=None, region=Non
             if response.returncode:
                 # OCI errors can repeat a private object URI. Do not echo them.
                 raise ApplyError(f"OCI {' '.join(arguments[:4])} failed (exit {response.returncode}); state is saved. Check the OCI console/CLI credentials, then resume.")
-            # OCI CLI render() suppresses an empty list instead of emitting
-            # {"data": []}. This is valid only for this successful list call.
+            if arguments[:3] == ["compute", "image-shape-compatibility-entry", "remove"]:
+                return  # This operation has no response body.
             if not response.stdout.strip() and arguments[:3] == ["compute", "image-shape-compatibility-entry", "list"]:
                 return []
             try:
@@ -164,6 +172,9 @@ def apply(bundle, *, image_id=None, import_image=False, profile=None, region=Non
             if state.get("image_id") and state["image_id"] != image_id:
                 raise ApplyError("This bundle already tracks a different imported image")
             state["image_id"] = image_id
+            _save(state_path, state)
+        if state.pop("completed", False):
+            state.pop("verified_shapes", None)
             _save(state_path, state)
         if not state.get("image_id"):
             if state.get("import_started"):
@@ -203,15 +214,14 @@ def apply(bundle, *, image_id=None, import_image=False, profile=None, region=Non
             if not isinstance(rows, list):
                 raise ApplyError("OCI shape list is not an array")
             result = {}
-            wanted = {row["shapeName"] for row in entries}
             for row in rows:
-                if not isinstance(row, dict) or not isinstance(row.get("shape"), str):
+                name = row.get("shape") if isinstance(row, dict) else None
+                if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,199}", name) or name in result:
                     raise ApplyError("OCI shape list contains malformed or duplicate entries")
-                if row["shape"] not in wanted:
-                    continue  # Unrelated service entries are never rewritten.
-                if row["shape"] in result:
-                    raise ApplyError("OCI shape list contains malformed or duplicate entries")
-                result[row["shape"]] = {
+                if name not in wanted:
+                    result[name] = {}  # Service defaults can have fractional bounds.
+                    continue
+                result[name] = {
                     "ocpuConstraints": _constraints(row.get("ocpu-constraints", row.get("ocpuConstraints"))),
                     "memoryConstraints": _constraints(row.get("memory-constraints", row.get("memoryConstraints")), True)}
             return result
@@ -234,12 +244,28 @@ def apply(bundle, *, image_id=None, import_image=False, profile=None, region=Non
             cli(["compute", "image-shape-compatibility-entry", "add", "--force"], payload)
             state["last_applied_shape"] = name
             _save(state_path, state)
-        actual = current()
-        if any(row["shapeName"] not in actual or not _matches(actual[row["shapeName"]], row) for row in expected):
-            raise ApplyError("OCI did not retain every requested shape and limit; rerun to recheck/apply missing entries")
+        def verified():
+            actual = current()
+            if any(row["shapeName"] not in actual or not _matches(actual[row["shapeName"]], row) for row in expected):
+                raise ApplyError("OCI did not retain every requested shape and limit; rerun to recheck/apply missing entries")
+            return actual
+
+        actual = verified()
+        removed = []
+        if exact_shapes:
+            for name in sorted(actual.keys() - wanted):
+                cli(["compute", "image-shape-compatibility-entry", "remove", "--image-id", image_id,
+                     "--shape-name", name, "--force"])
+                removed.append(name)
+            if removed:
+                actual = verified()
+            if actual.keys() - wanted:
+                raise ApplyError("OCI still lists additional shapes; rerun to reconcile the current list")
         state.update(completed=True, verified_shapes=[row["shapeName"] for row in entries])
         _save(state_path, state)
-        return {"image_id": image_id, "verified_shapes": state["verified_shapes"], "unrelated_shapes_removed": False}
+        return {"image_id": image_id, "verified_shapes": state["verified_shapes"],
+                "additional_shapes": sorted(actual.keys() - wanted), "removed_shapes": removed,
+                "unrelated_shapes_removed": bool(removed)}
 
 
 def main():
@@ -247,6 +273,8 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--import-image", action="store_true", help="Import the uploaded object specified in image-import.json")
     mode.add_argument("--image-id", help="Apply shapes to an existing imported image")
+    parser.add_argument("--exact-shapes", action="store_true",
+                        help="Remove other compatible shapes after verifying all shapes in this bundle")
     parser.add_argument("--profile", help="OCI CLI profile")
     parser.add_argument("--region", help="OCI region")
     parser.add_argument("--timeout", type=int, default=3600, help="Seconds to wait for AVAILABLE")

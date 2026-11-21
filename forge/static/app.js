@@ -1,4 +1,5 @@
 'use strict';
+const ociDefaultShapesHint = 'With no shapes selected, OCI assigns shape compatibility when you import the image.';
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
@@ -633,7 +634,7 @@ function renderOciPanel() {
 
       <label class="check-field"><input type="checkbox" id="oci-ipv6-ack"><span>I have validated this guest’s IPv6 configuration<small>Required when advertising IPv6 support. Final validation must include a launch in the destination OCI network.</small></span></label>
     </div></details>
-    <details class="editor-disclosure oci-details" data-disclosure="oci-import"><summary>Import settings, tags & shapes <span class="disclosure-meta">Optional</span></summary><div class="details-content">
+    <details class="editor-disclosure oci-details" data-disclosure="oci-import"><summary>Import settings, tags & shapes <span class="disclosure-meta" id="oci-import-shape-summary"></span></summary><div class="details-content">
       <p class="panel-intro">Included in the configuration download; no cloud resources are created.</p>
       <div class="form-grid">
         <label class="field">Display name<input id="oci-display-name" placeholder="custom-linux-image"></label>
@@ -769,14 +770,27 @@ function currentOciShapeResolution() {
   const cached=studioSession().shapeResolution;
   return cached?.signature&&cached.signature===ociShapeResolutionKey()&&cached.context===previewContextKey()?cached.resolution:null;
 }
+function compactShapeNames(names) {
+  if (!names.length) return 'No shapes selected';
+  const remaining = names.length - 3;
+  return names.slice(0, 3).join(', ') + (remaining > 0 ? ` · +${remaining} more` : '');
+}
 function shapeResolutionMarkup(resolution,location) {
+  const names = resolution.effective_shapes.map(item => item.shape);
   const bounds=shape=>[['OCPUs',shape.min_ocpus,shape.max_ocpus],['GiB',shape.min_memory_gbs,shape.max_memory_gbs]].filter(([,min,max])=>min||max).map(([unit,min,max])=>`${min||'default'}–${max||'default'} ${unit}`).join(' · ');
   const added=new Map((resolution.added_shapes||[]).map(item=>[item.shape,item.reason]));
-  return `<details class="editor-disclosure oci-resolved-details" data-disclosure="${location}-resolved-shapes"><summary>Compatible shapes <span class="disclosure-meta">${resolution.effective_shapes.length} · ${resolution.mode==='manual'?'Only listed':'Automatic'}</span></summary><div class="details-content"><ul class="oci-resolved-list">${resolution.effective_shapes.map(item=>`<li><code>${esc(item.shape)}</code>${bounds(item)?`<span>${esc(bounds(item))}</span>`:''}${added.has(item.shape)?helpHint(added.get(item.shape),'Why this shape was added'):''}</li>`).join('')}</ul>${!resolution.effective_shapes.length?'<p class="field-help">List a shape or choose a specific destination profile to resolve compatible shapes.</p>':''}${resolution.skipped_shapes?.length?`<details><summary>Excluded shapes (${resolution.skipped_shapes.length})</summary><ul>${resolution.skipped_shapes.map(item=>`<li><code>${esc(item.shape)}</code>: ${esc(item.reason)}</li>`).join('')}</ul></details>`:''}${resolution.warnings?.length?`<ul class="oci-warnings">${resolution.warnings.map(item=>`<li>${esc(item)}</li>`).join('')}</ul>`:''}<p class="field-help">Offline matching. Availability and a successful OCI launch are still unverified.</p></div></details>`;
+  return `<details class="editor-disclosure oci-resolved-details" data-disclosure="${location}-resolved-shapes"><summary>Compatible shapes <span class="disclosure-meta" title="${esc(names.length ? names.join(', ') : ociDefaultShapesHint)}">${esc(compactShapeNames(names))}</span></summary><div class="details-content"><ul class="oci-resolved-list">${resolution.effective_shapes.map(item=>`<li><code>${esc(item.shape)}</code>${bounds(item)?`<span>${esc(bounds(item))}</span>`:''}${added.has(item.shape)?helpHint(added.get(item.shape),'Why this shape was added'):''}</li>`).join('')}</ul>${!resolution.effective_shapes.length?'<p class="field-help">List a shape or choose a specific destination profile to resolve compatible shapes.</p>':''}${resolution.skipped_shapes?.length?`<details><summary>Excluded shapes (${resolution.skipped_shapes.length})</summary><ul>${resolution.skipped_shapes.map(item=>`<li><code>${esc(item.shape)}</code>: ${esc(item.reason)}</li>`).join('')}</ul></details>`:''}${resolution.warnings?.length?`<ul class="oci-warnings">${resolution.warnings.map(item=>`<li>${esc(item)}</li>`).join('')}</ul>`:''}<p class="field-help">Offline matching. Availability and a successful OCI launch are still unverified.</p></div></details>`;
 }
 function updateOciShapeResolution() {
   if(!$('#oci-shape-mode'))return;
   const resolution=currentOciShapeResolution();
+  const summary = $('#oci-import-shape-summary');
+  if (summary) {
+    const names = resolution?.effective_shapes.map(row => row.shape)
+      ?? $$('#oci-shapes [data-shape-field="shape"]').map(input => input.value.trim()).filter(Boolean);
+    summary.textContent = compactShapeNames(names);
+    summary.title = names.length ? names.join(', ') : ociDefaultShapesHint;
+  }
   for(const location of ['oci','destination']) {
     const host=$(`#${location}-resolved-shapes`);if(!host)continue;
     const visible=Boolean(resolution)&&($('#oci-enabled')?.checked||location==='oci');

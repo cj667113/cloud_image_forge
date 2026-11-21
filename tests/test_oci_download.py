@@ -11,7 +11,7 @@ import pytest
 
 from forge import oci_archive
 from test_api import client
-from test_oci_archive import qcow
+from test_oci_archive import native_reference, qcow
 
 
 def export(client, tmp_path, **changes):
@@ -19,9 +19,10 @@ def export(client, tmp_path, **changes):
     folder = tmp_path / "builds" / "shared"
     folder.mkdir(parents=True, exist_ok=True)
     disk = qcow(folder / "published.qcow2")
-    fields = dict(path=str(disk), filename=disk.name, size=disk.stat().st_size,
+    fields = dict(path=str(disk), filename=disk.name, size=disk.stat().st_size, architecture="aarch64",
                   sha256=hashlib.sha256(disk.read_bytes()).hexdigest(), target="oci", format="qcow2",
                   recipe={"target": "oci", "oci": {"import_options": {
+                      "shape_compatibility": [{"shape": "VM.Standard.A2.Flex", "max_ocpus": 4}],
                       "operating_system": "Ubuntu", "operating_system_version": "26.04.1"}}},
                   shape_compatibility_resolution={"effective_shapes": [{"shape": "VM.Standard.A2.Flex", "max_ocpus": 4}]})
     return store.create("artifact", **{**fields, **changes})
@@ -66,7 +67,8 @@ def test_download_archives_existing_verified_disk_and_honors_ranges_renames_and_
 
 def test_old_export_uses_inspected_os_only_if_configured_and_final_labels_are_incomplete(client, tmp_path, monkeypatch):
     item = export(client, tmp_path, oci_archive_os={"operating_system": "Debian"}, recipe={
-        "oci": {"import_options": {"operating_system": "Unknown Linux"}}})
+        "oci": {"import_options": {"operating_system": "Unknown Linux",
+                                  "shape_compatibility": [{"shape": "VM.Standard.A2.Flex", "max_ocpus": 4}]}}})
     inspect = Mock(return_value={"operating_system": "Linux", "operating_system_version": "13"})
     monkeypatch.setattr(client.app.state.jobs, "inspect_export_os", inspect)
     contents, _ = metadata(client.get("/api/artifacts/" + item["id"] + "/oci-archive"))
@@ -94,6 +96,80 @@ def test_archive_rechecks_corrupt_cache_and_source_checksum_before_serving(clien
     assert not cache.exists()
     disk.unlink()
     assert client.get(url).status_code == 410
+
+
+def test_old_disk_reinspects_missing_architecture_once(client, tmp_path, monkeypatch):
+    item = export(client, tmp_path, architecture=None)
+    url = "/api/artifacts/" + item["id"] + "/oci-archive"
+    inspect = Mock(return_value={"architecture": "amd64"})
+    monkeypatch.setattr(client.app.state.jobs, "inspect_export_os", inspect)
+    result = client.get(url)
+    assert result.status_code == 409 and "requires aarch64" in result.json()["detail"]
+    inspect.return_value = {"architecture": "arm64"}
+    contents, _ = metadata(client.get(url))
+    assert [r["internalShapeName"] for r in contents["additionalMetadata"]["shapeCompatibilities"]] == ["VM.Standard.A2.Flex"]
+    assert client.get(url).status_code == 200 and inspect.call_count == 2
+
+
+def test_cache_and_listing_recheck_architecture_and_selected_names(client, tmp_path):
+    item = export(client, tmp_path)
+    store = client.app.state.store
+    base = "/api/artifacts/" + item["id"]
+    assert client.get(base + "/oci-archive").status_code == 200
+    store.update("artifact", item["id"], architecture="x86_64")
+    record = client.get(base).json()
+    assert not record["oci_archive_available"] and "requires aarch64" in record["oci_archive_blocker"]
+    assert client.get(base + "/oci-archive").status_code == 409
+    store.update("artifact", item["id"], architecture="aarch64",
+                 recipe={"oci": {"import_options": {"shape_compatibility": [{"shape": "BM.Standard.A4.48"}]}}},
+                 shape_compatibility_resolution={"effective_shapes": [{"shape": "BM.Standard.A4.48"}]})
+    rejected = client.get(base + "/oci-archive")
+    assert rejected.status_code == 409 and "BM.Standard.A4.48" in rejected.json()["detail"]
+    assert client.get(base + "/download").status_code == 200
+
+
+def test_cached_download_rechecks_operator_alias_and_refuses_removed_reference(client, tmp_path, monkeypatch):
+    name = "BM.Standard.A4.48"
+    rows = [{"shape": name}]
+    item = export(client, tmp_path, recipe={"oci": {"import_options": {"shape_compatibility": rows,
+                  "operating_system": "Ubuntu", "operating_system_version": "26.04.1"}}},
+                  shape_compatibility_resolution={"effective_shapes": rows})
+    monkeypatch.setattr(oci_archive, "SHAPE_REFERENCE_DIR", tmp_path)
+    path = tmp_path / (name + ".json")
+    base = "/api/artifacts/" + item["id"]
+    listing = client.get("/api/artifacts")
+    assert not listing.json()[0]["oci_archive_available"]
+    for alias in ("test-native-arm-first", "test-native-arm-updated"):
+        path.write_text(json.dumps(native_reference(name, alias)))
+        listing = client.get("/api/artifacts", headers={"If-None-Match": listing.headers["etag"]})
+        assert listing.status_code == 200 and listing.json()[0]["oci_archive_available"]
+        assert client.get("/api/artifacts", headers={"If-None-Match": listing.headers["etag"]}).status_code == 304
+        contents, _ = metadata(client.get(base + "/oci-archive"))
+        assert [r["internalShapeName"] for r in contents["additionalMetadata"]["shapeCompatibilities"]] == [alias]
+    path.unlink()
+    listing = client.get("/api/artifacts", headers={"If-None-Match": listing.headers["etag"]})
+    assert listing.status_code == 200 and not listing.json()[0]["oci_archive_available"]
+    assert client.get(base + "/oci-archive").status_code == 409
+
+
+def test_partial_or_tampered_native_archive_blocked_on_download_and_s3(client, tmp_path):
+    item = export(client, tmp_path)
+    store = client.app.state.store
+    base = "/api/artifacts/" + item["id"]
+    response = client.get(base + "/oci-archive")
+    original, _ = metadata(response)
+    native = tmp_path / "native.oci"
+    native.write_bytes(response.content)
+    store.update("artifact", item["id"], path=str(native), format="oci", oci_archive={"metadata": {"version": 2}})
+    assert "different shape list" in client.get(base).json()["oci_archive_blocker"]
+    for request in (lambda: client.get(base + "/download"),
+                    lambda: client.post(base + "/upload", json={"url": "s3://example/native.oci"})):
+        assert request().status_code == 409
+    store.update("artifact", item["id"], oci_archive={"metadata": original})
+    assert client.get(base + "/download").status_code == 200
+    native.write_bytes(response.content.replace(b"VM.Standard.A2.Flex", b"VM.Standard.E4.Flex", 1))
+    assert client.get(base + "/download").status_code == 409
+    assert client.post(base + "/upload", json={"url": "s3://example/native.oci"}).status_code == 409
 
 
 def test_concurrent_downloads_package_once_and_block_deletion(client, tmp_path, monkeypatch):
