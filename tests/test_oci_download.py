@@ -121,14 +121,14 @@ def test_cache_and_listing_recheck_architecture_and_selected_names(client, tmp_p
     assert not record["oci_archive_available"] and "requires aarch64" in record["oci_archive_blocker"]
     assert client.get(base + "/oci-archive").status_code == 409
     store.update("artifact", item["id"], architecture="aarch64",
-                 recipe={"oci": {"import_options": {"shape_compatibility": [{"shape": "BM.Standard.A4.48"}]}}},
+                 recipe={"oci": {"import_options": {"shape_compatibility": [{"shape": "BM.Standard.A4.48"}], "operating_system":"Ubuntu", "operating_system_version":"26.04"}}},
                  shape_compatibility_resolution={"effective_shapes": [{"shape": "BM.Standard.A4.48"}]})
-    rejected = client.get(base + "/oci-archive")
-    assert rejected.status_code == 409 and "BM.Standard.A4.48" in rejected.json()["detail"]
+    contents, _ = metadata(client.get(base + "/oci-archive"))
+    assert [r["internalShapeName"] for r in contents["additionalMetadata"]["shapeCompatibilities"]] == ["BM.Standard.A4.48"]
     assert client.get(base + "/download").status_code == 200
 
 
-def test_cached_download_rechecks_operator_alias_and_refuses_removed_reference(client, tmp_path, monkeypatch):
+def test_cached_download_rechecks_operator_alias_and_restores_public_name_after_reference_removal(client, tmp_path, monkeypatch):
     name = "BM.Standard.A4.48"
     rows = [{"shape": name}]
     item = export(client, tmp_path, recipe={"oci": {"import_options": {"shape_compatibility": rows,
@@ -138,7 +138,7 @@ def test_cached_download_rechecks_operator_alias_and_refuses_removed_reference(c
     path = tmp_path / (name + ".json")
     base = "/api/artifacts/" + item["id"]
     listing = client.get("/api/artifacts")
-    assert not listing.json()[0]["oci_archive_available"]
+    assert listing.json()[0]["oci_archive_available"]
     for alias in ("test-native-arm-first", "test-native-arm-updated"):
         path.write_text(json.dumps(native_reference(name, alias)))
         listing = client.get("/api/artifacts", headers={"If-None-Match": listing.headers["etag"]})
@@ -148,8 +148,9 @@ def test_cached_download_rechecks_operator_alias_and_refuses_removed_reference(c
         assert [r["internalShapeName"] for r in contents["additionalMetadata"]["shapeCompatibilities"]] == [alias]
     path.unlink()
     listing = client.get("/api/artifacts", headers={"If-None-Match": listing.headers["etag"]})
-    assert listing.status_code == 200 and not listing.json()[0]["oci_archive_available"]
-    assert client.get(base + "/oci-archive").status_code == 409
+    assert listing.status_code == 200 and listing.json()[0]["oci_archive_available"]
+    contents, _ = metadata(client.get(base + "/oci-archive"))
+    assert [r["internalShapeName"] for r in contents["additionalMetadata"]["shapeCompatibilities"]] == [name]
 
 
 def test_partial_or_tampered_native_archive_blocked_on_download_and_s3(client, tmp_path):

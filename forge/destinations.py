@@ -15,7 +15,7 @@ from .oci_shapes import AMD_STANDARD_PV, ARM_STANDARD_PV, resolve_shape_compatib
 
 NIC_DRIVERS = ("auto", *sorted(HARDWARE_NIC_DRIVERS))
 # These Standard Flex families share a guest device profile within their ISA.
-# Ax, DenseIO and physical machines have distinct hardware requirements.
+# Bare-metal groups are derived from the preparation settings below.
 VM_PROFILE_GROUPS = {
     "oci:arm-standard-pv": ARM_STANDARD_PV,
     "oci:amd-standard-pv": tuple(AMD_STANDARD_PV),
@@ -112,16 +112,29 @@ def destination_catalog():
     profiles.extend(_profile(f"oci:{architecture}:vm", architecture, "vm", "oci")
                     for architecture in ("aarch64", "x86_64"))
     by_shape = {profile["shape"]: profile for profile in profiles if profile["shape"]}
-    for group_id, shapes in VM_PROFILE_GROUPS.items():
+    def settings(profile):
+        return {key: value for key, value in profile.items() if key not in {"id", "label", "shape", "shapes"}}
+
+    groups = dict(VM_PROFILE_GROUPS)
+    remaining = [p for p in by_shape.values() if p["target"] == "bare_metal"]
+    while remaining:
+        first = remaining[0]
+        common = settings(first)
+        members = [p for p in remaining if settings(p) == common]
+        remaining = [p for p in remaining if settings(p) != common]
+        if len(members) > 1:
+            groups["oci:bare-metal:" + first["shape"]] = [p["shape"] for p in members]
+
+    for group_id, shapes in groups.items():
         members = [by_shape[name] for name in shapes if name in by_shape]
         if len(members) != len(shapes):
             continue
         first = members[0]
-        settings = {key: value for key, value in first.items() if key not in {"id", "label", "shape", "shapes"}}
-        if any(member[key] != value for member in members[1:] for key, value in settings.items()):
+        common = settings(first)
+        if any(settings(member) != common for member in members[1:]):
             continue
         label = ", ".join(shapes[:-1]) + " and " + shapes[-1]
-        group = {**settings, "id": group_id, "label": label, "shape": None, "shapes": list(shapes)}
+        group = {**common, "id": group_id, "label": label, "shape": None, "shapes": list(shapes)}
         profiles.insert(profiles.index(first), group)
         for member in members:
             member["group_id"] = group_id

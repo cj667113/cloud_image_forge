@@ -56,7 +56,9 @@ OBSERVED_SHAPE_NAMES = {name: name for name in (
 # Reject recognizable x86 hardware-family aliases on ARM. This check never
 # supplies a mapping or establishes that an alias is valid for a given shape.
 X86_INTERNAL_FAMILY = re.compile(r"(?:[ex][0-9]+-2[cl]?|b200)\.", re.IGNORECASE)
-ARCHIVE_POLICY_VERSION = 2
+# Version-2 capability descriptor format from the supplied Oracle native export.
+NATIVE_CAPABILITY_FORMAT = "34dd2cea-aff2-4f45-b8f6-1cb5290bfab2"
+ARCHIVE_POLICY_VERSION = 3
 SHAPE_REFERENCE_DIR = Path("/etc/cloud-image-forge/oci-shapes")
 MAX_REFERENCE_BYTES = 2 * MAX_METADATA_BYTES
 
@@ -172,6 +174,9 @@ def shape_metadata(config, shape_resolution, arch, *, allow_missing_arch=False, 
     if len(shape_arches) > 1:
         raise OciArchiveError("The selected OCI shapes span both ARM64 and x86_64. Choose one guest architecture.")
     aliases = {name: OBSERVED_SHAPE_NAMES.get(name) or _reference_alias(name) for name in sorted(names)}
+    public_names = [name for name, alias in aliases.items() if alias is None and name.startswith("BM.")]
+    for name in public_names:
+        aliases[name] = name
     unmapped = [name for name, alias in aliases.items() if not alias]
     if unmapped:
         raise OciArchiveError("No verified OCI archive mapping for " + ", ".join(unmapped) +
@@ -182,9 +187,8 @@ def shape_metadata(config, shape_resolution, arch, *, allow_missing_arch=False, 
                  "ocpuConstraints": row["ocpuConstraints"], "memoryConstraints": row["memoryConstraints"]}
                 for row in entries]
     return {"entries": embedded, "embedded_shapes": [row["shapeName"] for row in entries],
-            "companion_only_shapes": [],
-            "mapping_basis": "Operator-installed OCI shape references and known archive mappings"
-            if names - OBSERVED_SHAPE_NAMES.keys() else "Known Oracle and FreeBSD archive mappings"}
+            "companion_only_shapes": [], "public_name_shapes": public_names,
+            "mapping_basis": "Known and operator-supplied native identifiers, with selected public names for remaining bare-metal shapes"}
 
 
 def image_metadata(config, inspection, *, shape_resolution=None):
@@ -214,14 +218,17 @@ def _image_metadata(config, inspection, shapes):
     launch = {name: config.capabilities[key].default_value for name, key in LAUNCH_CAPABILITIES.items()}
     launch["launchOptionsSource"] = config.import_options.launch_mode
     capabilities = None
-    if config.image_caps_format_version:
+    format_version = config.image_caps_format_version
+    if not format_version and any(name.startswith("BM.") for name in shapes["embedded_shapes"]):
+        format_version = NATIVE_CAPABILITY_FORMAT
+    if format_version:
         descriptors = capability_schema(config)
         for descriptor in descriptors.values():
             descriptor.pop("source", None)  # API-only; absent in version-2 export descriptors.
         capabilities = json.dumps({"capabilities": descriptors}, sort_keys=True, separators=(",", ":"), allow_nan=False)
     result = {"version": 2, "externalLaunchOptions": launch,
               "imageCapabilityData": capabilities,
-              "imageCapsFormatVersion": config.image_caps_format_version,
+              "imageCapsFormatVersion": format_version,
               "operatingSystem": operating_system, "operatingSystemVersion": version}
     if shapes["entries"]:
         result["additionalMetadata"] = {"shapeCompatibilities": shapes["entries"]}
@@ -229,10 +236,13 @@ def _image_metadata(config, inspection, shapes):
     return result
 
 
-def _warnings(config, shapes):
+def _warnings(metadata, shapes):
     result = []
-    if not config.image_caps_format_version:
+    if not metadata["imageCapsFormatVersion"]:
         result.append("No OCI archive capability-format UUID was supplied: imageCapabilityData and imageCapsFormatVersion are null. The archive retains its launch options; apply additional selected capabilities from the companion OCI configuration after import.")
+    if shapes["public_name_shapes"]:
+        result.append("These bare-metal entries use their selected public names. OCI import recognition is unverified: "
+                      + ", ".join(shapes["public_name_shapes"]) + ".")
     if shapes["embedded_shapes"]:
         result.append("Run the companion apply-oci.py command after import to verify the selected shapes and limits in OCI.")
     return result
@@ -443,9 +453,9 @@ owned temporary/output inode; the input file is opened read-only throughout.
                            "archive_sha256": archive_sha256, "disk_size": initial.st_size,
                            "disk_sha256": disk.digest.hexdigest(),
                            "metadata_sha256": hashlib.sha256(metadata_bytes).hexdigest(), "metadata": metadata,
-                           "capability_mode": "embedded" if config.image_caps_format_version else "deferred",
+                           "capability_mode": "embedded" if metadata["imageCapsFormatVersion"] else "deferred",
                            "shape_compatibility": {key: value for key, value in shapes.items() if key != "entries"},
-                           "warnings": _warnings(config, shapes)}
+                           "warnings": _warnings(metadata, shapes)}
         return receipt
     except BaseException:
         if published:

@@ -34,7 +34,7 @@ def test_group_shares_preparation_and_exports_each_named_shape(group_id, arch, s
     listed = [p for p in profiles.values() if p["architecture"] == arch and "group_id" not in p]
     assert [p["id"] for p in listed if set(shapes).intersection(p["shapes"])] == [group_id]
     assert all(p in listed for p in profiles.values() if p["architecture"] == arch and
-               (p["network_attachment"] == "accelerated" or p["target"] == "bare_metal" or not p["shapes"]))
+               (p["network_attachment"] == "accelerated" or not p["shapes"]))
 
     source = image(arch)
     grouped = resolve_destination(source, {"profile_id": group_id})
@@ -56,6 +56,24 @@ def test_group_shares_preparation_and_exports_each_named_shape(group_id, arch, s
 
     wrong_arch = "aarch64" if arch == "x86_64" else "x86_64"
     assert not resolve_destination(image(wrong_arch), {"profile_id": group_id})["ready"]
+
+
+@pytest.mark.parametrize("arch", ["aarch64", "x86_64"])
+def test_bare_metal_picker_groups_equal_overrides_and_keeps_saved_single_shape(arch):
+    profiles = destination_catalog()["profiles"]
+    members = [p for p in profiles if p["architecture"] == arch and p["target"] == "bare_metal" and p["shape"]]
+    group, = [p for p in profiles if p["id"] == members[0]["group_id"]]
+    source = image(arch)
+    grouped = resolve_destination(source, {"profile_id": group["id"], "nic_driver": "mlx5_core"})
+    assert grouped["ready"] and group["shapes"] == [p["shape"] for p in members]
+    assert grouped["oci_defaults"]["import_options"]["shape_compatibility_mode"] == "manual"
+    assert grouped["shape_compatibility_resolution"]["effective_shapes"] == [{"shape": name} for name in group["shapes"]]
+    for p in members:
+        assert p["group_id"] == group["id"]
+        saved = resolve_destination(source, {"profile_id": p["id"], "nic_driver": "mlx5_core"})
+        assert saved["oci_defaults"]["capabilities"] == grouped["oci_defaults"]["capabilities"]
+        assert saved["platform_migration"] == grouped["platform_migration"]
+        assert saved["shape_compatibility_resolution"]["effective_shapes"] == [{"shape": p["shape"]}]
 
 
 def test_group_splits_when_a_member_requires_different_network_preparation(monkeypatch):

@@ -192,16 +192,26 @@ def test_unmapped_shapes_are_not_guessed_or_copied_from_source_metadata():
     inspection = deepcopy(INSPECTION)
     inspection["os"]["arch"] = "x86_64"
     inspection["additionalMetadata"] = {"shapeCompatibilities": [{"internalShapeName": "unsafe-source-default"}]}
-    with pytest.raises(subject.OciArchiveError, match="No verified OCI archive mapping for BM.Standard.E5.192"):
-        subject.image_metadata(config, inspection)
+    metadata = subject.image_metadata(config, inspection)
+    assert [row["internalShapeName"] for row in metadata["additionalMetadata"]["shapeCompatibilities"]] == [
+        "VM.Standard.E4.Flex", "BM.Standard.E5.192"]
 
 
-@pytest.mark.parametrize("shape", ["BM.Standard.A1.160", "BM.Standard.A4.48"])
-def test_unmapped_arm_bare_metal_never_creates_unrestricted_archive(tmp_path, shape):
-    config = OciConfig(import_options={"shape_compatibility": [{"shape": shape}]})
-    with pytest.raises(subject.OciArchiveError, match=shape):
-        package(tmp_path, config)
-    assert not (tmp_path / "image.oci").exists()
+def test_bare_metal_download_contains_only_selected_shapes_and_effective_overrides(tmp_path):
+    shapes = ["BM.Standard.A4.48", "BM.Standard.A4.Ax.48"]
+    config = OciConfig(import_options={"shape_compatibility": [{"shape": shape, "max_ocpus": 8} for shape in shapes],
+                                       "launch_mode": "NATIVE"},
+                       capabilities={"Network.AttachmentType": {"default_value": "VFIO", "values": ["VFIO"]}})
+    _, path, receipt = package(tmp_path, config)
+    with tarfile.open(path) as archive:
+        metadata = json.load(archive.extractfile("image_metadata.json"))
+    assert metadata["additionalMetadata"]["shapeCompatibilities"] == [
+        {"internalShapeName": name, "ocpuConstraints": {"max": 8}, "memoryConstraints": None} for name in shapes]
+    assert metadata["externalLaunchOptions"]["networkType"] == "VFIO"
+    assert metadata["externalLaunchOptions"]["launchOptionsSource"] == "NATIVE"
+    assert metadata["imageCapsFormatVersion"] == FORMAT_UUID
+    assert json.loads(metadata["imageCapabilityData"])["capabilities"]["Network.AttachmentType"]["defaultValue"] == "VFIO"
+    assert receipt["capability_mode"] == "embedded" and receipt["shape_compatibility"]["public_name_shapes"] == shapes
 
 
 @pytest.mark.parametrize("arch,shape,reason", [
