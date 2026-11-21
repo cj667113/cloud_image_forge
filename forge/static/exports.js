@@ -66,7 +66,7 @@ function exportShapeMarkup(selection) {
   const list = rows => `<ul class="export-shape-list" aria-label="Selected OCI shapes">${rows.map(badge).join('')}</ul>`;
   const rest = shapes.slice(4);
   const afterImport = selection.applyAfterImport
-    ? `<details class="export-more-shapes"><summary>Register bare-metal shapes after import</summary><p>OCI can omit these shapes during import. Extract the <a href="/api/artifacts/${encodeURIComponent(selection.applyAfterImport)}/oci-bundle" download>OCI configuration ZIP</a> and run this command with the imported image’s OCID.</p><code>python3 apply-oci.py --image-id IMAGE_OCID</code></details>`
+    ? `<details class="export-more-shapes"><summary>Missing a shape after OCI import?</summary><p>To register the selected shapes and verify their limits, extract the <a href="/api/artifacts/${encodeURIComponent(selection.applyAfterImport)}/oci-bundle" download>OCI configuration ZIP</a> and run this command with the imported image’s OCID.</p><code>python3 apply-oci.py --image-id IMAGE_OCID</code></details>`
     : '';
   return `<div class="export-shapes"><p class="export-shapes-heading">Selected OCI shapes${arch ? ` <span>· ${esc(arch)}</span>` : ''}</p>${shapes.length
     ? list(shapes.slice(0,4)) + (rest.length ? `<details class="export-more-shapes"><summary>View ${rest.length} more ${rest.length === 1 ? 'shape' : 'shapes'}</summary>${list(rest)}</details>` : '')

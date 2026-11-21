@@ -209,7 +209,7 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
         # The artifact representation also depends on the installed OCI shape
         # references. The store still owns the opaque per-inventory revision.
         matches = set()
-        version = f"4-{shape_reference_revision()}" if kind == "artifact" else "1"
+        version = f"5-{shape_reference_revision()}" if kind == "artifact" else "1"
         prefix = f"forge-{kind}-v{version}-"
         if len(validators) <= 8192:
             for item in validators.split(","):

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from forge import oci_archive as subject
-from forge.oci import GLOBAL_SCHEMA, OciConfig
+from forge.oci import ARM_SHAPES, GLOBAL_SCHEMA, X86_SHAPES, OciConfig
 
 
 FORMAT_UUID = "34dd2cea-aff2-4f45-b8f6-1cb5290bfab2"
@@ -63,7 +63,8 @@ def test_operator_reference_embeds_only_single_named_shape_and_uses_export_limit
 
 
 @pytest.mark.parametrize("change", ["shape", "image-id", "two-public", "two-internal", "version", "next-page",
-                                    "other-public-alias", "incompatible-alias", "path-alias", "oversize", "symlink"])
+                                    "other-public-alias", "other-variant", "incompatible-alias", "path-alias",
+                                    "oversize", "symlink"])
 def test_shape_reference_requires_unambiguous_native_pair(monkeypatch, tmp_path, change):
     name = "BM.Standard.A4.48"
     monkeypatch.setattr(subject, "SHAPE_REFERENCE_DIR", tmp_path)
@@ -85,6 +86,8 @@ def test_shape_reference_requires_unambiguous_native_pair(monkeypatch, tmp_path,
         ref["oci_shape_list"]["opc-next-page"] = "more"
     elif change == "other-public-alias":
         internal[0]["internalShapeName"] = "VM.Standard.A2.Flex"
+    elif change == "other-variant":
+        internal[0]["internalShapeName"] = "a4-2c.96.768.ax"
     elif change == "incompatible-alias":
         internal[0]["internalShapeName"] = "e99-2c.test-x86"
     elif change == "path-alias":
@@ -169,7 +172,7 @@ def test_multiple_observed_vm_shapes_are_embedded_with_exact_limits():
     assert config.model_dump() == before
 
 
-def test_partially_mapped_arm_group_keeps_all_shapes_in_companion_and_refuses_incomplete_archive(tmp_path):
+def test_arm_vm_group_has_the_same_three_shapes_and_per_shape_limits_in_archive_and_companion(tmp_path):
     from forge.destinations import resolve_destination
     from forge.oci import bundle_files
 
@@ -177,16 +180,18 @@ def test_partially_mapped_arm_group_keeps_all_shapes_in_companion_and_refuses_in
     config = OciConfig.model_validate(selected["oci_defaults"])
     config.import_options.shape_compatibility[1].max_ocpus = 4
     path = tmp_path / "arm.oci"
-    with pytest.raises(subject.OciArchiveError, match="VM.Standard.A4.Flex"):
-        subject.write_archive(path, qcow(tmp_path / "source.qcow2"), config, INSPECTION, lambda _: None)
-    assert not path.exists()
+    subject.write_archive(path, qcow(tmp_path / "source.qcow2"), config, INSPECTION, lambda _: None)
+    with tarfile.open(path) as archive:
+        embedded = json.load(archive.extractfile("image_metadata.json"))["additionalMetadata"]["shapeCompatibilities"]
     files = bundle_files(config, {"format": "oci"})
     entries = json.loads(files["shape-compatibility.json"])["entries"]
     assert [entry["shapeName"] for entry in entries] == ["VM.Standard.A1.Flex", "VM.Standard.A2.Flex", "VM.Standard.A4.Flex"]
-    assert entries[1]["ocpuConstraints"] == {"max": 4}
+    assert [entry["ocpuConstraints"] for entry in entries] == [None, {"max": 4}, None]
+    assert embedded == [{"internalShapeName": row["shapeName"], "ocpuConstraints": row["ocpuConstraints"],
+                         "memoryConstraints": None} for row in entries]
 
 
-def test_unmapped_shapes_are_not_guessed_or_copied_from_source_metadata():
+def test_selected_x86_shapes_use_native_names_and_ignore_source_shape_list():
     config = OciConfig(import_options={"shape_compatibility_mode": "manual", "shape_compatibility": [
         {"shape": "VM.Standard.E4.Flex", "max_ocpus": 8}, {"shape": "BM.Standard.E5.192"}]})
     inspection = deepcopy(INSPECTION)
@@ -194,7 +199,22 @@ def test_unmapped_shapes_are_not_guessed_or_copied_from_source_metadata():
     inspection["additionalMetadata"] = {"shapeCompatibilities": [{"internalShapeName": "unsafe-source-default"}]}
     metadata = subject.image_metadata(config, inspection)
     assert [row["internalShapeName"] for row in metadata["additionalMetadata"]["shapeCompatibilities"]] == [
-        "VM.Standard.E4.Flex", "BM.Standard.E5.192"]
+        "VM.Standard.E4.Flex", "e5-2c.192.2304"]
+
+
+def test_every_catalog_shape_has_a_distinct_native_identifier():
+    assert subject.OBSERVED_SHAPE_NAMES.keys() == ARM_SHAPES | X86_SHAPES
+    assert len(set(subject.OBSERVED_SHAPE_NAMES.values())) == len(subject.OBSERVED_SHAPE_NAMES)
+
+
+def test_missing_bare_metal_mapping_cannot_publish_a_literal_public_name(tmp_path, monkeypatch):
+    name = "BM.Standard.A4.48"
+    monkeypatch.delitem(subject.OBSERVED_SHAPE_NAMES, name)
+    monkeypatch.setattr(subject, "SHAPE_REFERENCE_DIR", tmp_path)
+    config = OciConfig(import_options={"shape_compatibility": [{"shape": name}]})
+    with pytest.raises(subject.OciArchiveError, match="No verified OCI archive mapping"):
+        package(tmp_path, config)
+    assert not (tmp_path / "image.oci").exists()
 
 
 def test_bare_metal_download_contains_only_selected_shapes_and_effective_overrides(tmp_path):
@@ -206,12 +226,15 @@ def test_bare_metal_download_contains_only_selected_shapes_and_effective_overrid
     with tarfile.open(path) as archive:
         metadata = json.load(archive.extractfile("image_metadata.json"))
     assert metadata["additionalMetadata"]["shapeCompatibilities"] == [
-        {"internalShapeName": name, "ocpuConstraints": {"max": 8}, "memoryConstraints": None} for name in shapes]
+        {"internalShapeName": alias, "ocpuConstraints": {"max": 8}, "memoryConstraints": None}
+        for alias in ("a4-2c.96.768", "a4-2c.96.768.ax")]
     assert metadata["externalLaunchOptions"]["networkType"] == "VFIO"
     assert metadata["externalLaunchOptions"]["launchOptionsSource"] == "NATIVE"
     assert metadata["imageCapsFormatVersion"] == FORMAT_UUID
     assert json.loads(metadata["imageCapabilityData"])["capabilities"]["Network.AttachmentType"]["defaultValue"] == "VFIO"
-    assert receipt["capability_mode"] == "embedded" and receipt["shape_compatibility"]["public_name_shapes"] == shapes
+    assert receipt["capability_mode"] == "embedded"
+    assert receipt["shape_compatibility"]["embedded_shapes"] == shapes
+    assert receipt["shape_compatibility"]["public_name_shapes"] == []
 
 
 @pytest.mark.parametrize("arch,shape,reason", [

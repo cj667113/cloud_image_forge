@@ -43,16 +43,25 @@ LAUNCH_CAPABILITIES = {
     "pvEncryptionInTransitEnabled": "Storage.ParaVirtualization.EncryptionInTransit",
     "consistentVolumeNamingEnabled": "Storage.ConsistentVolumeNaming",
 }
-# The x86 VM names appear in Oracle-exported version-2 metadata. The ARM names
-# appear in the arm64 shape table of FreeBSD's published OCI exporter:
-# https://lists.freebsd.org/archives/dev-commits-src-all/2025-March/052583.html
-# This is an observed archive convention, not a public API mapping guarantee.
-# In particular, bare-metal internal names differ and are never synthesized.
-OBSERVED_SHAPE_NAMES = {name: name for name in (
-    "VM.Standard.A1.Flex", "VM.Standard.A2.Flex",
-    "VM.Standard.E4.Flex", "VM.Standard.E5.Flex", "VM.Standard.E6.Flex",
-    "VM.Standard3.Flex", "VM.Standard4.Ax.Flex", "VM.Standard.E6.Ax.Flex",
-    "VM.DenseIO.E4.Flex", "VM.DenseIO.E5.Flex", "VM.DenseIO.E6.Ax.Flex", "VM.Optimized3.Flex")}
+# Identifiers observed in native OCI v2 exports (2026-09-29 and 2026-11-21).
+# Bare-metal entries were matched to Oracle's shape specifications by family,
+# CPU count, memory and variant. See docs/oci-compatibility.md.
+OBSERVED_SHAPE_NAMES = {
+    **{name: name for name in (
+        "VM.Standard.A1.Flex", "VM.Standard.A2.Flex", "VM.Standard.A4.Flex", "VM.Standard.A4.Ax.Flex",
+        "VM.Standard.E4.Flex", "VM.Standard.E5.Flex", "VM.Standard.E6.Flex",
+        "VM.Standard3.Flex", "VM.Standard4.Ax.Flex", "VM.Standard.E6.Ax.Flex",
+        "VM.DenseIO.E4.Flex", "VM.DenseIO.E5.Flex", "VM.DenseIO.E6.Ax.Flex", "VM.Optimized3.Flex")},
+    "BM.Standard.A1.160": "a1-2c.160.1024",
+    "BM.Standard.A4.48": "a4-2c.96.768",
+    "BM.Standard.A4.Ax.48": "a4-2c.96.768.ax",
+    "BM.Standard.E4.128": "e4-2c.128.2048",
+    "BM.Standard.E5.192": "e5-2c.192.2304",
+    "BM.Standard.E6.256": "e6-2c.256.3072",
+    "BM.Standard.E6.Ax.192": "e6-2c.192.1536.ax",
+    "BM.Standard3.64": "x9-2c.64.1024",
+    "BM.Standard4.Ax.120": "x12-2c.120.1152.ax",
+}
 # Reject recognizable x86 hardware-family aliases on ARM. This check never
 # supplies a mapping or establishes that an alias is valid for a given shape.
 X86_INTERNAL_FAMILY = re.compile(r"(?:[ex][0-9]+-2[cl]?|b200)\.", re.IGNORECASE)
@@ -173,10 +182,7 @@ def shape_metadata(config, shape_resolution, arch, *, allow_missing_arch=False, 
         shape_arches.add(required)
     if len(shape_arches) > 1:
         raise OciArchiveError("The selected OCI shapes span both ARM64 and x86_64. Choose one guest architecture.")
-    aliases = {name: OBSERVED_SHAPE_NAMES.get(name) or _reference_alias(name) for name in sorted(names)}
-    public_names = [name for name, alias in aliases.items() if alias is None and name.startswith("BM.")]
-    for name in public_names:
-        aliases[name] = name
+    aliases = {name: _reference_alias(name) or OBSERVED_SHAPE_NAMES.get(name) for name in sorted(names)}
     unmapped = [name for name, alias in aliases.items() if not alias]
     if unmapped:
         raise OciArchiveError("No verified OCI archive mapping for " + ", ".join(unmapped) +
@@ -187,8 +193,8 @@ def shape_metadata(config, shape_resolution, arch, *, allow_missing_arch=False, 
                  "ocpuConstraints": row["ocpuConstraints"], "memoryConstraints": row["memoryConstraints"]}
                 for row in entries]
     return {"entries": embedded, "embedded_shapes": [row["shapeName"] for row in entries],
-            "companion_only_shapes": [], "public_name_shapes": public_names,
-            "mapping_basis": "Known and operator-supplied native identifiers, with selected public names for remaining bare-metal shapes"}
+            "companion_only_shapes": [], "public_name_shapes": [],
+            "mapping_basis": "OCI native export identifiers or installed per-shape references"}
 
 
 def image_metadata(config, inspection, *, shape_resolution=None):
@@ -240,9 +246,6 @@ def _warnings(metadata, shapes):
     result = []
     if not metadata["imageCapsFormatVersion"]:
         result.append("No OCI archive capability-format UUID was supplied: imageCapabilityData and imageCapsFormatVersion are null. The archive retains its launch options; apply additional selected capabilities from the companion OCI configuration after import.")
-    if shapes["public_name_shapes"]:
-        result.append("These bare-metal entries use their selected public names. OCI import recognition is unverified: "
-                      + ", ".join(shapes["public_name_shapes"]) + ".")
     if shapes["embedded_shapes"]:
         result.append("Run the companion apply-oci.py command after import to verify the selected shapes and limits in OCI.")
     return result
@@ -257,7 +260,7 @@ def shape_reference_revision():
     if not SHAPE_REFERENCE_DIR.is_dir():
         return "default"
     digest = hashlib.sha256()
-    for name in sorted((ARM_SHAPES | X86_SHAPES) - OBSERVED_SHAPE_NAMES.keys()):
+    for name in sorted(ARM_SHAPES | X86_SHAPES):
         try:
             identity = _identity((SHAPE_REFERENCE_DIR / (name + ".json")).lstat())
         except FileNotFoundError:

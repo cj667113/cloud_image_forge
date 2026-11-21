@@ -124,11 +124,11 @@ def test_cache_and_listing_recheck_architecture_and_selected_names(client, tmp_p
                  recipe={"oci": {"import_options": {"shape_compatibility": [{"shape": "BM.Standard.A4.48"}], "operating_system":"Ubuntu", "operating_system_version":"26.04"}}},
                  shape_compatibility_resolution={"effective_shapes": [{"shape": "BM.Standard.A4.48"}]})
     contents, _ = metadata(client.get(base + "/oci-archive"))
-    assert [r["internalShapeName"] for r in contents["additionalMetadata"]["shapeCompatibilities"]] == ["BM.Standard.A4.48"]
+    assert [r["internalShapeName"] for r in contents["additionalMetadata"]["shapeCompatibilities"]] == ["a4-2c.96.768"]
     assert client.get(base + "/download").status_code == 200
 
 
-def test_cached_download_rechecks_operator_alias_and_restores_public_name_after_reference_removal(client, tmp_path, monkeypatch):
+def test_cached_download_rechecks_operator_alias_and_restores_native_name_after_reference_removal(client, tmp_path, monkeypatch):
     name = "BM.Standard.A4.48"
     rows = [{"shape": name}]
     item = export(client, tmp_path, recipe={"oci": {"import_options": {"shape_compatibility": rows,
@@ -150,7 +150,32 @@ def test_cached_download_rechecks_operator_alias_and_restores_public_name_after_
     listing = client.get("/api/artifacts", headers={"If-None-Match": listing.headers["etag"]})
     assert listing.status_code == 200 and listing.json()[0]["oci_archive_available"]
     contents, _ = metadata(client.get(base + "/oci-archive"))
-    assert [r["internalShapeName"] for r in contents["additionalMetadata"]["shapeCompatibilities"]] == [name]
+    assert [r["internalShapeName"] for r in contents["additionalMetadata"]["shapeCompatibilities"]] == ["a4-2c.96.768"]
+
+
+def test_previous_public_name_archive_is_repackaged_from_qcow2_and_blocked_as_a_native_export(client, tmp_path, monkeypatch):
+    name = "BM.Standard.A4.48"
+    rows = [{"shape": name}]
+    item = export(client, tmp_path, recipe={"oci": {"import_options": {"shape_compatibility": rows,
+                  "operating_system": "Ubuntu", "operating_system_version": "26.04.1"}}},
+                  shape_compatibility_resolution={"effective_shapes": rows})
+    base = "/api/artifacts/" + item["id"]
+    with monkeypatch.context() as previous:
+        previous.setitem(oci_archive.OBSERVED_SHAPE_NAMES, name, name)
+        old = client.get(base + "/oci-archive")
+        old_metadata, disk = metadata(old)
+        assert old_metadata["additionalMetadata"]["shapeCompatibilities"][0]["internalShapeName"] == name
+    new_metadata, new_disk = metadata(client.get(base + "/oci-archive"))
+    assert new_metadata["additionalMetadata"]["shapeCompatibilities"] == [
+        {"internalShapeName": "a4-2c.96.768", "memoryConstraints": None, "ocpuConstraints": None}]
+    assert disk == new_disk and hashlib.sha256(new_disk).hexdigest() == item["sha256"]
+
+    native = tmp_path / "previous.oci"
+    native.write_bytes(old.content)
+    client.app.state.store.update("artifact", item["id"], path=str(native), format="oci",
+                                  oci_archive={"metadata": old_metadata})
+    assert "different shape list" in client.get(base).json()["oci_archive_blocker"]
+    assert client.get(base + "/download").status_code == 409
 
 
 def test_partial_or_tampered_native_archive_blocked_on_download_and_s3(client, tmp_path):
