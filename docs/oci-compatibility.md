@@ -229,6 +229,16 @@ Memory encryption and Secure Boot are instance `platformConfig` properties, resp
 
 ### Shape compatibility and service-owned image fields
 
+The wizard groups bare-metal shapes by their primary NIC as well as their CPU architecture. These are the defaults it writes to the OCI archive and companion configuration.
+
+| Destination | Image launch mode | Boot attachment | Primary network | Guest network driver |
+| --- | --- | --- | --- | --- |
+| `BM.Standard.A4.Ax.48`, `BM.Standard.E6.Ax.192`, `BM.Standard4.Ax.120` | `CUSTOM` | `ISCSI` | `PARAVIRTUALIZED` | `virtio_net` over `virtio_pci` |
+| Physical NIC bare-metal profiles, including `BM.Standard.A4.48` and `BM.Standard.E5.192` | `NATIVE` | `ISCSI` | `VFIO` | Target NIC driver or verified driver bundle |
+| Supported Acceleron Ax VMs | `ACCELERATEDPV` | `PARAVIRTUALIZED` | `ACCELERATEDPV` | `virtio_net` over `virtio_pci` |
+
+OCI rejected a VFIO image for `BM.Standard.A4.Ax.48` and specified that bare-metal CNIC shapes require paravirtualized networking. Forge applies that rule to the three cataloged Acceleron bare-metal shapes identified by Oracle. It uses `CUSTOM` to express iSCSI storage with a PV NIC in both the launch options and image capabilities. Forge checks the resolved network default even when PV also appears in the allowed values. An older export combining physical NIC and CNIC targets needs a separate export for each profile. [A4 Acceleron](https://blogs.oracle.com/cloud-infrastructure/announcing-oci-compute-a4-acceleron-instances), [E6 Acceleron](https://blogs.oracle.com/cloud-infrastructure/announcing-oci-compute-e6-acceleron-instances), [X12 Acceleron](https://blogs.oracle.com/cloud-infrastructure/announcing-oci-x12-standard-acceleron-compute), [VM networking types](https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/instances.htm)
+
 An image's supported-shape list is a separate control-plane resource. `oci compute image-shape-compatibility-entry add` accepts CLI JSON fields `imageId`, `shapeName`, and optional `memoryConstraints`/`ocpuConstraints`. The memory object uses integer `minInGBs`/`maxInGBs`; the OCPU object uses integer `min`/`max`. These describe tested bounds for an image and shape; they do not resize the guest disk, translate machine code, or manufacture missing CPU/device support. [Shape compatibility command](https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/compute/image-shape-compatibility-entry/add.html), [memory constraints](https://docs.oracle.com/en-us/iaas/tools/dotnet/latest/api/Oci.CoreService.Models.ImageMemoryConstraints.html), [OCPU constraints](https://docs.oracle.com/en-us/iaas/tools/dotnet/latest/api/Oci.CoreService.Models.ImageOcpuConstraints.html)
 
 The Exports card and completed build identify the inspected architecture and every selected public shape. An OCI archive with a selection must contain the same effective list and limits in `additionalMetadata.shapeCompatibilities`. Forge checks the guest CPU architecture and each serialized shape entry before publishing the file. It checks older downloads too. With no selection, OCI assigns the imported image’s compatibility list.

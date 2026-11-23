@@ -391,6 +391,35 @@ def test_bm_e5_requires_iscsi_and_actual_mlx5_driver(monkeypatch):
     assert calls[0]["platform_nic_driver"] == "mlx5_core"
 
 
+@pytest.mark.parametrize("network,mode,import_mode,other_shape,issue", [
+    ("PARAVIRTUALIZED", "CUSTOM", "CUSTOM", None, None),
+    ("VFIO", "CUSTOM", "CUSTOM", None, "image network default"),
+    ("ACCELERATEDPV", "CUSTOM", "CUSTOM", None, "image network default"),
+    ("PARAVIRTUALIZED", "NATIVE", "CUSTOM", None, "launch mode"),
+    ("PARAVIRTUALIZED", "CUSTOM", "NATIVE", None, "launch mode"),
+    ("PARAVIRTUALIZED", "CUSTOM", "PARAVIRTUALIZED", None, "launch mode"),
+    ("PARAVIRTUALIZED", "CUSTOM", "CUSTOM", "BM.Standard.A4.48", "separately"),
+])
+def test_cnic_checks_resolved_network_across_plan_archive_and_companion(ready_guest_plan, network, mode, import_mode, other_shape, issue):
+    from forge.oci_archive import OciArchiveError, image_metadata
+
+    names = ["BM.Standard.A4.Ax.48", *([other_shape] if other_shape else [])]
+    config = OciConfig(import_options={"launch_mode": import_mode, "shape_compatibility": [{"shape": name} for name in names]},
+                       capabilities={"Network.AttachmentType": setting(network, sorted({network, "PARAVIRTUALIZED"})),
+                                     "Compute.LaunchMode": setting(mode), "Storage.BootVolumeType": setting("ISCSI")})
+    inspection = {"os": {"arch": "aarch64", "distro": "ubuntu", "name": "Ubuntu 26.04.1 LTS"}}
+    plan = compatibility_plan(inspection, config)
+    if issue:
+        assert any(names[0] in msg and issue in msg for msg in plan["blockers"])
+        with pytest.raises(OciArchiveError, match=issue):
+            image_metadata(config, inspection)
+        with pytest.raises(ValueError, match=issue):
+            bundle_files(config, {})
+    else:
+        assert plan["ready_to_build"], plan["blockers"]
+        assert image_metadata(config, inspection)["externalLaunchOptions"]["networkType"] == network
+
+
 def test_accelerated_migration_network_roundtrips_recipe():
     recipe = Recipe(platform_migration={"enabled": True, "source": "bare_metal", "target": "vm",
                                         "boot_attachment": "paravirtualized", "network_attachment": "accelerated"})

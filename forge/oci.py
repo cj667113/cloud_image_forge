@@ -26,19 +26,38 @@ SOURCES = [
     {"title": "OCI image import", "url": "https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/compute/image/import/from-object.html"},
     {"title": "OCI image capability schema creation", "url": "https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/compute/image-capability-schema/create.html"},
     {"title": "OCI networking types and supported shapes", "url": "https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/edit-launch-options.htm"},
+    {"title": "OCI Acceleron compute families", "url": "https://blogs.oracle.com/cloud-infrastructure/OCI-Acceleron-ComputeShapes"},
     {"title": "OCI launch option API values", "url": "https://docs.oracle.com/en-us/iaas/tools/python/latest/api/core/models/oci.core.models.LaunchOptions.html"},
     {"title": "OCI shape CPU architectures", "url": "https://docs.oracle.com/en-us/iaas/Content/Compute/References/computeshapes.htm"},
     {"title": "OCI image shape compatibility add", "url": "https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/compute/image-shape-compatibility-entry/add.html"},
     {"title": "OCI image shape compatibility list", "url": "https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/compute/image-shape-compatibility-entry/list.html"},
 ]
-CHECKED_ON = "2026-11-21"
+CHECKED_ON = "2026-11-23"
 STORAGE_TYPES = ["ISCSI", "SCSI", "IDE", "PARAVIRTUALIZED"]
 ACCELERATED_VM_SHAPES = {"VM.Standard.E6.Ax.Flex", "VM.DenseIO.E6.Ax.Flex",
                          "VM.Standard4.Ax.Flex", "VM.Standard.A4.Ax.Flex"}
+# Guest-facing defaults for each supported bare-metal profile. A new shape
+# needs an explicit NIC profile before the wizard can offer it.
+BARE_METAL_NETWORK = {
+    "BM.Standard.A1.160": "vfio",
+    "BM.Standard.A4.48": "vfio",
+    "BM.Standard.A4.Ax.48": "paravirtualized",
+    "BM.Standard.E4.128": "vfio",
+    "BM.Standard.E5.192": "vfio",
+    "BM.Standard.E6.256": "vfio",
+    "BM.Standard.E6.Ax.192": "paravirtualized",
+    "BM.Standard3.64": "vfio",
+    "BM.Standard4.Ax.120": "paravirtualized",
+}
+CNIC_BARE_METAL_SHAPES = frozenset(shape for shape, network in BARE_METAL_NETWORK.items()
+                                   if network == "paravirtualized")
 # Exact documented shapes only: similar names do not establish attachment support.
 SHAPE_NETWORK_TYPES = {
     **{shape: frozenset({"PARAVIRTUALIZED", "ACCELERATEDPV"}) for shape in ACCELERATED_VM_SHAPES},
-    **{shape: frozenset({"PARAVIRTUALIZED", "VFIO"}) for shape in (*AMD_STANDARD_PV, *ARM_STANDARD_PV)},
+    **{shape: frozenset({"PARAVIRTUALIZED", "VFIO"}) for shape in (
+        *AMD_STANDARD_PV, *ARM_STANDARD_PV, "VM.Standard3.Flex", "VM.DenseIO.E4.Flex",
+        "VM.DenseIO.E5.Flex", "VM.Optimized3.Flex")},
+    **{shape: frozenset({"PARAVIRTUALIZED"}) for shape in CNIC_BARE_METAL_SHAPES},
 }
 ARM_SHAPES = {*ARM_STANDARD_PV, "VM.Standard.A4.Ax.Flex",
               "BM.Standard.A1.160", "BM.Standard.A4.48", "BM.Standard.A4.Ax.48"}
@@ -54,6 +73,33 @@ def shape_architecture(name):
     if name in X86_SHAPES:
         return "x86_64"
     return None
+
+
+def cnic_network_error(names, network, boot, *launch_modes):
+    """Check the image defaults that OCI resolves when registering a bare-metal CNIC shape."""
+    names = set(names)
+    cnic = names & CNIC_BARE_METAL_SHAPES
+    if not cnic:
+        return None
+    targets = ", ".join(sorted(cnic))
+    physical = sorted(name for name in names if BARE_METAL_NETWORK.get(name) == "vfio")
+    if physical:
+        return (f"{targets} requires PARAVIRTUALIZED networking. The Forge profile for {', '.join(physical)} "
+                "uses VFIO. Export these bare-metal profiles separately.")
+    if network != "PARAVIRTUALIZED":
+        return (f"{targets} requires PARAVIRTUALIZED as the image network default for bare-metal CNIC. "
+                "Select its destination profile and create a new export.")
+    modes = ("CUSTOM", "PARAVIRTUALIZED") if boot == "PARAVIRTUALIZED" else ("CUSTOM",)
+    if any(mode not in modes for mode in launch_modes):
+        return (f"{targets} requires a launch mode that resolves to PARAVIRTUALIZED networking. "
+                "Use CUSTOM for both the image capability and import launch mode with iSCSI boot.")
+    return None
+
+
+def cnic_config_error(names, config):
+    defaults = {key: value.default_value for key, value in config.capabilities.items()}
+    return cnic_network_error(names, defaults.get("Network.AttachmentType"), defaults.get("Storage.BootVolumeType"),
+                              defaults.get("Compute.LaunchMode"), config.import_options.launch_mode)
 
 
 def descriptor(kind, default, values=None):
@@ -391,13 +437,16 @@ def compatibility_plan(inspection: dict, config: OciConfig, allow_network=False,
     shape_resolution = resolve_shape_compatibility(inspection, config, platform_migration)
     plan["shape_compatibility_resolution"] = shape_resolution
     plan["warnings"].extend(shape_resolution["warnings"])
+    cnic_error = cnic_config_error((row["shape"] for row in shape_resolution["effective_shapes"]), config)
+    if cnic_error:
+        plan["blockers"].append(cnic_error)
     for shape in (ShapeCompatibility.model_validate(row) for row in shape_resolution["effective_shapes"]):
         arch = normalize_arch(inspection.get("os", {}).get("arch"))
         required_arch = shape_architecture(shape.shape)
         if required_arch and arch != "unknown" and arch != required_arch:
             plan["blockers"].append(f"{shape.shape} requires {required_arch}; this {arch} image cannot be converted to another CPU architecture by changing image capabilities.")
         supported_networks = SHAPE_NETWORK_TYPES.get(shape.shape)
-        if supported_networks is not None:
+        if supported_networks is not None and shape.shape not in CNIC_BARE_METAL_SHAPES:
             usable_networks = supported_networks.intersection(allowed.get("Network.AttachmentType", []))
             if not usable_networks:
                 supported = " or ".join(sorted(supported_networks))
@@ -446,6 +495,20 @@ def _shape_manifest(entries, architecture):
             "shapeArchitectures": {entry["shapeName"]: shape_architecture(entry["shapeName"]) for entry in entries}}
 
 
+def bundle_network_blocker(artifact):
+    """Check saved exports before offering their original CLI import settings."""
+    raw = (artifact.get("recipe") or {}).get("oci") or {}
+    resolution = artifact.get("shape_compatibility_resolution") or {}
+    rows = resolution.get("effective_shapes") or raw.get("import_options", {}).get("shape_compatibility", [])
+    names = [row.get("shape") for row in rows if isinstance(row, dict) and isinstance(row.get("shape"), str)]
+    if CNIC_BARE_METAL_SHAPES.isdisjoint(names):
+        return None
+    try:
+        return cnic_config_error(names, OciConfig.model_validate(raw))
+    except ValueError:
+        return "The saved bare-metal CNIC launch settings could not be verified. Create a new export."
+
+
 def bundle_files(config: OciConfig, artifact: dict) -> dict[str, str]:
     """Generate CLI inputs without executing an OCI command or modifying the disk."""
     options = config.import_options
@@ -488,6 +551,9 @@ def bundle_files(config: OciConfig, artifact: dict) -> dict[str, str]:
              "artifact.json": {k: artifact[k] for k in ("name", "sha256", "virtual_size", "format", "architecture") if k in artifact}}
     from .oci_archive import shape_entries
     entries = shape_entries(config, artifact.get("shape_compatibility_resolution"))
+    cnic_error = cnic_config_error((entry["shapeName"] for entry in entries), config)
+    if cnic_error:
+        raise ValueError(cnic_error)
     files["shape-compatibility.json"] = _shape_manifest(entries, artifact.get("architecture"))
     if artifact.get("shape_compatibility_resolution"):
         files["shape-resolution.json"] = artifact["shape_compatibility_resolution"]

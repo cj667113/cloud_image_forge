@@ -217,21 +217,27 @@ def test_missing_bare_metal_mapping_cannot_publish_a_literal_public_name(tmp_pat
     assert not (tmp_path / "image.oci").exists()
 
 
-def test_bare_metal_download_contains_only_selected_shapes_and_effective_overrides(tmp_path):
-    shapes = ["BM.Standard.A4.48", "BM.Standard.A4.Ax.48"]
+@pytest.mark.parametrize("shapes,aliases,network,launch", [
+    (["BM.Standard.A1.160", "BM.Standard.A4.48"], ["a1-2c.160.1024", "a4-2c.96.768"], "VFIO", "NATIVE"),
+    (["BM.Standard.A4.Ax.48"], ["a4-2c.96.768.ax"], "PARAVIRTUALIZED", "CUSTOM"),
+])
+def test_bare_metal_download_contains_only_selected_shapes_and_effective_overrides(tmp_path, shapes, aliases, network, launch):
     config = OciConfig(import_options={"shape_compatibility": [{"shape": shape, "max_ocpus": 8} for shape in shapes],
-                                       "launch_mode": "NATIVE"},
-                       capabilities={"Network.AttachmentType": {"default_value": "VFIO", "values": ["VFIO"]}})
+                                       "launch_mode": launch},
+                       capabilities={"Network.AttachmentType": {"default_value": network},
+                                     "Compute.LaunchMode": {"default_value": launch},
+                                     "Storage.BootVolumeType": {"default_value": "ISCSI"}})
     _, path, receipt = package(tmp_path, config)
     with tarfile.open(path) as archive:
         metadata = json.load(archive.extractfile("image_metadata.json"))
     assert metadata["additionalMetadata"]["shapeCompatibilities"] == [
         {"internalShapeName": alias, "ocpuConstraints": {"max": 8}, "memoryConstraints": None}
-        for alias in ("a4-2c.96.768", "a4-2c.96.768.ax")]
-    assert metadata["externalLaunchOptions"]["networkType"] == "VFIO"
-    assert metadata["externalLaunchOptions"]["launchOptionsSource"] == "NATIVE"
+        for alias in aliases]
+    assert metadata["externalLaunchOptions"]["networkType"] == network
+    assert metadata["externalLaunchOptions"]["launchOptionsSource"] == launch
+    assert metadata["externalLaunchOptions"]["bootVolumeType"] == "ISCSI"
     assert metadata["imageCapsFormatVersion"] == FORMAT_UUID
-    assert json.loads(metadata["imageCapabilityData"])["capabilities"]["Network.AttachmentType"]["defaultValue"] == "VFIO"
+    assert json.loads(metadata["imageCapabilityData"])["capabilities"]["Network.AttachmentType"]["defaultValue"] == network
     assert receipt["capability_mode"] == "embedded"
     assert receipt["shape_compatibility"]["embedded_shapes"] == shapes
     assert receipt["shape_compatibility"]["public_name_shapes"] == []

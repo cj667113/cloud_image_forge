@@ -26,7 +26,7 @@ from .config import Settings
 from .jobs import Jobs
 from .models import (ObjectLocation, Recipe, OciPlanRequest, OciSchemaRequest, UefiPlanRequest,
                      StoragePlanRequest, PlatformPlanRequest, DestinationSelection, MountPlanRequest)
-from .oci import catalog as oci_catalog, compatibility_plan
+from .oci import bundle_network_blocker, catalog as oci_catalog, compatibility_plan
 from .oci_archive import (ArchiveSpaceError, OciArchiveError, archive_blocker, archive_download,
                           can_download_archive, shape_metadata, shape_reference_revision, verify_published_archive)
 from .store import Store, artifact_name
@@ -69,6 +69,8 @@ def public(record: dict, *, artifact=False) -> dict:
         result["oci_archive_available"] = can_download_archive(record) and not blocker
         if blocker:
             result["oci_archive_blocker"] = blocker
+        if record.get("oci_config") and (bundle_blocker := bundle_network_blocker(record)):
+            result["oci_config_blocker"] = bundle_blocker
     return result
 
 
@@ -209,7 +211,7 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
         # The artifact representation also depends on the installed OCI shape
         # references. The store still owns the opaque per-inventory revision.
         matches = set()
-        version = f"5-{shape_reference_revision()}" if kind == "artifact" else "1"
+        version = f"6-{shape_reference_revision()}" if kind == "artifact" else "1"
         prefix = f"forge-{kind}-v{version}-"
         if len(validators) <= 8192:
             for item in validators.split(","):
@@ -552,6 +554,8 @@ def create_app(settings: Settings | None = None, engine=None) -> FastAPI:
             raise HTTPException(404, "This artifact has no OCI capability configuration")
         if not Path(path).is_file():
             raise HTTPException(410, "OCI configuration file is no longer present")
+        if blocker := bundle_network_blocker(artifact):
+            raise HTTPException(409, blocker)
         filename = f"oci-configuration-{artifact_id[:8]}.zip"
         original = artifact.get("filename") or Path(artifact["path"]).name
         name = artifact_name(artifact)

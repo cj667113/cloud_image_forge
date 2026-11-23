@@ -178,6 +178,57 @@ def test_previous_public_name_archive_is_repackaged_from_qcow2_and_blocked_as_a_
     assert client.get(base + "/download").status_code == 409
 
 
+def test_old_vfio_cnic_export_blocks_archive_and_cli_bundle_but_preserves_the_disk(client, tmp_path):
+    rows = [{"shape": "BM.Standard.A4.48"}, {"shape": "BM.Standard.A4.Ax.48"}]
+    bundle = tmp_path / "older.zip"
+    bundle.touch()
+    item = export(client, tmp_path, recipe={"oci": {"import_options": {"shape_compatibility": rows, "launch_mode": "NATIVE"},
+                                                     "capabilities": {"Network.AttachmentType": {"default_value": "VFIO"}}}},
+                  shape_compatibility_resolution={"effective_shapes": rows}, oci_config={"compatible_shape_count": 2},
+                  oci_bundle_path=str(bundle))
+    base = "/api/artifacts/" + item["id"]
+    record = client.get(base).json()
+    assert not record["oci_archive_available"]
+    assert "separately" in record["oci_archive_blocker"]
+    assert record["oci_config_blocker"] == record["oci_archive_blocker"]
+    assert client.get(base + "/oci-archive").status_code == 409
+    assert client.get(base + "/oci-bundle").status_code == 409
+    assert hashlib.sha256(client.get(base + "/download").content).hexdigest() == item["sha256"]
+
+
+@pytest.mark.parametrize("field", ["networkType", "launchOptionsSource", "Network.AttachmentType", "Compute.LaunchMode",
+                                   "allowed_networks"])
+def test_cnic_native_download_checks_actual_launch_and_capability_defaults(client, tmp_path, field):
+    from forge.destinations import resolve_destination
+
+    name = "BM.Standard.A4.Ax.48"
+    source = {"os": {"arch": "aarch64", "distro": "ubuntu", "name": "Ubuntu 26.04.1 LTS"},
+              "boot": {"supported_firmware": ["UEFI_64"]}}
+    config = resolve_destination(source, {"profile_id": "oci:" + name})["oci_defaults"]
+    item = export(client, tmp_path, recipe={"oci": config}, shape_compatibility_resolution={"effective_shapes": [{"shape": name}]})
+    base = "/api/artifacts/" + item["id"]
+    original, disk = metadata(client.get(base + "/oci-archive"))
+    path = tmp_path / "native.oci"
+    client.app.state.store.update("artifact", item["id"], format="oci", path=str(path), oci_archive={"metadata": original})
+    if field in original["externalLaunchOptions"]:
+        original["externalLaunchOptions"][field] = "VFIO" if field == "networkType" else "NATIVE"
+    else:
+        caps = json.loads(original["imageCapabilityData"])
+        if field == "allowed_networks":
+            caps["capabilities"]["Network.AttachmentType"]["values"] = ["VFIO"]
+        else:
+            caps["capabilities"][field]["defaultValue"] = "VFIO" if field == "Network.AttachmentType" else "NATIVE"
+        original["imageCapabilityData"] = json.dumps(caps)
+    with tarfile.open(path, "w") as archive:
+        for filename, data in (("image_metadata.json", json.dumps(original).encode()), ("output.QCOW2", disk)):
+            member = tarfile.TarInfo(filename)
+            member.size = len(data)
+            archive.addfile(member, io.BytesIO(data))
+    result = client.get(base + "/download")
+    assert result.status_code == 409 and "PARAVIRTUALIZED" in result.json()["detail"]
+    assert client.post(base + "/upload", json={"url": "s3://example/native.oci"}).status_code == 409
+
+
 def test_partial_or_tampered_native_archive_blocked_on_download_and_s3(client, tmp_path):
     item = export(client, tmp_path)
     store = client.app.state.store

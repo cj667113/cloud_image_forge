@@ -171,11 +171,13 @@ def test_arm_preservation_blocks_foreign_kernel_and_unverified_hardware_target()
     assert any("CONFIG_ACPI" in error for error in result["blockers"])
 
 
-def test_arm_hardware_preservation_uses_existing_firmware_discovery_evidence():
+@pytest.mark.parametrize("network,nic,driver", [("vfio", "mlx5_core", "mlx5_core"),
+                                              ("paravirtualized", None, "virtio_net")])
+def test_arm_hardware_preservation_uses_existing_firmware_discovery_evidence(network, nic, driver):
     source = arm_image()
     for kernel in source["platform"]["kernels"].values():
         kernel["config"].update(CONFIG_ACPI="y", CONFIG_PCI="y")
-    profile = options(target="bare_metal", boot_attachment="iscsi", network_attachment="vfio", nic_driver="mlx5_core")
+    profile = options(target="bare_metal", boot_attachment="iscsi", network_attachment=network, nic_driver=nic)
     result = plan_platform(source, profile)
     # Local-root-only evidence cannot pass a mandatory firmware-iSCSI target.
     assert not result["ready"]
@@ -185,6 +187,11 @@ def test_arm_hardware_preservation_uses_existing_firmware_discovery_evidence():
         " ro\n", " ro netroot=iscsi rd.iscsi.firmware=1\n")
     result = plan_platform(source, profile)
     assert result["ready"], result["blockers"]
+    assert driver in result["required_modules"]
+    if network == "paravirtualized":
+        assert result["nic_drivers"] == [] and "virtio_pci" in result["required_modules"]
+        next(iter(source["platform"]["kernels"].values()))["initrd_modules"].remove("virtio_net")
+        assert not plan_platform(source, profile)["ready"]
     assert result["experimental"] and not result["provider_supported"]
     assert result["portability"]["root_transport"] == "optional_firmware_iscsi"
     next(iter(source["platform"]["kernels"].values()))["initrd_iscsi_userspace"] = False

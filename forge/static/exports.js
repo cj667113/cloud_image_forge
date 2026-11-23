@@ -30,7 +30,7 @@ function exportDownloadLinks(artifact, compact=false) {
   return original;
 }
 function exportOciConfigurationLink(artifact) {
-  if (!artifact.oci_config) return '';
+  if (!artifact.oci_config || artifact.oci_config_blocker) return '';
   const shapes = artifact.shapeSelection ?? exportShapeSelection(artifact);
   const canReconcile = shapes?.shapes.length && !shapes.blocker
     && ['aarch64', 'x86_64'].includes(shapes.architecture)
@@ -54,8 +54,8 @@ function exportShapeSelection(artifact) {
     architecture: normalizeArchitecture(artifact.architecture),
     known: Array.isArray(rows) || artifact.oci_config?.compatible_shape_count === 0,
     shapes: names.map(name => ({name, matched: added.has(name)})),
-    blocker: artifact.oci_archive_blocker,
-    applyAfterImport: artifact.oci_config && !artifact.oci_archive_blocker && names.some(name => name.startsWith('BM.')) ? artifact.id : null,
+    blocker: artifact.oci_archive_blocker || artifact.oci_config_blocker,
+    applyAfterImport: artifact.oci_config && !artifact.oci_archive_blocker && !artifact.oci_config_blocker && names.some(name => name.startsWith('BM.')) ? artifact.id : null,
   };
 }
 function exportShapeMarkup(selection) {
@@ -74,7 +74,7 @@ function exportShapeMarkup(selection) {
 }
 function exportModel(artifact) {
   const source=state.images.find(image=>image.id===artifact.image_id);
-  return {id:artifact.id,name:libraryName('artifact',artifact),target:artifact.target,format:artifact.format,size:artifact.size,virtual_size:artifact.virtual_size,sha256:artifact.sha256,created_at:artifact.created_at,image_id:artifact.image_id,source:source?.name||artifact.source_name||null,shapeSelection:exportShapeSelection(artifact),oci_config:Boolean(artifact.oci_config),oci_archive_available:artifact.oci_archive_available===true,oci_archive_blocker:artifact.oci_archive_blocker,warnings:exportWarnings(artifact),error:artifact.error||null};
+  return {id:artifact.id,name:libraryName('artifact',artifact),target:artifact.target,format:artifact.format,size:artifact.size,virtual_size:artifact.virtual_size,sha256:artifact.sha256,created_at:artifact.created_at,image_id:artifact.image_id,source:source?.name||artifact.source_name||null,shapeSelection:exportShapeSelection(artifact),oci_config:Boolean(artifact.oci_config),oci_config_blocker:artifact.oci_config_blocker,oci_archive_available:artifact.oci_archive_available===true,oci_archive_blocker:artifact.oci_archive_blocker,warnings:exportWarnings(artifact),error:artifact.error||null};
 }
 function exportEntryMarkup(item) {
   const key=encodeURIComponent(item.id),date=exportDate(item.created_at),provider=profiles[item.target]?.label||item.target||'Generic',format={gcp:'TAR.GZ',vhd:'VHD',qcow2:'QCOW2',raw:'RAW',oci:'OCI'}[item.format]||(item.format||'Image').toUpperCase();

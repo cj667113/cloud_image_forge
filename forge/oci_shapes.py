@@ -11,7 +11,7 @@ from copy import deepcopy
 from .architecture import normalize_arch
 
 
-CHECKED_ON = "2026-11-21"
+CHECKED_ON = "2026-11-23"
 SOURCES = [
     "https://docs.oracle.com/en-us/iaas/Content/Compute/References/computeshapes.htm",
     "https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/edit-launch-options.htm",
@@ -24,6 +24,15 @@ AMD_STANDARD_PV = {
     "VM.Standard.E5.Flex": {"max_ocpus": 126, "max_memory_gbs": 1024},
     "VM.Standard.E6.Flex": {"max_ocpus": 126, "max_memory_gbs": 1454},
 }
+
+
+def platform_launch_mode(target, boot, network):
+    """Preferred OCI mode for the selected guest-facing attachments."""
+    if target == "bare_metal":
+        return "NATIVE" if boot == "iscsi" and network == "vfio" else "CUSTOM"
+    if boot == "paravirtualized" and network in {"accelerated", "paravirtualized"}:
+        return "ACCELERATEDPV" if network == "accelerated" else "PARAVIRTUALIZED"
+    return "CUSTOM"
 
 
 def shape_compatibility_catalog() -> dict:

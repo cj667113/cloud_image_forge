@@ -18,6 +18,7 @@ from uuid import uuid4
 from .oci_guest import MODULE_CONFIG as OCI_MODULE_CONFIG
 from .oci_guest import ARCH_CONFIG, HARDWARE_NIC_DRIVERS, verified_nic_bundle, _architecture_errors, _hardware_architecture_errors, _glob, _kernel_architecture, _network_files, _read, _serial_device, _select_initramfs_backend, _iscsi_module_directory
 from .architecture import normalize_arch, execution_blocker
+from .oci_shapes import platform_launch_mode
 
 
 MODULE_CONFIG = {**OCI_MODULE_CONFIG, "nvme": "CONFIG_BLK_DEV_NVME", "nvme_core": "CONFIG_NVME_CORE",
@@ -462,8 +463,8 @@ def _plan_preserve(inspection, options, plan, oci_config, target_provider, boot_
         blockers.append("Select a supported target boot and network attachment profile.")
     if network == "vfio" and options.get("nic_driver") not in NIC_DRIVERS | {"auto"}:
         blockers.append("Select the actual target physical/VF NIC driver to validate existing coverage.")
-    if target == "bare_metal" and (boot != "iscsi" or network != "vfio"):
-        blockers.append("The supported bare-metal assessment profile uses firmware iSCSI boot and a selected hardware NIC.")
+    if target == "bare_metal" and (boot != "iscsi" or network not in {"vfio", "paravirtualized"}):
+        blockers.append("Bare-metal profiles use firmware iSCSI boot and either hardware/VFIO or CNIC paravirtualized networking.")
     if any(options.get(name) for name in ("install_packages", "configure_network", "configure_serial_console")):
         blockers.append("Preserve mode does not install packages or rewrite networking/serial settings. Disable those changes or choose Reconfigure.")
     if target_provider not in {"oci", "generic"}:
@@ -497,11 +498,9 @@ def _plan_preserve(inspection, options, plan, oci_config, target_provider, boot_
             if choice.get("default_value") != wanted or wanted not in (choice.get("values") or [choice.get("default_value")]):
                 blockers.append(f"OCI {key} must allow and prefer {wanted} to match the target being validated.")
         launch = config.get("capabilities", {}).get("Compute.LaunchMode", {}).get("default_value")
-        expected_launch = ("NATIVE" if target == "bare_metal" else
-                           "ACCELERATEDPV" if network == "accelerated" and boot == "paravirtualized" else
-                           "PARAVIRTUALIZED" if boot == network == "paravirtualized" else "CUSTOM")
+        expected_launch = platform_launch_mode(target, boot, network)
         if launch not in {expected_launch, "CUSTOM"}:
-            blockers.append(f"OCI Compute.LaunchMode must be {expected_launch} or CUSTOM for this platform profile.")
+            blockers.append(f"OCI Compute.LaunchMode {launch} conflicts with this platform profile. Use {expected_launch}.")
         for item in config.get("import_options", {}).get("shape_compatibility", []):
             name = item.get("shape", "") if isinstance(item, dict) else str(item)
             if target == "vm" and name.startswith("BM.") or target == "bare_metal" and name.startswith("VM."):
@@ -547,11 +546,11 @@ def plan_platform(inspection, options, allow_network=False, oci_config=None, tar
         blockers.append("Select a valid VM or bare-metal destination; source may remain unknown.")
     if boot not in {"paravirtualized", "iscsi"} or network not in {"paravirtualized", "accelerated", "vfio"}:
         blockers.append("Select a supported boot and network attachment profile.")
-    if (target == "bare_metal" or network == "vfio") and nic not in NIC_DRIVERS | {"auto"}:
+    if network == "vfio" and nic not in NIC_DRIVERS | {"auto"}:
         blockers.append("Select the actual target physical/VF NIC driver; hardware cannot be inferred from an imported disk.")
     if target == "bare_metal":
-        if boot != "iscsi" or network != "vfio":
-            blockers.append("Experimental bare-metal preparation requires iSCSI boot and hardware/VFIO networking.")
+        if boot != "iscsi" or network not in {"vfio", "paravirtualized"}:
+            blockers.append("Bare-metal profiles use firmware iSCSI boot and either hardware/VFIO or CNIC paravirtualized networking.")
         warnings.append("OCI documentation does not support bringing your own image to bare-metal instances. This export is experimental offline hardware preparation, not an OCI-supported bare-metal image.")
         warnings.append("The chosen NIC and boot-controller profile must match the target machine; driver presence does not prove hardware or firmware compatibility.")
     if target_provider not in {"oci", "generic"}:
@@ -725,11 +724,9 @@ def plan_platform(inspection, options, allow_network=False, oci_config=None, tar
             if descriptor.get("default_value") != wanted or wanted not in (descriptor.get("values") or [descriptor.get("default_value")]):
                 blockers.append(f"OCI {key} must allow and prefer {wanted} to match the platform migration profile.")
         launch = config.get("capabilities", {}).get("Compute.LaunchMode", {}).get("default_value")
-        expected_launch = ("NATIVE" if target == "bare_metal" else
-                           "ACCELERATEDPV" if network == "accelerated" and boot == "paravirtualized" else
-                           "PARAVIRTUALIZED" if boot == network == "paravirtualized" else "CUSTOM")
+        expected_launch = platform_launch_mode(target, boot, network)
         if launch not in {expected_launch, "CUSTOM"}:
-            blockers.append(f"OCI Compute.LaunchMode must be {expected_launch} or CUSTOM for this platform profile.")
+            blockers.append(f"OCI Compute.LaunchMode {launch} conflicts with this platform profile. Use {expected_launch}.")
         shapes = config.get("import_options", {}).get("shape_compatibility") or []
         for shape in shapes:
             name = shape.get("shape", "") if isinstance(shape, dict) else str(shape)

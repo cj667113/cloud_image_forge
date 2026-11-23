@@ -8,9 +8,9 @@ from copy import deepcopy
 import re
 
 from .architecture import normalize_arch
-from .oci import ACCELERATED_VM_SHAPES, ARM_SHAPES, X86_SHAPES
+from .oci import ACCELERATED_VM_SHAPES, ARM_SHAPES, BARE_METAL_NETWORK, CHECKED_ON, X86_SHAPES
 from .oci_guest import HARDWARE_NIC_DRIVERS, verified_nic_bundle
-from .oci_shapes import AMD_STANDARD_PV, ARM_STANDARD_PV, resolve_shape_compatibility
+from .oci_shapes import AMD_STANDARD_PV, ARM_STANDARD_PV, platform_launch_mode, resolve_shape_compatibility
 
 
 NIC_DRIVERS = ("auto", *sorted(HARDWARE_NIC_DRIVERS))
@@ -22,6 +22,7 @@ VM_PROFILE_GROUPS = {
 }
 SOURCES = ["https://docs.oracle.com/en-us/iaas/Content/Compute/References/computeshapes.htm",
            "https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/edit-launch-options.htm",
+           "https://blogs.oracle.com/cloud-infrastructure/OCI-Acceleron-ComputeShapes",
            "https://docs.oracle.com/en-us/iaas/Content/Compute/References/bringyourownimage.htm"]
 
 
@@ -92,14 +93,18 @@ def _select_preparation(inspection, platform, oci_defaults, strategy):
 
 def _profile(identifier, architecture, target, provider, shape=None):
     bare = target == "bare_metal"
-    accelerated = shape in ACCELERATED_VM_SHAPES
+    if bare:
+        network = BARE_METAL_NETWORK[shape] if shape else "vfio"
+    else:
+        network = "accelerated" if shape in ACCELERATED_VM_SHAPES else "paravirtualized"
+    physical_nic = network == "vfio"
     return {"id": identifier, "label": shape or f"{'General OCI' if provider == 'oci' else 'Generic'} {'ARM64' if architecture == 'aarch64' else 'x86_64'} {'bare metal' if bare else 'VM'}",
             "provider": provider, "architecture": architecture, "target": target, "shape": shape,
             "shapes": [shape] if shape else [],
             "boot_attachment": "iscsi" if bare else "paravirtualized",
-            "network_attachment": "vfio" if bare else "accelerated" if accelerated else "paravirtualized",
+            "network_attachment": network,
             "firmware": "UEFI_64" if bare or architecture == "aarch64" else None,
-            "nic_driver": "auto" if bare else None, "requires_nic_driver": bare,
+            "nic_driver": "auto" if physical_nic else None, "requires_nic_driver": physical_nic,
             "experimental": bare, "provider_supported": not bare,
             "sources": SOURCES if provider == "oci" else []}
 
@@ -154,7 +159,7 @@ def destination_catalog():
         primary["variants"] = [primary["id"], *(p["id"] for p in variants)]
         for variant in variants:
             variant["group_id"] = primary["id"]
-    return {"version": 1, "checked_on": "2026-11-21", "profiles": deepcopy(profiles),
+    return {"version": 1, "checked_on": CHECKED_ON, "profiles": deepcopy(profiles),
             "nic_drivers": list(NIC_DRIVERS), "sources": list(SOURCES)}
 
 
@@ -200,14 +205,14 @@ def resolve_destination(inspection, selection):
     if firmware is None:
         result["blockers"].append("Boot firmware is unknown. Refresh inspection or review an explicit firmware migration before preparing this destination.")
     if profile["experimental"]:
-        result["warnings"].append("Bare-metal preparation is experimental and requires destination firmware iSCSI discovery plus the selected physical NIC. A hardware boot test is required.")
+        result["warnings"].append("Bare-metal preparation requires destination firmware iSCSI discovery. Verify boot and networking on the selected hardware.")
         if profile["provider"] == "oci":
             result["warnings"].append("OCI does not support external BYOI imports to bare metal; offline preparation does not establish provider import eligibility.")
     if source == "unknown":
         result["warnings"].append("The source machine type remains unknown; preparation follows the selected destination without inventing source history.")
     if profile["provider"] == "oci":
         network = {"paravirtualized": "PARAVIRTUALIZED", "accelerated": "ACCELERATEDPV", "vfio": "VFIO"}[profile["network_attachment"]]
-        launch = "NATIVE" if profile["target"] == "bare_metal" else network
+        launch = platform_launch_mode(profile["target"], profile["boot_attachment"], profile["network_attachment"])
         storage = "ISCSI" if profile["boot_attachment"] == "iscsi" else "PARAVIRTUALIZED"
         values = {"Compute.LaunchMode": launch, "Network.AttachmentType": network,
                   "Storage.BootVolumeType": storage, "Storage.LocalDataVolumeType": storage,

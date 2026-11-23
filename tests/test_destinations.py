@@ -13,7 +13,7 @@ def image(arch="aarch64"):
 def test_catalog_has_exact_architecture_shapes_without_invented_nics():
     profiles = {item["id"]: item for item in destination_catalog()["profiles"]}
     assert profiles["oci:BM.Standard.A1.160"]["architecture"] == "aarch64"
-    assert profiles["oci:BM.Standard.A4.Ax.48"]["requires_nic_driver"]
+    assert not profiles["oci:BM.Standard.A4.Ax.48"]["requires_nic_driver"]
     assert profiles["oci:VM.Standard.E6.Ax.Flex"]["architecture"] == "x86_64"
     assert all(item["nic_driver"] in {None, "auto"} for item in profiles.values())
     profiles["oci:VM.Standard.A1.Flex"]["sources"].clear()
@@ -58,22 +58,45 @@ def test_group_shares_preparation_and_exports_each_named_shape(group_id, arch, s
     assert not resolve_destination(image(wrong_arch), {"profile_id": group_id})["ready"]
 
 
-@pytest.mark.parametrize("arch", ["aarch64", "x86_64"])
-def test_bare_metal_picker_groups_equal_overrides_and_keeps_saved_single_shape(arch):
+@pytest.mark.parametrize("arch,network,count", [
+    ("aarch64", "vfio", 2), ("aarch64", "paravirtualized", 1),
+    ("x86_64", "vfio", 4), ("x86_64", "paravirtualized", 2),
+])
+def test_bare_metal_picker_groups_equal_overrides_and_keeps_saved_single_shape(arch, network, count):
     profiles = destination_catalog()["profiles"]
-    members = [p for p in profiles if p["architecture"] == arch and p["target"] == "bare_metal" and p["shape"]]
-    group, = [p for p in profiles if p["id"] == members[0]["group_id"]]
+    members = [p for p in profiles if p["architecture"] == arch and p["target"] == "bare_metal" and p["shape"]
+               and p["network_attachment"] == network]
+    assert len(members) == count
+    group, = [p for p in profiles if p["id"] == members[0].get("group_id", members[0]["id"])]
     source = image(arch)
     grouped = resolve_destination(source, {"profile_id": group["id"], "nic_driver": "mlx5_core"})
     assert grouped["ready"] and group["shapes"] == [p["shape"] for p in members]
-    assert grouped["oci_defaults"]["import_options"]["shape_compatibility_mode"] == "manual"
+    if count > 1:
+        assert grouped["oci_defaults"]["import_options"]["shape_compatibility_mode"] == "manual"
     assert grouped["shape_compatibility_resolution"]["effective_shapes"] == [{"shape": name} for name in group["shapes"]]
     for p in members:
-        assert p["group_id"] == group["id"]
+        assert p.get("group_id", p["id"]) == group["id"]
         saved = resolve_destination(source, {"profile_id": p["id"], "nic_driver": "mlx5_core"})
         assert saved["oci_defaults"]["capabilities"] == grouped["oci_defaults"]["capabilities"]
         assert saved["platform_migration"] == grouped["platform_migration"]
         assert saved["shape_compatibility_resolution"]["effective_shapes"] == [{"shape": p["shape"]}]
+
+
+@pytest.mark.parametrize("arch,shape", [("aarch64", "BM.Standard.A4.Ax.48"), ("x86_64", "BM.Standard.E6.Ax.192"),
+                                       ("x86_64", "BM.Standard4.Ax.120")])
+def test_cnic_profile_needs_no_physical_driver_and_exports_custom_pv_networking(arch, shape):
+    from forge.oci import OciConfig, bundle_files
+
+    result = resolve_destination(image(arch), {"profile_id": "oci:" + shape})
+    assert result["ready"] and result["platform_migration"]["nic_driver"] is None
+    assert result["platform_migration"]["network_attachment"] == "paravirtualized"
+    config = OciConfig.model_validate(result["oci_defaults"])
+    files = bundle_files(config, {"format": "oci"})
+    assert json.loads(files["image-import.json"])["launchMode"] == "CUSTOM"
+    launch = json.loads(files["instance-launch-options.json"])
+    assert (launch["firmware"], launch["bootVolumeType"], launch["networkType"]) == ("UEFI_64", "ISCSI", "PARAVIRTUALIZED")
+    assert json.loads(files["schema-data.json"])["Network.AttachmentType"]["values"] == ["PARAVIRTUALIZED"]
+    assert [row["shapeName"] for row in json.loads(files["shape-compatibility.json"])["entries"]] == [shape]
 
 
 @pytest.mark.parametrize("arch", ["aarch64", "x86_64"])

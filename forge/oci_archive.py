@@ -24,7 +24,8 @@ import tarfile
 import tempfile
 
 from .architecture import SUPPORTED_ARCHES, normalize_arch
-from .oci import ARM_SHAPES, X86_SHAPES, OciConfig, ShapeCompatibility, capability_schema, shape_architecture
+from .oci import (ARM_SHAPES, CNIC_BARE_METAL_SHAPES, X86_SHAPES, OciConfig, ShapeCompatibility,
+                  capability_schema, cnic_config_error, cnic_network_error, shape_architecture)
 from .oci_shapes import resolve_shape_compatibility
 
 
@@ -182,6 +183,9 @@ def shape_metadata(config, shape_resolution, arch, *, allow_missing_arch=False, 
         shape_arches.add(required)
     if len(shape_arches) > 1:
         raise OciArchiveError("The selected OCI shapes span both ARM64 and x86_64. Choose one guest architecture.")
+    cnic_error = cnic_config_error(names, config)
+    if cnic_error:
+        raise OciArchiveError(cnic_error)
     aliases = {name: _reference_alias(name) or OBSERVED_SHAPE_NAMES.get(name) for name in sorted(names)}
     unmapped = [name for name, alias in aliases.items() if not alias]
     if unmapped:
@@ -478,13 +482,31 @@ def can_download_archive(artifact):
 def _stored_shapes(artifact, *, allow_missing_arch=False):
     config = _config(artifact["recipe"]["oci"])
     return shape_metadata(config, artifact.get("shape_compatibility_resolution"), artifact.get("architecture"),
-                          allow_missing_arch=allow_missing_arch, platform_migration=artifact["recipe"].get("platform_migration"))["entries"]
+                          allow_missing_arch=allow_missing_arch, platform_migration=artifact["recipe"].get("platform_migration"))
 
 
 def _check_declared_shapes(metadata, expected):
     additional = metadata.get("additionalMetadata", {}) if isinstance(metadata, dict) else None
-    if not isinstance(additional, dict) or additional.get("shapeCompatibilities", []) != expected:
+    if not isinstance(additional, dict) or additional.get("shapeCompatibilities", []) != expected["entries"]:
         raise OciArchiveError("This older .oci file has a different shape list than the export. Create a new export.")
+    names = expected["embedded_shapes"]
+    if CNIC_BARE_METAL_SHAPES.isdisjoint(names):
+        return
+    try:
+        launch = metadata["externalLaunchOptions"]
+        caps = json.loads(metadata["imageCapabilityData"])["capabilities"]
+        nic = caps["Network.AttachmentType"]
+        if not isinstance(nic["values"], list) or "PARAVIRTUALIZED" not in nic["values"]:
+            raise OciArchiveError("This .oci file must allow PARAVIRTUALIZED networking for its bare-metal CNIC shapes. Create a new export.")
+        for network, boot, mode in (
+                (launch["networkType"], launch["bootVolumeType"], launch["launchOptionsSource"]),
+                (nic["defaultValue"], caps["Storage.BootVolumeType"]["defaultValue"],
+                 caps["Compute.LaunchMode"]["defaultValue"])):
+            error = cnic_network_error(names, network, boot, mode)
+            if error:
+                raise OciArchiveError(error)
+    except (KeyError, TypeError, json.JSONDecodeError, RecursionError) as exc:
+        raise OciArchiveError("This .oci file is missing bare-metal CNIC launch settings. Create a new export.") from exc
 
 
 def archive_blocker(artifact):
@@ -498,7 +520,7 @@ def archive_blocker(artifact):
         expected = _stored_shapes(artifact, allow_missing_arch=not native)
         if native:
             metadata = (artifact.get("oci_archive") or {}).get("metadata")
-            if expected or metadata is not None:
+            if expected["entries"] or metadata is not None:
                 _check_declared_shapes(metadata, expected)
     except OciArchiveError as exc:
         return str(exc)

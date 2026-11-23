@@ -429,6 +429,17 @@ class PlanTests(unittest.TestCase):
         self.assertFalse(result["ready"])
         self.assertTrue(any("hardware/VFIO" in error for error in result["blockers"]))
 
+    def test_cnic_reconfiguration_checks_virtio_and_iscsi_without_a_physical_nic(self):
+        source = image()
+        opts = options(target="bare_metal", boot_attachment="iscsi", network_attachment="paravirtualized")
+        plan = plan_platform(source, opts)
+        self.assertTrue(plan["ready"], plan["blockers"])
+        self.assertEqual(plan["nic_drivers"], [])
+        self.assertTrue({"iscsi_ibft", "iscsi_tcp", "virtio_pci", "virtio_net"} <= set(plan["required_modules"]))
+        self.assertNotIn("mlx5_core", plan["required_modules"])
+        source["platform"]["kernels"][KERNEL]["modules"].remove("virtio_net")
+        self.assertTrue(any("virtio_net" in error for error in plan_platform(source, opts)["blockers"]))
+
     def test_accelerated_profile_blocks_missing_or_unverified_network_driver(self):
         source = image()
         source["platform"]["kernels"][KERNEL]["modules"].remove("virtio_net")
