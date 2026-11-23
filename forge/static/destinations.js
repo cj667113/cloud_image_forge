@@ -76,8 +76,20 @@ function applyDestinationNicDefault() {
   const profile=destinationState.catalog?.profiles.find(item=>item.id===selectedDestinationProfileId()),input=$('#platform-nic');
   if(input&&!input.value&&profile?.nic_driver&&[...input.options].some(option=>option.value===profile.nic_driver))input.value=profile.nic_driver;
 }
+function destinationOciForRegion(defaults) {
+  if (!defaults?.capabilities[ociPvVersionKey]) return defaults;
+  const capability = state.ociCatalog?.capabilities.find(item => item.key === ociPvVersionKey);
+  const names = defaults.import_options.shape_compatibility.map(row => row.shape);
+  const setting = ociPvVersionDefaults(capability, names);
+  const capabilities = {...defaults.capabilities};
+  if (setting) capabilities[ociPvVersionKey] = setting;
+  else delete capabilities[ociPvVersionKey];
+  return {...defaults, capabilities};
+}
 function destinationOciIssue(defaults) {
   if(!defaults)return '';
+  const versionIssue = ociPvVersionSchemaError(defaults.import_options.shape_compatibility.map(row => row.shape));
+  if (versionIssue) return versionIssue;
   const missing=Object.entries(defaults.capabilities||{}).filter(([key,setting])=>{
     const node=$$('[data-oci-default]').find(input=>input.dataset.ociDefault===key);
     if(!node)return true;
@@ -88,9 +100,9 @@ function destinationOciIssue(defaults) {
 }
 function applyDestinationOci(defaults,strategy) {
   if(!defaults)return;
+  studioSession().ociPvVersionEdited = false;
   for(const [key,setting] of Object.entries(defaults.capabilities||{})) {
-    const node=$$('[data-oci-default]').find(input=>input.dataset.ociDefault===key);if(node.type==='checkbox')node.checked=setting.default_value;else node.value=JSON.stringify(setting.default_value);
-    $$('[data-oci-allowed]').filter(input=>input.dataset.ociAllowed===key).forEach(input=>input.checked=(setting.values||[setting.default_value]).includes(JSON.parse(input.value)));
+    setOciCapability(key, setting);
     if(key==='Compute.Firmware'){state.ociFirmwareEdited=true;if($('#oci-firmware-confirm'))$('#oci-firmware-confirm').checked=true;}
   }
   $('#oci-launch-mode').value=defaults.import_options.launch_mode;
@@ -146,8 +158,9 @@ async function resolveDestinationProfile({apply=true,syncOci=true}={}) {
     if(config&&apply){
       for(const [key,id] of Object.entries({source:'platform-source',target:'platform-target',boot_attachment:'platform-boot',network_attachment:'platform-network',nic_driver:'platform-nic'}))$(`#${id}`).value=config[key]||'';
       if(result.profile?.provider==='oci'){$('#target-oci').checked=true;updateExport();}
-      result.schema_error=destinationOciIssue(result.oci_defaults);
-      if(!result.schema_error&&syncOci)applyDestinationOci(result.oci_defaults,config.strategy);
+      const regionalDefaults = destinationOciForRegion(result.oci_defaults);
+      result.schema_error=destinationOciIssue(regionalDefaults);
+      if(!result.schema_error&&syncOci)applyDestinationOci(regionalDefaults,config.strategy);
       else if(!result.schema_error&&result.oci_defaults&&session.destinationOciPrepare?.profileId===selection.profile_id) {
         const managed=session.destinationOciPrepare;
         if(!managed.manual)managed.prepare=typeof result.oci_defaults.guest?.prepare==='boolean'?result.oci_defaults.guest.prepare:config.strategy!=='preserve';

@@ -6,6 +6,7 @@ from pathlib import Path
 import tarfile
 from threading import Event
 from unittest.mock import Mock
+import zipfile
 
 import pytest
 
@@ -196,9 +197,14 @@ def test_old_vfio_cnic_export_blocks_archive_and_cli_bundle_but_preserves_the_di
     assert hashlib.sha256(client.get(base + "/download").content).hexdigest() == item["sha256"]
 
 
-@pytest.mark.parametrize("field", ["networkType", "launchOptionsSource", "Network.AttachmentType", "Compute.LaunchMode",
-                                   "allowed_networks"])
-def test_cnic_native_download_checks_actual_launch_and_capability_defaults(client, tmp_path, field):
+@pytest.mark.parametrize("field,invalid,reason", [
+    ("networkType", "VFIO", "PARAVIRTUALIZED"), ("launchOptionsSource", "NATIVE", "PARAVIRTUALIZED"),
+    ("Network.AttachmentType", "VFIO", "PARAVIRTUALIZED"), ("Compute.LaunchMode", "NATIVE", "PARAVIRTUALIZED"),
+    ("allowed_networks", ["VFIO"], "PARAVIRTUALIZED"),
+    ("pvAttachmentVersion", 2, "version"), ("pvAttachmentVersion", True, "version"),
+    ("allowed_versions", [2], "version"), ("allowed_versions", [True, 2], "version"),
+])
+def test_cnic_native_download_checks_actual_launch_and_capability_defaults(client, tmp_path, field, invalid, reason):
     from forge.destinations import resolve_destination
 
     name = "BM.Standard.A4.Ax.48"
@@ -211,13 +217,15 @@ def test_cnic_native_download_checks_actual_launch_and_capability_defaults(clien
     path = tmp_path / "native.oci"
     client.app.state.store.update("artifact", item["id"], format="oci", path=str(path), oci_archive={"metadata": original})
     if field in original["externalLaunchOptions"]:
-        original["externalLaunchOptions"][field] = "VFIO" if field == "networkType" else "NATIVE"
+        original["externalLaunchOptions"][field] = invalid
     else:
         caps = json.loads(original["imageCapabilityData"])
         if field == "allowed_networks":
-            caps["capabilities"]["Network.AttachmentType"]["values"] = ["VFIO"]
+            caps["capabilities"]["Network.AttachmentType"]["values"] = invalid
+        elif field == "allowed_versions":
+            caps["capabilities"]["Storage.ParaVirtualization.AttachmentVersion"].update(values=invalid, defaultValue=2)
         else:
-            caps["capabilities"][field]["defaultValue"] = "VFIO" if field == "Network.AttachmentType" else "NATIVE"
+            caps["capabilities"][field]["defaultValue"] = invalid
         original["imageCapabilityData"] = json.dumps(caps)
     with tarfile.open(path, "w") as archive:
         for filename, data in (("image_metadata.json", json.dumps(original).encode()), ("output.QCOW2", disk)):
@@ -225,8 +233,41 @@ def test_cnic_native_download_checks_actual_launch_and_capability_defaults(clien
             member.size = len(data)
             archive.addfile(member, io.BytesIO(data))
     result = client.get(base + "/download")
-    assert result.status_code == 409 and "PARAVIRTUALIZED" in result.json()["detail"]
+    assert result.status_code == 409 and reason.lower() in result.json()["detail"].lower()
     assert client.post(base + "/upload", json={"url": "s3://example/native.oci"}).status_code == 409
+
+
+@pytest.mark.parametrize("changed,sparse_recipe", [("schema-data.json", True), ("image-capability-schema.json", False)])
+def test_arm_bare_metal_download_checks_the_capabilities_inside_the_saved_zip(client, tmp_path, changed, sparse_recipe):
+    from forge.destinations import resolve_destination
+    from forge.oci import OciConfig, bundle_files
+
+    shape = "BM.Standard.A4.48"
+    selected = resolve_destination({"os": {"arch": "aarch64"}}, {"profile_id": "oci:" + shape})
+    config = OciConfig.model_validate(selected["oci_defaults"])
+    files = bundle_files(config, {"format": "qcow2"})
+    path = tmp_path / "saved.zip"
+    saved = config.model_dump()
+    if sparse_recipe:
+        del saved["capabilities"]["Storage.ParaVirtualization.AttachmentVersion"]
+    item = export(client, tmp_path, recipe={"oci": saved}, oci_bundle_path=str(path),
+                  oci_config={"compatible_shape_count": 1},
+                  shape_compatibility_resolution={"effective_shapes": [{"shape": shape}]})
+    base = "/api/artifacts/" + item["id"]
+    for allowed in ([1, 2], [2]):
+        document = json.loads(files[changed])
+        schema = document.get("schemaData", document)
+        schema["Storage.ParaVirtualization.AttachmentVersion"].update(defaultValue=min(allowed), values=allowed)
+        with zipfile.ZipFile(path, "w") as archive:
+            for name, content in files.items():
+                archive.writestr(name, json.dumps(document) if name == changed else content)
+        response = client.get(base + "/oci-bundle")
+        if 1 in allowed:
+            assert response.status_code == 200
+        else:
+            assert response.status_code == 409 and "version" in response.json()["detail"].lower()
+            if sparse_recipe:
+                assert client.get(base).json()["oci_config_blocker"] == response.json()["detail"]
 
 
 def test_partial_or_tampered_native_archive_blocked_on_download_and_s3(client, tmp_path):

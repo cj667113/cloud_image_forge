@@ -24,8 +24,9 @@ import tarfile
 import tempfile
 
 from .architecture import SUPPORTED_ARCHES, normalize_arch
-from .oci import (ARM_SHAPES, CNIC_BARE_METAL_SHAPES, X86_SHAPES, OciConfig, ShapeCompatibility,
-                  capability_schema, cnic_config_error, cnic_network_error, shape_architecture)
+from .oci import (ARM_BARE_METAL_SHAPES, ARM_SHAPES, CNIC_BARE_METAL_SHAPES, PV_ATTACHMENT_VERSION, X86_SHAPES,
+                  OciConfig, ShapeCompatibility, capability_schema, cnic_network_error, saved_attachment_error,
+                  shape_architecture, shape_config_error)
 from .oci_shapes import resolve_shape_compatibility
 
 
@@ -40,7 +41,7 @@ LAUNCH_CAPABILITIES = {
     "bootVolumeType": "Storage.BootVolumeType",
     "remoteDataVolumeType": "Storage.RemoteDataVolumeType",
     "localDataVolumeType": "Storage.LocalDataVolumeType",
-    "pvAttachmentVersion": "Storage.ParaVirtualization.AttachmentVersion",
+    "pvAttachmentVersion": PV_ATTACHMENT_VERSION,
     "pvEncryptionInTransitEnabled": "Storage.ParaVirtualization.EncryptionInTransit",
     "consistentVolumeNamingEnabled": "Storage.ConsistentVolumeNaming",
 }
@@ -68,7 +69,7 @@ OBSERVED_SHAPE_NAMES = {
 X86_INTERNAL_FAMILY = re.compile(r"(?:[ex][0-9]+-2[cl]?|b200)\.", re.IGNORECASE)
 # Version-2 capability descriptor format from the supplied Oracle native export.
 NATIVE_CAPABILITY_FORMAT = "34dd2cea-aff2-4f45-b8f6-1cb5290bfab2"
-ARCHIVE_POLICY_VERSION = 3
+ARCHIVE_POLICY_VERSION = 4
 SHAPE_REFERENCE_DIR = Path("/etc/cloud-image-forge/oci-shapes")
 MAX_REFERENCE_BYTES = 2 * MAX_METADATA_BYTES
 
@@ -183,9 +184,9 @@ def shape_metadata(config, shape_resolution, arch, *, allow_missing_arch=False, 
         shape_arches.add(required)
     if len(shape_arches) > 1:
         raise OciArchiveError("The selected OCI shapes span both ARM64 and x86_64. Choose one guest architecture.")
-    cnic_error = cnic_config_error(names, config)
-    if cnic_error:
-        raise OciArchiveError(cnic_error)
+    shape_error = shape_config_error(names, config)
+    if shape_error:
+        raise OciArchiveError(shape_error)
     aliases = {name: _reference_alias(name) or OBSERVED_SHAPE_NAMES.get(name) for name in sorted(names)}
     unmapped = [name for name, alias in aliases.items() if not alias]
     if unmapped:
@@ -226,6 +227,10 @@ def _image_metadata(config, inspection, shapes):
     if missing:
         raise OciArchiveError("OCI archive launch metadata is missing capabilities: " + ", ".join(sorted(missing)))
     launch = {name: config.capabilities[key].default_value for name, key in LAUNCH_CAPABILITIES.items()}
+    if not ARM_BARE_METAL_SHAPES.isdisjoint(shapes["embedded_shapes"]):
+        # The resolved launch option and the image capability preference are
+        # independent fields in native archives. Keep the user's allowed set.
+        launch["pvAttachmentVersion"] = 1
     launch["launchOptionsSource"] = config.import_options.launch_mode
     capabilities = None
     format_version = config.image_caps_format_version
@@ -490,11 +495,21 @@ def _check_declared_shapes(metadata, expected):
     if not isinstance(additional, dict) or additional.get("shapeCompatibilities", []) != expected["entries"]:
         raise OciArchiveError("This older .oci file has a different shape list than the export. Create a new export.")
     names = expected["embedded_shapes"]
-    if CNIC_BARE_METAL_SHAPES.isdisjoint(names):
+    arm_bare_metal = not ARM_BARE_METAL_SHAPES.isdisjoint(names)
+    cnic = not CNIC_BARE_METAL_SHAPES.isdisjoint(names)
+    if not (arm_bare_metal or cnic):
         return
     try:
         launch = metadata["externalLaunchOptions"]
         caps = json.loads(metadata["imageCapabilityData"])["capabilities"]
+        if arm_bare_metal:
+            if error := saved_attachment_error(names, caps):
+                raise OciArchiveError(error)
+            version = launch.get("pvAttachmentVersion") if isinstance(launch, dict) else None
+            if type(version) is not int or version != 1:
+                raise OciArchiveError("The saved ARM bare-metal launch options must select PV attachment version 1. Create a new export.")
+        if not cnic:
+            return
         nic = caps["Network.AttachmentType"]
         if not isinstance(nic["values"], list) or "PARAVIRTUALIZED" not in nic["values"]:
             raise OciArchiveError("This .oci file must allow PARAVIRTUALIZED networking for its bare-metal CNIC shapes. Create a new export.")
@@ -506,7 +521,7 @@ def _check_declared_shapes(metadata, expected):
             if error:
                 raise OciArchiveError(error)
     except (KeyError, TypeError, json.JSONDecodeError, RecursionError) as exc:
-        raise OciArchiveError("This .oci file is missing bare-metal CNIC launch settings. Create a new export.") from exc
+        raise OciArchiveError("This .oci file is missing bare-metal launch settings. Create a new export.") from exc
 
 
 def archive_blocker(artifact):

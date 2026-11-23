@@ -243,6 +243,42 @@ def test_bare_metal_download_contains_only_selected_shapes_and_effective_overrid
     assert receipt["shape_compatibility"]["public_name_shapes"] == []
 
 
+@pytest.mark.parametrize("profile,arch,version", [
+    ("oci:bare-metal:BM.Standard.A1.160", "aarch64", 1),
+    ("oci:BM.Standard.A4.48", "aarch64", 1),
+    ("oci:BM.Standard.A4.Ax.48", "aarch64", 1),
+    ("oci:VM.Standard.A2.Flex", "aarch64", 2),
+    ("oci:BM.Standard.E6.Ax.192", "x86_64", 2),
+    ("oci:VM.Standard.E5.Flex", "x86_64", 2),
+])
+def test_destination_pv_attachment_version_in_native_archive_and_companion(tmp_path, profile, arch, version):
+    from forge.destinations import resolve_destination
+    from forge.oci import bundle_files
+
+    inspection = deepcopy(INSPECTION)
+    inspection["os"]["arch"] = arch
+    inspection["boot"] = {"recommended_firmware": "UEFI_64", "supported_firmware": ["UEFI_64"]}
+    result = resolve_destination(inspection, {"profile_id": profile, "nic_driver": "mlx5_core"})
+    assert result["ready"], result["blockers"]
+    config = OciConfig.model_validate(result["oci_defaults"])
+    resolution = result["shape_compatibility_resolution"]
+    destination = tmp_path / "export.oci"
+    subject.write_archive(destination, qcow(tmp_path / "disk.qcow2"), config, inspection, lambda _: None,
+                          shape_resolution=resolution)
+    with tarfile.open(destination) as archive:
+        metadata = json.load(archive.extractfile("image_metadata.json"))
+    assert metadata["externalLaunchOptions"]["pvAttachmentVersion"] == version
+    key = "Storage.ParaVirtualization.AttachmentVersion"
+    expected = {"descriptorType": "enuminteger", "defaultValue": version, "values": [1, 2]}
+    if profile.startswith(("oci:BM.", "oci:bare-metal:")):
+        assert json.loads(metadata["imageCapabilityData"])["capabilities"][key] == expected
+    files = bundle_files(config, {"format": "oci", "shape_compatibility_resolution": resolution})
+    descriptor = {**expected, "source": "IMAGE"}
+    assert json.loads(files["schema-data.json"])[key] == descriptor
+    assert json.loads(files["image-capability-schema.json"])["schemaData"][key] == descriptor
+    assert "pvAttachmentVersion" not in json.loads(files["instance-launch-options.json"])
+
+
 @pytest.mark.parametrize("arch,shape,reason", [
     ("arm64", "VM.Standard.E4.Flex", "requires x86_64"),
     ("amd64", "VM.Standard.A2.Flex", "requires aarch64"),

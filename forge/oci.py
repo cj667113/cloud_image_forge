@@ -61,6 +61,8 @@ SHAPE_NETWORK_TYPES = {
 }
 ARM_SHAPES = {*ARM_STANDARD_PV, "VM.Standard.A4.Ax.Flex",
               "BM.Standard.A1.160", "BM.Standard.A4.48", "BM.Standard.A4.Ax.48"}
+ARM_BARE_METAL_SHAPES = frozenset(ARM_SHAPES.intersection(BARE_METAL_NETWORK))
+PV_ATTACHMENT_VERSION = "Storage.ParaVirtualization.AttachmentVersion"
 X86_SHAPES = {*AMD_STANDARD_PV, "VM.Standard3.Flex", "VM.Standard4.Ax.Flex",
               "VM.Standard.E6.Ax.Flex", "VM.DenseIO.E4.Flex", "VM.DenseIO.E5.Flex",
               "VM.DenseIO.E6.Ax.Flex", "VM.Optimized3.Flex", "BM.Standard3.64", "BM.Standard4.Ax.120",
@@ -96,10 +98,35 @@ def cnic_network_error(names, network, boot, *launch_modes):
     return None
 
 
-def cnic_config_error(names, config):
+def attachment_version_error(names, allowed, global_schema=None):
+    targets = ARM_BARE_METAL_SHAPES.intersection(names)
+    if targets and not any(type(v) is int and v == 1 for v in allowed):
+        reason = f"The ARM bare-metal profile for {', '.join(sorted(targets))} must allow version 1 in {PV_ATTACHMENT_VERSION}."
+        if global_schema is not None and 1 not in normalize_schema(global_schema).get(PV_ATTACHMENT_VERSION, {}).get("values", []):
+            return reason + " The supplied regional schema does not offer version 1. Choose a compatible destination or region."
+        return reason + " Include version 1 and create a new export."
+    return None
+
+
+def saved_attachment_error(names, settings):
+    """Validate the image descriptor independently of the native launch preference."""
+    version = settings.get(PV_ATTACHMENT_VERSION, {}) if isinstance(settings, dict) else {}
+    if isinstance(version, dict):
+        allowed = version.get("values")
+        default = version.get("defaultValue")
+        if (version.get("descriptorType") == "enuminteger" and isinstance(allowed, list)
+                and all(type(v) is int for v in allowed) and type(default) is int and default in allowed):
+            return attachment_version_error(names, allowed)
+    return f"The saved {PV_ATTACHMENT_VERSION} descriptor is missing or invalid. Create a new export."
+
+
+def shape_config_error(names, config):
+    names = set(names)
     defaults = {key: value.default_value for key, value in config.capabilities.items()}
-    return cnic_network_error(names, defaults.get("Network.AttachmentType"), defaults.get("Storage.BootVolumeType"),
-                              defaults.get("Compute.LaunchMode"), config.import_options.launch_mode)
+    network_error = cnic_network_error(names, defaults.get("Network.AttachmentType"), defaults.get("Storage.BootVolumeType"),
+                                       defaults.get("Compute.LaunchMode"), config.import_options.launch_mode)
+    version = config.capabilities.get(PV_ATTACHMENT_VERSION)
+    return network_error or attachment_version_error(names, version.values if version else [], config.global_schema)
 
 
 def descriptor(kind, default, values=None):
@@ -121,7 +148,7 @@ GLOBAL_SCHEMA = {
     "Storage.RemoteDataVolumeType": descriptor("enumstring", "PARAVIRTUALIZED", STORAGE_TYPES),
     "Storage.ConsistentVolumeNaming": descriptor("boolean", True),
     "Storage.ParaVirtualization.EncryptionInTransit": descriptor("boolean", True),
-    "Storage.ParaVirtualization.AttachmentVersion": descriptor("enuminteger", 2, [1, 2]),
+    PV_ATTACHMENT_VERSION: descriptor("enuminteger", 2, [1, 2]),
     "Storage.Iscsi.MultipathDeviceSupported": descriptor("boolean", False),
 }
 
@@ -138,7 +165,7 @@ DETAILS = {
     "Storage.RemoteDataVolumeType": ("Remote data volume attachment", "Include drivers and initiator tools for the selected remote volume attachment types."),
     "Storage.ConsistentVolumeNaming": ("Consistent volume naming", "Require OCI device-naming support in the guest; an image capability does not install naming rules."),
     "Storage.ParaVirtualization.EncryptionInTransit": ("Paravirtualized encryption in transit", "OCI enables encryption for paravirtualized boot attachments. This does not encrypt the disk file and needs compatible platform/shape support."),
-    "Storage.ParaVirtualization.AttachmentVersion": ("Paravirtualized attachment version", "OCI selects attachment version 1 or 2. Guest VirtIO readiness is checked; the platform must support the selected version."),
+    PV_ATTACHMENT_VERSION: ("Paravirtualized attachment version", "Forge allows the versions in the regional schema. ARM bare-metal profiles use version 1 at launch."),
     "Storage.Iscsi.MultipathDeviceSupported": ("iSCSI multipath", "Prepare multipath tools/configuration for iSCSI attachments. OCI attachment settings and a cloud test are still needed."),
 }
 
@@ -186,10 +213,17 @@ def catalog(schema: dict | None = None) -> dict:
     rows = []
     for key, item in normalize_schema(schema).items():
         label, explanation = DETAILS.get(key, (key, "Additional tenancy capability. No automatic guest adaptation is implemented for this key; verify guest and platform requirements separately."))
-        rows.append({"key": key, "label": label, "group": key.split(".")[0],
-                     "descriptor_type": item["descriptorType"], "default_value": item["defaultValue"],
-                     "values": item.get("values"), "description": explanation, "guest_action": explanation,
-                     "custom_image_supported": key != "Compute.SecureBoot", "guest_adapter_known": key in DETAILS})
+        row = {"key": key, "label": label, "group": key.split(".")[0],
+               "descriptor_type": item["descriptorType"], "default_value": item["defaultValue"],
+               "values": item.get("values"), "description": explanation, "guest_action": explanation,
+               "custom_image_supported": key != "Compute.SecureBoot", "guest_adapter_known": key in DETAILS}
+        if key == PV_ATTACHMENT_VERSION:
+            row["automatic_settings"] = {
+                "default": attachment_version_defaults([], item).model_dump(),
+                "arm_bare_metal": attachment_version_defaults(ARM_BARE_METAL_SHAPES, item).model_dump(),
+                "arm_bare_metal_shapes": sorted(ARM_BARE_METAL_SHAPES),
+            }
+        rows.append(row)
     return {"capabilities": rows, "sources": SOURCES, "checked_on": CHECKED_ON,
             "schema_origin": "supplied" if schema is not None else "reference_snapshot"}
 
@@ -204,6 +238,15 @@ Scalar = StrictBool | StrictInt | StrictStr
 class CapabilitySetting(StrictModel):
     default_value: Scalar
     values: list[Scalar] | None = Field(default=None, max_length=64)
+
+
+def attachment_version_defaults(names, regional=None):
+    desc = GLOBAL_SCHEMA[PV_ATTACHMENT_VERSION] if regional is None else regional
+    allowed = desc["values"]
+    preferred = desc["defaultValue"]
+    if not ARM_BARE_METAL_SHAPES.isdisjoint(names) and 1 in allowed:
+        preferred = 1
+    return CapabilitySetting(default_value=preferred, values=allowed)
 
 
 class GuestPreparation(StrictModel):
@@ -289,7 +332,11 @@ class OciConfig(StrictModel):
             kind = desc["descriptorType"]
             if key not in self.capabilities:
                 default = desc["defaultValue"]
-                self.capabilities[key] = CapabilitySetting(default_value=default, values=None if kind == "boolean" else [default])
+                if key == PV_ATTACHMENT_VERSION:
+                    names = (row.shape for row in self.import_options.shape_compatibility)
+                    self.capabilities[key] = attachment_version_defaults(names, desc)
+                else:
+                    self.capabilities[key] = CapabilitySetting(default_value=default, values=None if kind == "boolean" else [default])
             item = self.capabilities[key]
             expected = {"boolean": bool, "enumstring": str, "enuminteger": int}[kind]
             if type(item.default_value) is not expected:
@@ -437,9 +484,9 @@ def compatibility_plan(inspection: dict, config: OciConfig, allow_network=False,
     shape_resolution = resolve_shape_compatibility(inspection, config, platform_migration)
     plan["shape_compatibility_resolution"] = shape_resolution
     plan["warnings"].extend(shape_resolution["warnings"])
-    cnic_error = cnic_config_error((row["shape"] for row in shape_resolution["effective_shapes"]), config)
-    if cnic_error:
-        plan["blockers"].append(cnic_error)
+    shape_error = shape_config_error((row["shape"] for row in shape_resolution["effective_shapes"]), config)
+    if shape_error:
+        plan["blockers"].append(shape_error)
     for shape in (ShapeCompatibility.model_validate(row) for row in shape_resolution["effective_shapes"]):
         arch = normalize_arch(inspection.get("os", {}).get("arch"))
         required_arch = shape_architecture(shape.shape)
@@ -495,18 +542,34 @@ def _shape_manifest(entries, architecture):
             "shapeArchitectures": {entry["shapeName"]: shape_architecture(entry["shapeName"]) for entry in entries}}
 
 
-def bundle_network_blocker(artifact):
+def bundle_shape_blocker(artifact, *, verify_file=False):
     """Check saved exports before offering their original CLI import settings."""
     raw = (artifact.get("recipe") or {}).get("oci") or {}
     resolution = artifact.get("shape_compatibility_resolution") or {}
     rows = resolution.get("effective_shapes") or raw.get("import_options", {}).get("shape_compatibility", [])
     names = [row.get("shape") for row in rows if isinstance(row, dict) and isinstance(row.get("shape"), str)]
-    if CNIC_BARE_METAL_SHAPES.isdisjoint(names):
+    if CNIC_BARE_METAL_SHAPES.isdisjoint(names) and ARM_BARE_METAL_SHAPES.isdisjoint(names):
         return None
     try:
-        return cnic_config_error(names, OciConfig.model_validate(raw))
-    except ValueError:
-        return "The saved bare-metal CNIC launch settings could not be verified. Create a new export."
+        error = shape_config_error(names, OciConfig.model_validate(raw))
+        if error or ARM_BARE_METAL_SHAPES.isdisjoint(names):
+            return error
+        # Old recipes may omit this key even though the immutable ZIP used the
+        # old [2] default. Check its stored CLI inputs before advertising it.
+        if verify_file or PV_ATTACHMENT_VERSION not in raw.get("capabilities", {}):
+            with zipfile.ZipFile(artifact["oci_bundle_path"]) as saved:
+                for filename in ("schema-data.json", "image-capability-schema.json"):
+                    entry = saved.getinfo(filename)
+                    if entry.file_size > 1024 * 1024:
+                        raise ValueError("Oversized OCI capability schema")
+                    settings = json.loads(saved.read(entry))
+                    if filename == "image-capability-schema.json":
+                        settings = settings["schemaData"]
+                    if error := saved_attachment_error(names, settings):
+                        return error
+    except (OSError, ValueError, TypeError, KeyError, zipfile.BadZipFile, RecursionError):
+        return "The saved bare-metal launch settings could not be verified. Create a new export."
+    return None
 
 
 def bundle_files(config: OciConfig, artifact: dict) -> dict[str, str]:
@@ -551,9 +614,9 @@ def bundle_files(config: OciConfig, artifact: dict) -> dict[str, str]:
              "artifact.json": {k: artifact[k] for k in ("name", "sha256", "virtual_size", "format", "architecture") if k in artifact}}
     from .oci_archive import shape_entries
     entries = shape_entries(config, artifact.get("shape_compatibility_resolution"))
-    cnic_error = cnic_config_error((entry["shapeName"] for entry in entries), config)
-    if cnic_error:
-        raise ValueError(cnic_error)
+    shape_error = shape_config_error((entry["shapeName"] for entry in entries), config)
+    if shape_error:
+        raise ValueError(shape_error)
     files["shape-compatibility.json"] = _shape_manifest(entries, artifact.get("architecture"))
     if artifact.get("shape_compatibility_resolution"):
         files["shape-resolution.json"] = artifact["shape_compatibility_resolution"]

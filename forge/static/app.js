@@ -1,5 +1,6 @@
 'use strict';
 const ociDefaultShapesHint = 'With no shapes selected, OCI assigns shape compatibility when you import the image.';
+const ociPvVersionKey = 'Storage.ParaVirtualization.AttachmentVersion';
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
@@ -498,7 +499,7 @@ document.addEventListener('click',event => {
   if(button.dataset.action === 'migration-preview') previewBootMigration();
   if(button.dataset.action === 'oci-preview') previewOci();
   if(button.dataset.action === 'oci-add-shape') addOciShape();
-  if(button.dataset.action === 'oci-remove-shape') { button.closest('.oci-shape-row').remove(); markOciChanged(); }
+  if(button.dataset.action === 'oci-remove-shape') { button.closest('.oci-shape-row').remove(); syncOciPvVersion(); markOciChanged(); }
   if(button.dataset.action === 'oci-load-schema') changeOciSchema();
   if(button.dataset.action === 'oci-load-metadata') $('#oci-metadata-file').click();
   if(button.dataset.action === 'oci-clear-metadata') { state.editorRevision++; $('#oci-image-caps-version').value = ''; notice('#oci-metadata-error',''); markOciChanged(); }
@@ -518,6 +519,8 @@ document.addEventListener('change', event => {
   if (input.id === 'oci-metadata-file') loadOciMetadataReference(input);
   if (input.id === 'boot-migration-enabled') toggleBootMigration();
 
+  if (input.dataset.ociDefault === ociPvVersionKey || input.dataset.ociAllowed === ociPvVersionKey) studioSession().ociPvVersionEdited = true;
+  if (input.dataset.shapeField === 'shape') syncOciPvVersion();
   if (input.dataset.ociDefault === 'Compute.Firmware' || input.dataset.ociAllowed === 'Compute.Firmware' || input.id === 'oci-firmware-confirm') { state.migrationAutoFirmware = null; state.ociFirmwareEdited = input.id === 'oci-firmware-confirm' ? input.checked : true; if ($('#oci-firmware-confirm')) $('#oci-firmware-confirm').checked = state.ociFirmwareEdited; }
   if (input.dataset.ociDefault) { const allowed = $$('[data-oci-allowed]').find(node => node.dataset.ociAllowed === input.dataset.ociDefault && node.value === input.value); if (allowed) allowed.checked = true; }
   if (input.closest('#panel-oci') && input.id !== 'oci-enabled') markOciChanged();
@@ -669,6 +672,35 @@ function renderOciPanel() {
 }
 function ociIsSecureBoot(capability) { return /secure[._-]?boot/i.test(capability.key); }
 function ociCapabilityType(capability) { return capability.descriptor_type?.toLowerCase() || (typeof capability.default_value === 'boolean' ? 'boolean' : Number.isInteger(capability.default_value) ? 'enuminteger' : 'enumstring'); }
+function selectedOciShapeNames() {
+  return $$('#oci-shapes [data-shape-field="shape"]').map(input => input.value.trim()).filter(Boolean);
+}
+function ociPvVersionDefaults(capability, shapes = selectedOciShapeNames()) {
+  const settings = capability?.automatic_settings;
+  if (!settings) return null;
+  return shapes.some(name => settings.arm_bare_metal_shapes.includes(name)) ? settings.arm_bare_metal : settings.default;
+}
+function ociPvVersionSchemaError(shapes) {
+  const findVersion = catalog => catalog?.capabilities.find(item => item.key === ociPvVersionKey);
+  const regional = findVersion(state.ociCatalog);
+  const armShapes = (regional || findVersion(state.ociBaseCatalog))?.automatic_settings?.arm_bare_metal_shapes || [];
+  const targets = shapes.filter(name => armShapes.includes(name));
+  return targets.length && !regional?.values.includes(1)
+    ? `The selected OCI schema must allow PV attachment version 1 for ${targets.join(', ')}. Load a compatible regional schema or choose another destination.` : '';
+}
+function setOciCapability(key, setting) {
+  const node = $$('[data-oci-default]').find(input => input.dataset.ociDefault === key);
+  if (!node) return;
+  if (node.type === 'checkbox') node.checked = setting.default_value;
+  else node.value = JSON.stringify(setting.default_value);
+  const values = setting.values || [setting.default_value];
+  for (const input of $$('[data-oci-allowed]').filter(input => input.dataset.ociAllowed === key)) input.checked = values.includes(JSON.parse(input.value));
+}
+function syncOciPvVersion() {
+  if (studioSession().ociPvVersionEdited) return;
+  const setting = ociPvVersionDefaults(state.ociCatalog?.capabilities.find(item => item.key === ociPvVersionKey));
+  if (setting) setOciCapability(ociPvVersionKey, setting);
+}
 function renderOciCapabilities(previous = {}) {
   const container = $('#oci-capabilities'); if (!container) return;
   const catalog = state.ociCatalog;
@@ -680,7 +712,10 @@ function renderOciCapabilities(previous = {}) {
   container.innerHTML = [...groups].map(([group,capabilities]) => `<details class="editor-disclosure oci-section" data-oci-group="${esc(group)}" data-disclosure="oci-group-${esc(group)}"${opened.has(group) ? ' open' : ''}><summary><span>${esc(group)} <span class="disclosure-meta">${capabilities.length} settings</span></span><span class="oci-group-summary"></span></summary><div class="details-content oci-capability-grid">${capabilities.map(capability => {
     const key = capability.key, type = ociCapabilityType(capability), secure = ociIsSecureBoot(capability), label = capability.label || key;
     const options = capability.values || [];
-    const saved = previous[key];
+    let saved = previous[key];
+    if (key === ociPvVersionKey && (!studioSession().ociPvVersionEdited || !options.includes(saved?.default_value))) {
+      saved = ociPvVersionDefaults(capability);
+    }
     const recommended = key === 'Compute.Firmware' && !state.ociFirmwareEdited ? detectedOciFirmware() : null;
     const initial = recommended && options.includes(recommended) ? recommended : capability.default_value;
     const value = secure ? false : saved && !recommended && (type === 'boolean' || options.includes(saved.default_value)) ? saved.default_value : initial;
@@ -719,6 +754,8 @@ function getOciConfig() {
   if (!state.ociCatalog?.capabilities?.length) throw new Error('Load the OCI capability catalog before building with OCI settings.');
   if(platformPreserveConflict())throw editorError('Turn off OCI guest preparation to preserve the existing hardware configuration.','#oci-prepare');
   const acceleratedIssue=ociAcceleratedSchemaError(); if(acceleratedIssue)throw editorError(acceleratedIssue,'#oci-schema-json');
+  const versionIssue = ociPvVersionSchemaError(selectedOciShapeNames());
+  if (versionIssue) throw editorError(versionIssue, '#oci-schema-json');
   const boot = state.images.find(image => image.id === state.selected)?.inspection?.boot;
   if (boot?.mode === 'dual' && !state.ociFirmwareEdited && state.ociCatalog.capabilities.some(capability => capability.key === 'Compute.Firmware')) throw editorError('Confirm the OCI firmware choice for this dual-mode image.','#oci-firmware-confirm');
   const global_schema = parseOciJson('#oci-schema-json','Global capability schema',null);
@@ -786,8 +823,7 @@ function updateOciShapeResolution() {
   const resolution=currentOciShapeResolution();
   const summary = $('#oci-import-shape-summary');
   if (summary) {
-    const names = resolution?.effective_shapes.map(row => row.shape)
-      ?? $$('#oci-shapes [data-shape-field="shape"]').map(input => input.value.trim()).filter(Boolean);
+    const names = resolution?.effective_shapes.map(row => row.shape) ?? selectedOciShapeNames();
     summary.textContent = compactShapeNames(names);
     summary.title = names.length ? names.join(', ') : ociDefaultShapesHint;
   }
@@ -877,6 +913,8 @@ async function changeOciSchema(reset = false) {
     if (reset) { $('#oci-schema-json').value = ''; $('#oci-schema-version').value = ''; }
     $('#oci-schema-status').textContent = schema ? 'Current OCI schema loaded' : 'Bundled catalog';
     $('#oci-catalog-error').hidden = true; renderOciCapabilities(previous); compactStudioHelp($('#panel-oci'));  if ($('#boot-migration-enabled')?.checked && !state.ociFirmwareEdited) applyMigrationFirmware(); markOciChanged();
+    const session = studioSession();
+    if (session.destination || session.destinationPending) scheduleDestinationResolution({syncOci:Boolean(session.destination?.schema_error || session.destinationPending)});
     toast(schema ? 'OCI schema loaded. Review the capability choices and preview the plan.' : 'Bundled OCI catalog restored.');
   } catch (error) { if (state.selected === imageId) notice('#oci-form-error',errorText(error)); }
 }

@@ -8,7 +8,8 @@ from copy import deepcopy
 import re
 
 from .architecture import normalize_arch
-from .oci import ACCELERATED_VM_SHAPES, ARM_SHAPES, BARE_METAL_NETWORK, CHECKED_ON, X86_SHAPES
+from .oci import (ACCELERATED_VM_SHAPES, ARM_SHAPES, BARE_METAL_NETWORK, CHECKED_ON, PV_ATTACHMENT_VERSION,
+                  X86_SHAPES, attachment_version_defaults)
 from .oci_guest import HARDWARE_NIC_DRIVERS, verified_nic_bundle
 from .oci_shapes import AMD_STANDARD_PV, ARM_STANDARD_PV, platform_launch_mode, resolve_shape_compatibility
 
@@ -220,6 +221,7 @@ def resolve_destination(inspection, selection):
         if firmware:
             values["Compute.Firmware"] = firmware
         capabilities = {key: {"default_value": value, "values": [value]} for key, value in values.items()}
+        capabilities[PV_ATTACHMENT_VERSION] = attachment_version_defaults(profile["shapes"]).model_dump()
         optional = {"Storage.ConsistentVolumeNaming": bool(inspection.get("oci_evidence", {}).get("consistent_naming_rules")),
                     "Compute.SecureBoot": False, "Compute.AMD_SecureEncryptedVirtualization": False,
                     "Storage.Iscsi.MultipathDeviceSupported": False, "Network.IPv6Only": False}

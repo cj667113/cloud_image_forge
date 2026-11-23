@@ -117,6 +117,62 @@ def test_region_schema_is_authoritative_for_accelerated_values():
     assert catalog(schema)["schema_origin"] == "supplied"
 
 
+def test_future_regional_pv_version_is_preserved_in_automatic_profiles():
+    key = "Storage.ParaVirtualization.AttachmentVersion"
+    schema = {key: {"descriptorType": "enuminteger", "values": [1, 2, 3], "defaultValue": 3}}
+    for shape, preferred in (("VM.Standard.A1.Flex", 3), ("BM.Standard.A4.48", 1)):
+        config = OciConfig(global_schema=schema, import_options={"shape_compatibility": [{"shape": shape}]})
+        assert config.capabilities[key].model_dump() == setting(preferred, [1, 2, 3])
+
+
+@pytest.mark.parametrize("regional_values,override,blocked", [
+    ([1, 2], setting(2, [2]), True),
+    ([2], None, True),
+    ([1], None, False),
+    ([1, 2], setting(1, [1]), False),
+    ([1, 2], setting(2, [1, 2]), False),
+])
+def test_arm_bare_metal_pv_version_respects_region_and_explicit_values(ready_guest_plan, regional_values, override, blocked):
+    from forge.destinations import resolve_destination
+    from forge.oci_archive import OciArchiveError, image_metadata
+
+    shape = "BM.Standard.A4.Ax.48"
+    image = {"os": {"distro": "ubuntu", "arch": "aarch64", "name": "Ubuntu 26.04 LTS"}}
+    raw = resolve_destination(image, {"profile_id": "oci:" + shape})["oci_defaults"]
+    key = "Storage.ParaVirtualization.AttachmentVersion"
+    schema = deepcopy(GLOBAL_SCHEMA)
+    schema[key].update(defaultValue=max(regional_values), values=regional_values)
+    raw["capabilities"].pop(key, None)
+    if override is not None:
+        raw["capabilities"][key] = override
+    config = OciConfig(**raw, global_schema=schema)
+    plan = compatibility_plan(image, config)
+    if blocked:
+        assert any(shape in message and "version 1" in message.lower() for message in plan["blockers"])
+        if 1 not in regional_values:
+            assert any("regional schema does not offer version 1" in message for message in plan["blockers"])
+        with pytest.raises(OciArchiveError, match="(?i)version 1"):
+            image_metadata(config, image)
+        with pytest.raises(ValueError, match="(?i)version 1"):
+            bundle_files(config, {"format": "oci"})
+    else:
+        assert plan["ready_to_build"], plan["blockers"]
+        metadata = image_metadata(config, image)
+        assert metadata["externalLaunchOptions"]["pvAttachmentVersion"] == 1
+        descriptor = json.loads(metadata["imageCapabilityData"])["capabilities"][key]
+        assert descriptor["values"] == (override["values"] if override else regional_values)
+        assert descriptor["defaultValue"] == (override["default_value"] if override else 1)
+
+
+def test_other_shapes_honor_an_explicit_single_pv_version(ready_guest_plan):
+    key = "Storage.ParaVirtualization.AttachmentVersion"
+    for version in (1, 2):
+        config = OciConfig(capabilities={key: setting(version, [version])},
+                           import_options={"shape_compatibility": [{"shape": "VM.Standard.A1.Flex"}]})
+        assert compatibility_plan({"os": {"arch": "aarch64"}}, config)["ready_to_build"]
+        assert capability_schema(config)[key]["values"] == [version]
+
+
 def test_non_oci_recipes_cannot_silently_drop_oci_configuration():
     with pytest.raises(ValidationError, match="only to an OCI"):
         Recipe(target="aws", output_format="raw", oci={})
